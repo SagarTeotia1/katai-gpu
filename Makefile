@@ -104,10 +104,18 @@ print(data['content'])"
 video-chunk: ## Parallel chunk analysis — splits video into N chunks, processes concurrently, merges
 	@python3 scripts/chunk_analysis.py \
 		--vid "$(VID)" \
-		--chunks $(or $(N),4) \
+		--chunks $(N) \
 		--backend http://localhost:$(BACKEND_PORT) \
 		$(if $(DURATION),--duration "$(DURATION)") \
 		$(if $(TRANSCRIPT),--transcript "$(TRANSCRIPT)")
+
+video-fast: ## Fast frame-based chunk analysis — usage: make video-fast VID="https://..." N=4
+	@python3 scripts/fast_chunk_analysis.py \
+		--vid "$(VID)" \
+		--chunks $(N) \
+		--backend http://localhost:$(BACKEND_PORT) \
+		$(if $(DURATION),--duration "$(DURATION)") \
+		$(if $(FPS),--fps "$(FPS)")
 
 video-semantic: ## Full semantic JSON analysis — saves to output/ — usage: make video-semantic VID="https://..."
 	@python3 scripts/semantic_analysis.py \
