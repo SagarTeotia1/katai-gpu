@@ -8,8 +8,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.config import settings
 from src.routers.chat import router as chat_router
 from src.routers.vision import router as vision_router
+from src.routers.video import router as video_router
 from src.services.llm import LLMService
 from src.services.vision import VisionService
+from src.services.video import VideoService
 
 logger = logging.getLogger(__name__)
 
@@ -25,14 +27,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Starting up (vLLM: %s, model: %s)", settings.llm_base_url, settings.model_id)
     llm_service = LLMService()
     vision_service = VisionService()
+    video_service = VideoService()
     app.state.llm_service = llm_service
     app.state.vision_service = vision_service
+    app.state.video_service = video_service
 
     yield
 
     logger.info("Shutting down")
     await llm_service.aclose()
     await vision_service.aclose()
+    await video_service.aclose()
 
 
 # ── App factory ───────────────────────────────────────────────────────────────
@@ -59,6 +64,7 @@ def create_app() -> FastAPI:
     # Routers
     application.include_router(chat_router)
     application.include_router(vision_router)
+    application.include_router(video_router)
 
     return application
 

@@ -101,6 +101,24 @@ req = urllib.request.Request('http://localhost:$(BACKEND_PORT)/api/chat', data=p
 data = json.loads(urllib.request.urlopen(req, timeout=120).read()); \
 print(data['content'])"
 
+video: ## Analyze video — usage: make video VID="https://..." PROMPT="describe"
+	@python3 -c "\
+import urllib.request, json; \
+vid = '$(VID)'; \
+prompt = '$(PROMPT)' if '$(PROMPT)' else 'Analyze this video completely. Describe every scene, action, object, person, text, and detail.'; \
+payload = json.dumps({'video_url': vid, 'prompt': prompt}).encode(); \
+req = urllib.request.Request('http://localhost:$(BACKEND_PORT)/api/video/analyze', data=payload, headers={'Content-Type':'application/json'}); \
+data = json.loads(urllib.request.urlopen(req, timeout=600).read()); \
+print(data['description'])"
+
+video-bench: ## Parallel video benchmark — usage: make video-bench VID1="..." VID2="..." VID3="..." VID4="..."
+	@python3 scripts/video_bench.py \
+		--backend http://localhost:$(BACKEND_PORT) \
+		$(if $(VID1),--vid "$(VID1)") \
+		$(if $(VID2),--vid "$(VID2)") \
+		$(if $(VID3),--vid "$(VID3)") \
+		$(if $(VID4),--vid "$(VID4)")
+
 analyze: ## Analyze image — usage: make analyze IMG="https://..." PROMPT="describe"
 	@python3 -c "\
 import urllib.request, json; \

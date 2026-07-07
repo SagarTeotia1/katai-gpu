@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     # Vision — higher token limit for exhaustive descriptions
     vision_max_tokens: int = 8192
 
+    # Video — even higher limit; videos have more content
+    video_max_tokens: int = 16384
+    video_fps: float = 2.0
+
     # Server
     host: str = "0.0.0.0"
     port: int = 8080
