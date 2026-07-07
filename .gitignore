@@ -42,8 +42,7 @@ Thumbs.db
 # Docker
 *.log
 
-# Model cache (don't commit weights)
-models/
+# Model weight files (don't commit weights)
 *.safetensors
 *.bin
 *.gguf
