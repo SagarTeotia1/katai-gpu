@@ -1,6 +1,7 @@
-# katai-gpu — Qwen Local GPU Inference Stack
+# katai-gpu — Qwen3.6-27B Local GPU Inference Stack
 
-One-command stack for running `qwen3.6:27b-bf16` on an A100 80GB with a streaming web chat UI.
+vLLM-powered multimodal inference stack with parallel video analysis pipeline.
+One-command startup. True concurrent batching. Chat + image + video analysis.
 
 ---
 
@@ -15,27 +16,29 @@ One-command stack for running `qwen3.6:27b-bf16` on an A100 80GB with a streamin
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
 │              FastAPI Backend  :8080                         │
-│   • CORS proxy                                              │
-│   • SSE streaming wrapper                                   │
-│   • Request validation (Pydantic)                           │
+│   • CORS proxy + SSE streaming                              │
+│   • Pydantic validation                                     │
+│   • Video probe via ffprobe (no LLM tokens)                 │
+│   • json-repair for truncated model output                  │
 └────────────────────────┬────────────────────────────────────┘
                          │ OpenAI-compat  /v1/chat/completions
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              Ollama Server  :11434                          │
-│   • OpenAI-compatible REST API                              │
+│              vLLM Server  :8000                             │
+│   • Continuous batching (PagedAttention)                    │
 │   • BF16 full precision                                     │
-│   • Flash Attention enabled                                 │
-│   • Model: qwen3.6:27b-bf16  (~54 GB VRAM)                 │
-│   • GPU: A100 80GB (26 GB headroom for KV cache)            │
+│   • Flash Attention 2                                       │
+│   • --reasoning-parser qwen3 (strips <think> blocks)        │
+│   • Model: Qwen/Qwen3.6-27B  (~51 GB VRAM)                 │
+│   • GPU: RTX Pro 6000 96GB (45 GB headroom for KV cache)   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 | Component | Tech | Role |
 |-----------|------|------|
-| Ollama | `ollama/ollama:latest` | GPU inference, model management |
-| Backend | FastAPI + httpx | CORS, SSE proxy, validation |
-| Frontend | React 18 + Vite + TailwindCSS | Chat UI, real-time streaming |
+| vLLM | `vllm/vllm-openai:latest` | GPU inference, continuous batching |
+| Backend | FastAPI + httpx + ffmpeg | Proxy, video pipeline, SSE |
+| Frontend | React 18 + Vite + TailwindCSS | Chat UI, streaming |
 | Orchestration | Docker Compose | One-command startup |
 
 ---
@@ -44,22 +47,21 @@ One-command stack for running `qwen3.6:27b-bf16` on an A100 80GB with a streamin
 
 | Spec | Value |
 |------|-------|
-| GPU | NVIDIA A100 80GB (or equivalent) |
-| VRAM needed | ~54 GB (BF16) |
-| VRAM headroom | ~26 GB for KV cache |
+| GPU | NVIDIA RTX Pro 6000 (96 GB VRAM) |
+| VRAM used by model | ~51 GB (BF16) |
+| VRAM headroom | ~45 GB for KV cache |
 | CUDA | 12.1+ |
 | RAM | 64 GB+ recommended |
-| Disk (model) | ~60 GB free |
+| Disk (model cache) | ~60 GB free |
 
-### Other GPU options (swap model tag in `.env`)
+### Other GPU configs
 
-| GPU | VRAM | Use this model |
-|-----|------|----------------|
-| A100 80GB | 80 GB | `qwen3.6:27b-bf16` ← default |
-| A100 40GB | 40 GB | `qwen3.6:27b-q4_K_M` |
-| RTX 4090 | 24 GB | `qwen3.6:27b-q4_K_M` |
-| RTX 3090 | 24 GB | `qwen3:8b-bf16` |
-| RTX 4080 | 16 GB | `qwen3:8b-q4_K_M` |
+| GPU | VRAM | Recommended model |
+|-----|------|-------------------|
+| RTX Pro 6000 | 96 GB | `Qwen/Qwen3.6-27B` BF16 ← default |
+| A100 80GB | 80 GB | `Qwen/Qwen3.6-27B` BF16 |
+| A100 40GB | 40 GB | Use `--quantization awq` |
+| RTX 4090 | 24 GB | `Qwen/Qwen3-8B` BF16 |
 
 ---
 
@@ -67,68 +69,134 @@ One-command stack for running `qwen3.6:27b-bf16` on an A100 80GB with a streamin
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MODEL_ID` | `qwen3.6:27b-bf16` | Ollama model tag |
-| `OLLAMA_PORT` | `11434` | Ollama server port |
+| `MODEL_ID` | `Qwen/Qwen3.6-27B` | HuggingFace model ID |
+| `HF_TOKEN` | *(optional)* | HF token — not needed if model already cached |
+| `VLLM_PORT` | `8000` | vLLM API port |
 | `BACKEND_PORT` | `8080` | FastAPI backend port |
 | `FRONTEND_PORT` | `3000` | Frontend (nginx) port |
-| `MAX_TOKENS` | `4096` | Default max generation tokens |
+| `MAX_TOKENS` | `4096` | Default chat max tokens |
 | `TEMPERATURE` | `0.7` | Default sampling temperature |
-| `OLLAMA_NUM_PARALLEL` | `2` | Concurrent requests Ollama handles |
+| `GPU_MEM_UTIL` | `0.90` | vLLM GPU memory utilization |
+| `MAX_MODEL_LEN` | `131072` | Max context length |
+
+> **HF_TOKEN**: Only required on first run to download the model. Once cached in `.hf-cache/`, not needed. vLLM will warn but still work without it.
 
 ---
 
 ## Quick Start
 
 ### Prerequisites
-1. Linux host with NVIDIA A100 (or compatible GPU)
-2. CUDA 12.1+ drivers installed (`nvidia-smi` works)
+1. Linux host with NVIDIA GPU (96 GB VRAM recommended)
+2. CUDA 12.1+ drivers (`nvidia-smi` must work)
 3. Docker + Docker Compose v2
-4. [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
+4. NVIDIA Container Toolkit
 
 ### Steps
 
 ```bash
-# 1. Enter project
+# 1. Clone and enter project
 cd katai-gpu
 
-# 2. Copy env
+# 2. Copy env (edit HF_TOKEN for first-time model download)
 cp .env.example .env
 
-# 3. Start everything (model downloads automatically on first run)
+# 3. Start everything
 make up
 
-# 4. Watch the model pull progress
-make logs-init
+# 4. Watch vLLM load (wait for "Application startup complete")
+make logs-vllm
 
-# 5. Once backend is healthy, open browser
+# 5. Run health check
+make test
+
+# 6. Open browser
 open http://localhost:3000
 ```
 
-> **First run note:** `qwen3.6:27b-bf16` is ~54 GB. The `ollama-init` container pulls it automatically. Backend starts only after pull completes. Track progress with `make logs-init`.
+> **First run**: Model downloads from HuggingFace (~54 GB). Takes 10-60 min depending on network. Subsequent starts load from `.hf-cache/` in ~8 seconds. Track with `make logs-vllm`.
+
+> **Do NOT `make down && make up` to update backend code.** Use `docker compose up --build -d backend` — leaves vLLM running (saves 5 min model reload).
 
 ---
 
 ## Commands
 
+### Docker
+
 | Command | Description |
 |---------|-------------|
-| `make up` | Build + start all services (pulls model on first run) |
+| `make up` | Build + start all services |
 | `make down` | Stop and remove containers |
-| `make restart` | Restart all containers |
+| `make restart` | Restart all containers (avoid — reloads vLLM) |
 | `make build` | Build images without starting |
 | `make clean` | Remove containers + images + volumes (deletes model cache) |
+| `docker compose up --build -d backend` | Rebuild only backend, keep vLLM warm |
+
+### Logs
+
+| Command | Description |
+|---------|-------------|
 | `make logs` | Follow all service logs |
-| `make logs-ollama` | Follow Ollama logs only |
-| `make logs-backend` | Follow backend logs only |
-| `make logs-init` | Watch model pull progress |
-| `make shell-backend` | Shell into backend container |
-| `make shell-ollama` | Shell into Ollama container |
-| `make pull-model` | Re-pull / update the model |
-| `make list-models` | List models in Ollama |
+| `make logs-vllm` | Follow vLLM startup + inference logs |
+| `make logs-backend` | Follow backend logs |
+| `make logs-frontend` | Follow frontend logs |
+
+### Health & Debug
+
+| Command | Description |
+|---------|-------------|
 | `make status` | Show container status |
+| `make test` | Full health check + test inference |
 | `make health-backend` | Check backend health |
-| `make health-ollama` | Check Ollama health + model list |
-| `make gpu-info` | Run nvidia-smi inside Ollama container |
+| `make health-vllm` | Check vLLM health |
+| `make gpu-info` | nvidia-smi inside vLLM container |
+| `make list-models` | List models loaded in vLLM |
+
+### Inference
+
+| Command | Description |
+|---------|-------------|
+| `make chat MSG="your question"` | Chat with model |
+| `make analyze IMG="url" PROMPT="describe"` | Analyze image |
+| `make video VID="url" PROMPT="describe"` | Basic video analysis |
+| `make video-semantic VID="url"` | Full structured JSON analysis |
+| `make video-chunk VID="url" N=4` | Parallel chunk analysis (default N=4) |
+| `make parallel N=8` | Fire N concurrent requests (concurrency test) |
+| `make vision-bench` | Parallel 4-image benchmark |
+| `make video-bench VID1="..." VID2="..."` | Parallel video benchmark |
+
+---
+
+## Video Pipeline Architecture
+
+### Direct Video Analysis
+```
+video URL → vLLM (processes all frames) → JSON / description
+```
+- `make video` — basic description
+- `make video-semantic` — full 20-section structured JSON (32K tokens)
+
+### Parallel Chunk Analysis (fastest for long videos)
+```
+ffprobe → duration
+       → N chunks planned (with 2s overlap)
+       → ThreadPoolExecutor fires all N simultaneously
+       → vLLM continuous batching: all N requests run on GPU at once
+       → json-repair closes any truncated JSON
+       → merge: deduplicate people, sort timeline, renumber scenes
+       → output/chunk_Nx_<slug>_<ts>.json
+```
+- `make video-chunk VID="url" N=4` — recommended
+- `make video-chunk VID="url" N=8` — faster for long videos
+
+### Concurrency Numbers (RTX Pro 6000 96GB)
+| Metric | Value |
+|--------|-------|
+| KV cache | ~476K tokens total |
+| Typical chunk usage | ~12K tokens at 12.3% per chunk |
+| Safe parallel chunks | 4-6 (N=4 recommended, N=8 max) |
+| Generation throughput | ~90 tok/s total across all chunks |
+| Time per chunk (8192 tokens) | ~360s wall time for N=4 |
 
 ---
 
@@ -136,126 +204,145 @@ open http://localhost:3000
 
 ```
 katai-gpu/
-├── .env.example          # Environment variable template
-├── .gitignore
-├── docker-compose.yml    # Service orchestration
-├── Makefile              # Developer convenience targets
-├── CLAUDE.md             # This file
+├── .env.example              # Environment variable template
+├── .env                      # Local config (gitignored)
+├── .hf-cache/                # HuggingFace model cache (gitignored)
+├── docker-compose.yml        # Service orchestration
+├── Makefile                  # Developer targets
+├── CLAUDE.md                 # This file
 │
-├── backend/              # FastAPI proxy
-│   ├── Dockerfile
+├── backend/
+│   ├── Dockerfile            # python:3.11-slim + curl + ffmpeg + json-repair
 │   ├── pyproject.toml
 │   └── src/
-│       ├── main.py           # FastAPI app + lifespan
-│       ├── config.py         # Pydantic settings (Ollama URLs)
+│       ├── main.py           # FastAPI app + lifespan (registers all services)
+│       ├── config.py         # Pydantic settings
 │       ├── routers/
-│       │   └── chat.py       # /api/chat + /api/chat/stream
+│       │   ├── chat.py       # /api/chat, /api/chat/stream
+│       │   ├── vision.py     # /api/vision/analyze
+│       │   └── video.py      # /api/video/* endpoints
 │       ├── services/
-│       │   └── llm.py        # Ollama client (complete + stream)
+│       │   ├── llm.py        # Chat service (vLLM client)
+│       │   ├── vision.py     # Image analysis service
+│       │   └── video.py      # Video analysis service (probe/chunk/semantic)
+│       ├── prompts/
+│       │   ├── chunk_video.py    # Chunk-aware prompt (absolute timestamps)
+│       │   └── semantic_video.py # 20-section full semantic prompt
 │       └── models/
 │           └── schemas.py    # Pydantic request/response models
 │
-├── frontend/             # React + Vite + Tailwind chat UI
-│   ├── Dockerfile        # Multi-stage: build → nginx
-│   ├── nginx.conf        # Static serve + /api proxy
-│   ├── package.json
-│   ├── tsconfig.json
-│   ├── vite.config.ts
-│   ├── tailwind.config.js
+├── frontend/
+│   ├── Dockerfile            # Multi-stage: build → nginx
+│   ├── nginx.conf
 │   └── src/
 │       ├── App.tsx
-│       ├── hooks/useChat.ts      # SSE streaming hook
+│       ├── hooks/useChat.ts
 │       └── components/
-│           ├── MessageList.tsx
-│           ├── Message.tsx
-│           ├── ChatInput.tsx
-│           └── StreamingIndicator.tsx
 │
-└── scripts/
-    ├── download_model.sh  # Manual model pull helper (Ollama API)
-    └── start.sh           # Pre-flight checks + docker compose up
+├── scripts/
+│   ├── chunk_analysis.py     # Parallel chunk orchestrator (probe→plan→map→reduce)
+│   ├── semantic_analysis.py  # Single full semantic analysis
+│   ├── vision_bench.py       # 4-image parallel benchmark
+│   └── video_bench.py        # Multi-video parallel benchmark
+│
+└── output/                   # JSON results saved here
+    ├── chunk_4x_*.json
+    └── semantic_*.json
 ```
-
----
-
-## Swapping Models
-
-Change `MODEL_ID` in `.env`, then `make down && make up`:
-
-```bash
-# A100 80GB — BF16 full precision
-MODEL_ID=qwen3.6:27b-bf16       # default — best quality
-
-# A100 40GB or RTX 4090 — quantized
-MODEL_ID=qwen3.6:27b-q4_K_M    # ~16 GB VRAM
-
-# Smaller models for lower VRAM
-MODEL_ID=qwen3:8b-bf16          # ~16 GB VRAM
-MODEL_ID=qwen3:8b               # ~5 GB VRAM (Ollama default quant)
-
-# Other families
-MODEL_ID=llama3.3:70b-bf16      # needs A100 80GB+
-MODEL_ID=mistral:7b
-```
-
-All Ollama model tags: https://ollama.com/library
 
 ---
 
 ## API Reference
 
+### Chat
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | App-level health |
-| `GET` | `/api/health` | Health + Ollama reachability |
-| `GET` | `/api/models` | List models in Ollama |
+| `GET` | `/health` | Liveness probe |
+| `GET` | `/api/health` | Health + vLLM reachability |
+| `GET` | `/api/models` | List loaded models |
 | `POST` | `/api/chat` | Non-streaming completion |
 | `POST` | `/api/chat/stream` | SSE streaming completion |
 
-### POST /api/chat/stream
+### Vision (Images)
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/vision/analyze` | Analyze image URL |
 
+### Video
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/video/probe` | Get video duration via ffprobe |
+| `POST` | `/api/video/chunk` | Analyze one temporal chunk (used by parallel pipeline) |
+| `POST` | `/api/video/semantic` | Full 20-section structured JSON analysis |
+| `POST` | `/api/video/analyze` | Basic video description |
+| `POST` | `/api/video/analyze/stream` | SSE streaming video description |
+
+### POST /api/video/chunk
 ```json
 {
-  "messages": [
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "Explain attention mechanisms."}
-  ],
-  "max_tokens": 4096,
-  "temperature": 0.7,
-  "stream": true
+  "video_url": "https://...",
+  "chunk_id": 0,
+  "total_chunks": 4,
+  "start": 0.0,
+  "end": 38.3,
+  "duration": 145.2,
+  "transcript_segment": ""
 }
 ```
 
-### SSE response format
+---
 
+## Key Implementation Notes
+
+### vLLM Reasoning Parser
+`--reasoning-parser qwen3` strips `<think>...</think>` blocks into the `reasoning` field.
+When `content` is `None` (model exhausted max_tokens during thinking), backend falls back to `reasoning` field.
+Use `chat_template_kwargs: {"enable_thinking": false}` in `extra_body` for JSON-mode requests.
+
+### ffprobe Probe
+Video duration detection uses `ffprobe`, NOT the LLM. Completes in ~0.3s, zero GPU tokens.
+The LLM-based probe was removed — model always spent all tokens thinking, leaving `content=None`.
+
+### json-repair
+Chunks hitting `max_tokens` produce truncated JSON. `json-repair` library closes open brackets/braces.
+If model output contains no `{` at all (prose/thinking leak), raises `VideoServiceError` immediately.
+
+### Concurrent Batching
+vLLM logs confirm real parallel execution:
 ```
-data: {"content": "Attention", "done": false}
-data: {"content": " mechanisms", "done": false}
-data: {"content": "", "done": true}
+Running: 4 reqs, Waiting: 0 reqs   ← all 4 chunks batched simultaneously
+GPU KV cache usage: 12.3%           ← safe, 87.7% headroom
 ```
+Ollama (old) queued requests sequentially. vLLM processes all N chunks in one GPU pass.
 
 ---
 
 ## Troubleshooting
 
-**Model pull takes too long / hangs**
-- `qwen3.6:27b-bf16` is ~54 GB — expect 10–60 min depending on network
-- Track: `make logs-init`
-- Pull manually: `make pull-model` (after `make up` starts Ollama)
+**vLLM takes 5+ min to start**
+Normal on first run after `make up`. Model loads ~51 GB into VRAM. Watch: `make logs-vllm`. Wait for `Application startup complete.`
 
-**Backend stays unhealthy**
-- Check if init completed: `make logs-init`
-- Model may still be pulling — backend waits for init to finish
-- Force check: `make health-ollama`
+**Backend 502 after `make up`**
+Backend may have started before vLLM finished loading. Wait for `Application startup complete` in vLLM logs, then retry.
 
-**"CUDA out of memory"**
-- Shouldn't happen on A100 80GB with this model
-- If it does, switch to quantized: `MODEL_ID=qwen3.6:27b-q4_K_M` in `.env`
+**Chunks all fail with "invalid JSON"**
+- Truncated JSON (hits token limit) → fixed by `json-repair`
+- Prose output (model ignored `response_format`) → chunk fails, others still merge
 
-**Slow first token**
-- Normal for large BF16 models — context loading takes time
-- Subsequent tokens stream fast once generation starts
+**"Probe returned empty content"**
+Old backend without ffprobe fix. Rebuild: `docker compose up --build -d backend`
 
-**Frontend "Failed to connect"**
-- Wait for all three containers to be healthy: `make status`
-- Backend starts only after model pull completes
+**Triton JIT warnings on first request**
+```
+Triton kernel JIT compilation during inference: _zero_kv_blocks_kernel
+```
+Normal — one-time warmup spike. No action needed.
+
+**CUDA out of memory**
+Shouldn't happen on 96 GB. If it does: reduce `GPU_MEM_UTIL` to `0.85` in `.env`, then `make down && make up`.
+
+**Model re-downloading on restart**
+`.hf-cache/` is bind-mounted to project dir. If it's missing or the volume was deleted (`make clean`), model re-downloads. Keep `.hf-cache/` on fast local disk.
+
+**N parameter not working in `make video-chunk N=8`**
+`N ?= 4` provides default. Command-line `N=8` overrides it. If still showing 4, ensure you're not setting N in `.env`.
