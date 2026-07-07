@@ -1,4 +1,4 @@
-.PHONY: up down logs build shell-backend shell-vllm restart clean test chat help
+.PHONY: up down logs build shell-backend shell-vllm restart clean test chat analyze parallel help
 
 ifneq (,$(wildcard .env))
   include .env
@@ -14,6 +14,7 @@ BACKEND_PORT       ?= 8080
 FRONTEND_PORT      ?= 3000
 MODEL              ?= $(MODEL_ID)
 MODEL              ?= Qwen/Qwen3.6-27B
+N                  ?= 4
 
 ##@ General
 
@@ -22,7 +23,7 @@ help: ## Show this help message
 
 ##@ Docker
 
-up: ## Build images and start all services (downloads model on first run via HF)
+up: ## Build images and start all services
 	@if [ ! -f .env ]; then \
 		echo "No .env found — copying from .env.example"; \
 		cp .env.example .env; \
@@ -53,99 +54,121 @@ clean: ## Remove containers, images, and volumes (WARNING: deletes model cache)
 logs: ## Follow logs for all services
 	$(COMPOSE) logs -f
 
-logs-vllm: ## Follow vLLM logs (model download + startup)
+logs-vllm: ## Follow vLLM logs
 	$(COMPOSE) logs -f vllm
 
-logs-backend: ## Follow backend logs only
+logs-backend: ## Follow backend logs
 	$(COMPOSE) logs -f backend
 
-logs-frontend: ## Follow frontend logs only
+logs-frontend: ## Follow frontend logs
 	$(COMPOSE) logs -f frontend
 
 ##@ Development
 
-shell-backend: ## Open a shell inside the backend container
+shell-backend: ## Shell into backend container
 	docker exec -it $(BACKEND_CONTAINER) /bin/bash
 
-shell-vllm: ## Open a shell inside the vLLM container
+shell-vllm: ## Shell into vLLM container
 	docker exec -it $(VLLM_CONTAINER) /bin/bash
 
 ##@ Testing
 
-test: ## Full stack health check — vLLM, backend, model list, test inference
+test: ## Full stack health check + test inference
 	@echo "=== vLLM health ==="
-	@python3 -c "\
-import urllib.request, json, sys; \
-r = urllib.request.urlopen('http://localhost:$(VLLM_PORT)/health', timeout=5); \
-print('vLLM:', r.status, r.reason)"
+	@python3 -c "import urllib.request; r = urllib.request.urlopen('http://localhost:$(VLLM_PORT)/health', timeout=5); print('OK' if r.status == 200 else 'FAIL')"
 	@echo ""
 	@echo "=== Backend health ==="
-	@python3 -c "\
-import urllib.request, json, sys; \
-r = urllib.request.urlopen('http://localhost:$(BACKEND_PORT)/health', timeout=5); \
-print(json.dumps(json.loads(r.read()), indent=2))"
+	@python3 -c "import urllib.request, json; r = urllib.request.urlopen('http://localhost:$(BACKEND_PORT)/health', timeout=5); print(json.dumps(json.loads(r.read()), indent=2))"
 	@echo ""
 	@echo "=== Models ==="
-	@python3 -c "\
-import urllib.request, json; \
-r = urllib.request.urlopen('http://localhost:$(VLLM_PORT)/v1/models', timeout=5); \
-data = json.loads(r.read()); \
-[print(' •', m['id']) for m in data.get('data', [])]"
+	@python3 -c "import urllib.request, json; r = urllib.request.urlopen('http://localhost:$(VLLM_PORT)/v1/models', timeout=5); [print(' •', m['id']) for m in json.loads(r.read()).get('data', [])]"
 	@echo ""
-	@echo "=== Test inference (say hi) ==="
+	@echo "=== Test inference ==="
 	@python3 -c "\
 import urllib.request, json; \
-payload = json.dumps({'model':'$(MODEL)','messages':[{'role':'user','content':'say hi in one sentence'}],'max_tokens':60}).encode(); \
+payload = json.dumps({'model':'$(MODEL)','messages':[{'role':'user','content':'What is 2+2? Answer in one word.'}],'max_tokens':20,'temperature':0.1}).encode(); \
 req = urllib.request.Request('http://localhost:$(VLLM_PORT)/v1/chat/completions', data=payload, headers={'Content-Type':'application/json'}); \
 data = json.loads(urllib.request.urlopen(req, timeout=60).read()); \
-print(data['choices'][0]['message']['content'])"
+print('Response:', data['choices'][0]['message']['content'].strip()); \
+print('Tokens used:', data['usage']['total_tokens'])"
 
-analyze: ## Analyze image URL — usage: make analyze IMG="https://..." PROMPT="describe this"
+chat: ## Chat with model — usage: make chat MSG="your question"
+	@python3 -c "\
+import urllib.request, json; \
+msg = '$(MSG)' if '$(MSG)' else 'What can you do?'; \
+payload = json.dumps({'messages': [{'role':'user','content': msg}], 'max_tokens': 1024}).encode(); \
+req = urllib.request.Request('http://localhost:$(BACKEND_PORT)/api/chat', data=payload, headers={'Content-Type':'application/json'}); \
+data = json.loads(urllib.request.urlopen(req, timeout=120).read()); \
+print(data['content'])"
+
+analyze: ## Analyze image — usage: make analyze IMG="https://..." PROMPT="describe"
 	@python3 -c "\
 import urllib.request, json; \
 img = '$(IMG)'; \
-prompt = '$(PROMPT)' or 'Analyze this image completely. Describe every object, color, text, and detail.'; \
+prompt = '$(PROMPT)' if '$(PROMPT)' else 'Describe every object, color, text, and detail in this image.'; \
 payload = json.dumps({'image_url': img, 'prompt': prompt}).encode(); \
-req = urllib.request.Request('http://localhost:$(BACKEND_PORT)/api/vision/analyze/stream', data=payload, headers={'Content-Type':'application/json'}); \
-resp = urllib.request.urlopen(req, timeout=300); \
-[print(json.loads(l.decode()[6:])['content'], end='', flush=True) for l in resp if l.startswith(b'data:') and b'\"done\":true' not in l]; \
-print()"
+req = urllib.request.Request('http://localhost:$(BACKEND_PORT)/api/vision/analyze', data=payload, headers={'Content-Type':'application/json'}); \
+data = json.loads(urllib.request.urlopen(req, timeout=300).read()); \
+print(data['description'])"
 
-chat: ## Interactive chat via backend SSE stream — usage: make chat MSG="your message"
+parallel: ## Fire N concurrent requests to test vLLM concurrency — usage: make parallel N=8 IMG="https://..."
 	@python3 -c "\
-import urllib.request, json; \
-msg = '$(MSG)' or 'Hello, what can you do?'; \
-payload = json.dumps({'messages':[{'role':'user','content':msg}],'max_tokens':512}).encode(); \
-req = urllib.request.Request('http://localhost:$(BACKEND_PORT)/api/chat/stream', data=payload, headers={'Content-Type':'application/json'}); \
-resp = urllib.request.urlopen(req, timeout=120); \
-[print(json.loads(l.decode()[6:])['content'], end='', flush=True) for l in resp if l.startswith(b'data:') and l.strip() != b'data: {\"content\":\"\",\"done\":true}']; \
-print()"
+import urllib.request, json, time; \
+from concurrent.futures import ThreadPoolExecutor, as_completed; \
+n = $(N); \
+img = '$(IMG)'; \
+use_vision = bool(img); \
+questions = [ \
+  'Explain attention mechanism in transformers in 2 sentences.', \
+  'What is gradient descent? Keep it brief.', \
+  'What is a neural network? One paragraph.', \
+  'Explain backpropagation simply.', \
+  'What is the difference between RNN and LSTM?', \
+  'What is batch normalization used for?', \
+  'Explain dropout regularization.', \
+  'What is the vanishing gradient problem?', \
+  'What are residual connections in deep learning?', \
+  'Explain the encoder-decoder architecture.', \
+]; \
+def call_chat(i): \
+  t0 = time.time(); \
+  payload = json.dumps({'messages':[{'role':'user','content': questions[i % len(questions)]}],'max_tokens':200}).encode(); \
+  req = urllib.request.Request('http://localhost:$(BACKEND_PORT)/api/chat', data=payload, headers={'Content-Type':'application/json'}); \
+  data = json.loads(urllib.request.urlopen(req, timeout=180).read()); \
+  return i, time.time()-t0, data['content'][:120]; \
+def call_vision(i): \
+  t0 = time.time(); \
+  payload = json.dumps({'image_url': img, 'prompt': 'Briefly describe this image in 2 sentences.'}).encode(); \
+  req = urllib.request.Request('http://localhost:$(BACKEND_PORT)/api/vision/analyze', data=payload, headers={'Content-Type':'application/json'}); \
+  data = json.loads(urllib.request.urlopen(req, timeout=300).read()); \
+  return i, time.time()-t0, data['description'][:120]; \
+fn = call_vision if use_vision else call_chat; \
+print(f'Firing {n} concurrent requests ({\"vision\" if use_vision else \"chat\"})...'); \
+print('-' * 60); \
+t_start = time.time(); \
+with ThreadPoolExecutor(max_workers=n) as ex: \
+  futures = [ex.submit(fn, i) for i in range(n)]; \
+  for f in as_completed(futures): \
+    i, elapsed, preview = f.result(); \
+    print(f'[req {i+1:02d}] {elapsed:.1f}s | {preview}...'); \
+print('-' * 60); \
+print(f'All {n} done in {time.time()-t_start:.1f}s total')"
 
 ##@ Model
 
-list-models: ## List models served by vLLM
-	@python3 -c "\
-import urllib.request, json; \
-r = urllib.request.urlopen('http://localhost:$(VLLM_PORT)/v1/models', timeout=5); \
-data = json.loads(r.read()); \
-[print(m['id']) for m in data.get('data', [])]"
+list-models: ## List models in vLLM
+	@python3 -c "import urllib.request, json; r = urllib.request.urlopen('http://localhost:$(VLLM_PORT)/v1/models', timeout=5); [print(m['id']) for m in json.loads(r.read()).get('data', [])]"
 
 ##@ Health
 
 status: ## Show container status
 	$(COMPOSE) ps
 
-health-backend: ## Check backend health endpoint
-	@python3 -c "\
-import urllib.request, json; \
-r = urllib.request.urlopen('http://localhost:$(BACKEND_PORT)/health', timeout=5); \
-print(json.dumps(json.loads(r.read()), indent=2))"
+health-backend: ## Check backend health
+	@python3 -c "import urllib.request, json; r = urllib.request.urlopen('http://localhost:$(BACKEND_PORT)/health', timeout=5); print(json.dumps(json.loads(r.read()), indent=2))"
 
-health-vllm: ## Check vLLM health endpoint
-	@python3 -c "\
-import urllib.request; \
-r = urllib.request.urlopen('http://localhost:$(VLLM_PORT)/health', timeout=5); \
-print(r.status, r.reason)"
+health-vllm: ## Check vLLM health
+	@python3 -c "import urllib.request; r = urllib.request.urlopen('http://localhost:$(VLLM_PORT)/health', timeout=5); print(r.status, r.reason)"
 
-gpu-info: ## Show GPU info inside the vLLM container
+gpu-info: ## Show GPU info
 	@docker exec $(VLLM_CONTAINER) nvidia-smi
