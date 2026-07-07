@@ -22,6 +22,11 @@ class VideoRequest(BaseModel):
     )
 
 
+class SemanticVideoRequest(BaseModel):
+    video_url: str = Field(..., description="Public URL of the video")
+    transcript: str = Field(default="", description="Optional Whisper transcript with timestamps")
+
+
 class VideoResponse(BaseModel):
     description: str
     model: str
@@ -33,6 +38,20 @@ def get_video_service(request: Request) -> VideoService:
 
 
 VideoDep = Annotated[VideoService, Depends(get_video_service)]
+
+
+@router.post("/semantic")
+async def semantic_analyze(req: SemanticVideoRequest, video: VideoDep) -> dict:
+    """
+    Full semantic JSON analysis — structured database for AI editorial systems.
+    Returns complete JSON with scenes, shots, timeline, people, clips, highlights etc.
+    """
+    try:
+        result = await video.analyze_semantic(req.video_url, req.transcript)
+    except VideoServiceError as exc:
+        logger.error("Semantic video analysis failed: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return result
 
 
 @router.post("/analyze", response_model=VideoResponse)

@@ -101,6 +101,12 @@ req = urllib.request.Request('http://localhost:$(BACKEND_PORT)/api/chat', data=p
 data = json.loads(urllib.request.urlopen(req, timeout=120).read()); \
 print(data['content'])"
 
+video-semantic: ## Full semantic JSON analysis — saves to output/ — usage: make video-semantic VID="https://..."
+	@python3 scripts/semantic_analysis.py \
+		--vid "$(VID)" \
+		--backend http://localhost:$(BACKEND_PORT) \
+		$(if $(TRANSCRIPT),--transcript "$(TRANSCRIPT)")
+
 video: ## Analyze video — usage: make video VID="https://..." PROMPT="describe"
 	@python3 -c "\
 import urllib.request, json; \

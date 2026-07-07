@@ -5,6 +5,7 @@ from collections.abc import AsyncGenerator
 import httpx
 
 from src.config import settings
+from src.prompts.semantic_video import SEMANTIC_VIDEO_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,54 @@ class VideoService:
                 },
             },
         }
+
+    async def analyze_semantic(self, video_url: str, transcript: str = "") -> dict:
+        """Full semantic JSON analysis — returns parsed dict, saves to output/."""
+        user_text = "Analyze this video completely."
+        if transcript:
+            user_text = f"Transcript (use as temporal ground truth):\n\n{transcript}\n\nAnalyze this video completely."
+
+        payload = {
+            "model": settings.model_id,
+            "messages": [
+                {"role": "system", "content": SEMANTIC_VIDEO_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {"type": "video_url", "video_url": {"url": video_url}},
+                    ],
+                },
+            ],
+            "max_tokens": 32768,
+            "temperature": 0.1,
+            "stream": False,
+            "response_format": {"type": "json_object"},
+            "extra_body": {
+                "top_k": 20,
+                "mm_processor_kwargs": {
+                    "fps": settings.video_fps,
+                    "do_sample_frames": True,
+                },
+            },
+        }
+        try:
+            r = await self._client.post(settings.llm_chat_url, json=payload)
+            r.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            logger.error("vLLM semantic video error %s: %s", exc.response.status_code, exc.response.text)
+            raise VideoServiceError(f"vLLM error {exc.response.status_code}") from exc
+        except httpx.RequestError as exc:
+            raise VideoServiceError("vLLM is unreachable") from exc
+
+        data = r.json()
+        try:
+            raw = data["choices"][0]["message"]["content"]
+            return json.loads(raw)
+        except (KeyError, IndexError) as exc:
+            raise VideoServiceError(f"Unexpected response shape: {data}") from exc
+        except json.JSONDecodeError as exc:
+            raise VideoServiceError(f"Model returned invalid JSON: {raw[:500]}") from exc
 
     async def analyze(self, video_url: str, prompt: str) -> str:
         payload = self._build_payload(video_url, prompt, stream=False)
