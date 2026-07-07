@@ -347,6 +347,27 @@ def main():
         print("[!] All chunks failed.", file=sys.stderr)
         sys.exit(1)
 
+    # ── RETRY failed chunks once ──────────────────────────────────────────────
+    if errors:
+        retry_ids = [cid for cid, _ in errors]
+        print(f"\n[retry] Retrying {len(retry_ids)} failed chunk(s): {[c+1 for c in retry_ids]}")
+        still_failed = []
+        for cid in retry_ids:
+            chunk = chunks[cid]
+            try:
+                t0 = time.time()
+                chunk_results[cid] = analyze_chunk(
+                    video_url, chunk, duration, n,
+                    trans_segments[cid], args.backend,
+                )
+                print(f"  [✓] chunk {cid+1} RETRY succeeded in {time.time()-t0:.1f}s")
+            except Exception as e:
+                print(f"  [✗] chunk {cid+1} RETRY failed: {e}")
+                still_failed.append((cid, str(e)))
+        errors = still_failed
+        ok = sum(1 for r in chunk_results if r is not None)
+        print(f"[retry] {ok}/{n} chunks now succeeded")
+
     valid_results = [r for r in chunk_results if r is not None]
 
     # ── REDUCE ──

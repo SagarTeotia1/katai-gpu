@@ -161,52 +161,72 @@ class VideoService:
         duration: float,
         transcript_segment: str = "",
     ) -> dict:
-        """Analyze one temporal chunk of the video. Returns partial semantic JSON."""
+        """Analyze one temporal chunk of the video. Returns partial semantic JSON.
+
+        Retries up to MAX_ATTEMPTS times. On retry after prose output, uses a
+        more explicit JSON-start hint to force the model out of thinking mode.
+        """
+        MAX_ATTEMPTS = 3
+
+        def _build_user_text(attempt: int) -> str:
+            base = f"Analyze seconds {start:.2f} to {end:.2f} of this video."
+            if transcript_segment:
+                base = (
+                    f"Transcript for this window ({start:.2f}s-{end:.2f}s):\n\n{transcript_segment}\n\n" + base
+                )
+            if attempt > 0:
+                # Stronger JSON hint on retry — prime the model to start immediately
+                base += f'\n\nRespond with ONLY JSON starting with {{"chunk_id": {chunk_id},'
+            return base
+
         system = chunk_system_prompt(chunk_id, total_chunks, start, end, duration)
-        user_text = f"Analyze seconds {start:.2f} to {end:.2f} of this video."
-        if transcript_segment:
-            user_text = (
-                f"Transcript for this window ({start:.2f}s-{end:.2f}s):\n\n{transcript_segment}\n\n"
-                f"Analyze seconds {start:.2f} to {end:.2f} of this video."
-            )
-        payload = {
-            "model": settings.model_id,
-            "messages": [
-                {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_text},
-                        {"type": "video_url", "video_url": {"url": video_url}},
-                    ],
+        last_exc: Exception | None = None
+
+        for attempt in range(MAX_ATTEMPTS):
+            payload = {
+                "model": settings.model_id,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": _build_user_text(attempt)},
+                            {"type": "video_url", "video_url": {"url": video_url}},
+                        ],
+                    },
+                ],
+                "max_tokens": settings.video_chunk_max_tokens,
+                "temperature": 0.0 if attempt > 0 else 0.1,
+                "stream": False,
+                "response_format": {"type": "json_object"},
+                "extra_body": {
+                    "top_k": 1 if attempt > 0 else 20,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    "mm_processor_kwargs": {"fps": settings.video_fps, "do_sample_frames": True},
                 },
-            ],
-            "max_tokens": settings.video_chunk_max_tokens,
-            "temperature": 0.1,
-            "stream": False,
-            "response_format": {"type": "json_object"},
-            "extra_body": {
-                "top_k": 20,
-                "chat_template_kwargs": {"enable_thinking": False},
-                "mm_processor_kwargs": {"fps": settings.video_fps, "do_sample_frames": True},
-            },
-        }
-        raw = ""
-        try:
-            r = await self._client.post(settings.llm_chat_url, json=payload)
-            r.raise_for_status()
-            data = r.json()
-            msg = data["choices"][0]["message"]
-            raw = _extract_content(msg, f"chunk-{chunk_id}")
-            if not raw:
-                raise VideoServiceError(f"Chunk {chunk_id} returned empty content; response: {data}")
-            return _parse_json_robust(raw, f"chunk-{chunk_id}")
-        except httpx.HTTPStatusError as exc:
-            raise VideoServiceError(f"Chunk {chunk_id} HTTP {exc.response.status_code}: {exc.response.text[:200]}") from exc
-        except VideoServiceError:
-            raise
-        except Exception as exc:
-            raise VideoServiceError(f"Chunk {chunk_id} failed: {exc}") from exc
+            }
+            raw = ""
+            try:
+                r = await self._client.post(settings.llm_chat_url, json=payload)
+                r.raise_for_status()
+                data = r.json()
+                msg = data["choices"][0]["message"]
+                raw = _extract_content(msg, f"chunk-{chunk_id}")
+                if not raw:
+                    raise VideoServiceError(f"Chunk {chunk_id} returned empty content; response: {data}")
+                return _parse_json_robust(raw, f"chunk-{chunk_id}")
+            except VideoServiceError as exc:
+                last_exc = exc
+                if "prose instead of JSON" in str(exc) and attempt < MAX_ATTEMPTS - 1:
+                    logger.warning("Chunk %d attempt %d/%d: prose output — retrying with JSON hint", chunk_id, attempt + 1, MAX_ATTEMPTS)
+                    continue
+                raise
+            except httpx.HTTPStatusError as exc:
+                raise VideoServiceError(f"Chunk {chunk_id} HTTP {exc.response.status_code}: {exc.response.text[:200]}") from exc
+            except Exception as exc:
+                raise VideoServiceError(f"Chunk {chunk_id} failed: {exc}") from exc
+
+        raise last_exc or VideoServiceError(f"Chunk {chunk_id} exhausted {MAX_ATTEMPTS} attempts")
 
     async def analyze_semantic(self, video_url: str, transcript: str = "") -> dict:
         """Full semantic JSON analysis — returns parsed dict."""
