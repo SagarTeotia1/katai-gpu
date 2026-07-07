@@ -25,8 +25,8 @@ class VisionService:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def _fetch_image_b64(self, image_url: str) -> str:
-        """Download image and return as base64 string."""
+    async def _fetch_image(self, image_url: str) -> tuple[str, str]:
+        """Download image, return (base64_string, mime_type)."""
         try:
             r = await self._client.get(image_url, follow_redirects=True)
             r.raise_for_status()
@@ -34,9 +34,12 @@ class VisionService:
             raise VisionServiceError(f"Failed to fetch image ({exc.response.status_code}): {image_url}") from exc
         except httpx.RequestError as exc:
             raise VisionServiceError(f"Cannot reach image URL: {image_url}") from exc
-        return base64.b64encode(r.content).decode("utf-8")
+        mime = r.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+        if not mime.startswith("image/"):
+            mime = "image/jpeg"
+        return base64.b64encode(r.content).decode("utf-8"), mime
 
-    def _build_payload(self, image_b64: str, prompt: str, *, stream: bool) -> dict:
+    def _build_payload(self, image_b64: str, mime: str, prompt: str, *, stream: bool) -> dict:
         return {
             "model": settings.vision_model_id,
             "messages": [
@@ -44,17 +47,18 @@ class VisionService:
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_b64}"}},
                     ],
                 }
             ],
+            "max_tokens": settings.max_tokens,
             "stream": stream,
         }
 
     async def analyze(self, image_url: str, prompt: str) -> str:
         """Non-streaming image analysis."""
-        image_b64 = await self._fetch_image_b64(image_url)
-        payload = self._build_payload(image_b64, prompt, stream=False)
+        image_b64, mime = await self._fetch_image(image_url)
+        payload = self._build_payload(image_b64, mime, prompt, stream=False)
 
         try:
             r = await self._client.post(settings.llm_chat_url, json=payload)
@@ -72,8 +76,8 @@ class VisionService:
 
     async def stream(self, image_url: str, prompt: str) -> AsyncGenerator[str, None]:
         """Streaming image analysis — yields token text chunks."""
-        image_b64 = await self._fetch_image_b64(image_url)
-        payload = self._build_payload(image_b64, prompt, stream=True)
+        image_b64, mime = await self._fetch_image(image_url)
+        payload = self._build_payload(image_b64, mime, prompt, stream=True)
 
         try:
             async with self._client.stream("POST", settings.llm_chat_url, json=payload) as response:
