@@ -17,14 +17,15 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 def _extract_content(msg: dict, context: str = "") -> str:
     """Extract text content from a vLLM message dict.
 
-    --reasoning-parser qwen3 moves <think> blocks to reasoning_content.
-    Falls back to reasoning_content if content is None/empty.
+    --reasoning-parser qwen3 moves <think> blocks to the 'reasoning' field
+    (NOT 'reasoning_content'). Falls back through both field names.
+    content is None when model exhausts max_tokens during thinking.
     """
-    raw = msg.get("content") or msg.get("reasoning_content") or ""
+    raw = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or ""
     if not isinstance(raw, str):
         raw = str(raw) if raw is not None else ""
     if "<think>" in raw:
-        logger.warning("_extract_content(%s): <think> tag found — reasoning parser may not have stripped it", context)
+        logger.warning("_extract_content(%s): <think> tag in content — stripping", context)
         raw = _THINK_RE.sub("", raw).strip()
     return raw
 
@@ -93,20 +94,20 @@ class VideoService:
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a video metadata extractor. Return ONLY valid JSON, no markdown.",
+                    "content": "/no_think\nYou are a video metadata extractor. Return ONLY valid JSON, no markdown, no thinking.",
                 },
                 {
                     "role": "user",
                     "content": [
                         {
                             "type": "text",
-                            "text": 'Watch this video and return ONLY this JSON: {"duration_seconds": <number>, "fps": <number_or_null>, "resolution": "<string_or_null>"}',
+                            "text": '/no_think Return ONLY this JSON (no explanation): {"duration_seconds": <number>, "fps": <number_or_null>, "resolution": "<WxH_or_null>"}',
                         },
                         {"type": "video_url", "video_url": {"url": video_url}},
                     ],
                 },
             ],
-            "max_tokens": 256,
+            "max_tokens": 1024,
             "temperature": 0.0,
             "stream": False,
             "response_format": {"type": "json_object"},
