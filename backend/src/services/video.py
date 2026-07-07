@@ -181,7 +181,7 @@ class VideoService:
                     ],
                 },
             ],
-            "max_tokens": 16384,
+            "max_tokens": settings.video_chunk_max_tokens,
             "temperature": 0.1,
             "stream": False,
             "response_format": {"type": "json_object"},

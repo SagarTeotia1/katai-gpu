@@ -26,9 +26,12 @@ class Settings(BaseSettings):
     # Vision — higher token limit for exhaustive descriptions
     vision_max_tokens: int = 8192
 
-    # Video — even higher limit; videos have more content
+    # Video — full semantic analysis
     video_max_tokens: int = 16384
-    video_fps: float = 2.0
+    # Chunk analysis — shorter per-chunk budget; json-repair handles truncation
+    video_chunk_max_tokens: int = 8192
+    # 1 fps = 1 frame/s; fewer prompt tokens → faster prefill + generation start
+    video_fps: float = 1.0
 
     # Server
     host: str = "0.0.0.0"
