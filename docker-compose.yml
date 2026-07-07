@@ -25,6 +25,7 @@ services:
       --max-model-len ${MAX_MODEL_LEN:-131072}
       --dtype bfloat16
       --gpu-memory-utilization ${GPU_MEM_UTIL:-0.90}
+      --max-num-seqs 512
       --reasoning-parser qwen3
       --enable-auto-tool-choice
       --tool-call-parser qwen3_coder
