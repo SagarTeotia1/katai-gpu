@@ -1,5 +1,3 @@
-version: "3.9"
-
 networks:
   katai-net:
     driver: bridge
@@ -41,19 +39,15 @@ services:
     restart: unless-stopped
 
   # ── Model pull (runs once, exits) ────────────────────────────────────────────
-  # Pulls the model from Ollama registry into the ollama_data volume.
-  # Backend waits for this to complete before starting.
+  # Uses the same ollama image (already pulled) to run `ollama pull` via CLI.
+  # OLLAMA_HOST points the CLI at the running server container.
   ollama-init:
-    image: curlimages/curl:8
+    image: ollama/ollama:latest
     container_name: katai-ollama-init
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
     entrypoint: ["/bin/sh", "-c"]
-    command: >
-      curl -X POST http://ollama:11434/api/pull
-      -H "Content-Type: application/json"
-      -d "{\"name\":\"${MODEL_ID:-qwen3.6:27b-bf16}\"}"
-      --max-time 7200
-      --silent
-      --show-error
+    command: "ollama pull ${MODEL_ID:-qwen3.6:27b-bf16}"
     depends_on:
       ollama:
         condition: service_healthy
