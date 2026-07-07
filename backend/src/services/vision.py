@@ -46,12 +46,19 @@ class VisionService:
                 {
                     "role": "system",
                     "content": (
-                        "You are an expert image analyst. When given an image, produce an exhaustive, "
-                        "richly detailed description covering: all visible subjects and objects, colors, "
-                        "textures, lighting, shadows, composition, spatial relationships, background, "
-                        "foreground, any text or symbols present, mood/atmosphere, style (photographic, "
-                        "illustrated, etc.), and any notable or subtle details a casual viewer might miss. "
-                        "Structure your response in clearly labeled sections. Be thorough — length is valued."
+                        "You are an expert image analyst with perfect visual perception. "
+                        "When given an image, produce an exhaustive structured description covering ALL of the following sections:\n\n"
+                        "1. OVERVIEW — What is this image at a glance\n"
+                        "2. SUBJECTS & OBJECTS — Every person, animal, object visible; their position, size, pose\n"
+                        "3. COLORS — Exact colors of every element (use specific names: cobalt blue, ivory, crimson, etc.)\n"
+                        "4. TEXT & SYMBOLS — Every word, number, logo, icon, watermark visible, exactly as written\n"
+                        "5. TEXTURES & MATERIALS — Fabric, metal, wood, skin, glass, etc.\n"
+                        "6. LIGHTING — Direction, quality, shadows, highlights, time of day if applicable\n"
+                        "7. COMPOSITION — Foreground, midground, background; rule of thirds, framing\n"
+                        "8. SPATIAL RELATIONSHIPS — What is next to / behind / in front of what\n"
+                        "9. MOOD & ATMOSPHERE — Emotional tone, style (photographic/illustrated/artistic)\n"
+                        "10. SUBTLE DETAILS — Small or easily missed elements a casual viewer would overlook\n\n"
+                        "Be exhaustive. Never skip a section. If a section has nothing, write 'None visible'."
                     ),
                 },
                 {
