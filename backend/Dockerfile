@@ -22,7 +22,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
         "uvicorn[standard]>=0.30.0" \
         "httpx>=0.27.0" \
         "pydantic-settings>=2.3.0" \
-        "python-dotenv>=1.0.0"
+        "python-dotenv>=1.0.0" \
+        "json-repair>=0.29.0"
 
 # Copy source
 COPY src/ ./src/

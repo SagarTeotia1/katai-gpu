@@ -5,6 +5,7 @@ import re
 from collections.abc import AsyncGenerator
 
 import httpx
+from json_repair import repair_json
 
 from src.config import settings
 from src.prompts.semantic_video import SEMANTIC_VIDEO_SYSTEM_PROMPT
@@ -13,6 +14,42 @@ from src.prompts.chunk_video import chunk_system_prompt
 logger = logging.getLogger(__name__)
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_JSON_START = re.compile(r"\{", re.DOTALL)
+
+
+def _parse_json_robust(raw: str, context: str = "") -> dict:
+    """Parse JSON with repair fallback for truncated responses.
+
+    1. Try standard json.loads (fast path, no repair overhead).
+    2. If that fails and raw starts with '{', use json_repair to close
+       truncated braces/brackets (handles 16K token cutoff mid-object).
+    3. If raw doesn't contain '{' at all, model output prose — raise immediately.
+    """
+    raw = raw.strip()
+
+    # Fast path
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # Find first '{' — if absent, model output prose/thinking, not JSON
+    m = _JSON_START.search(raw)
+    if not m:
+        raise VideoServiceError(f"{context}: model output prose instead of JSON — {raw[:200]}")
+
+    json_fragment = raw[m.start():]
+
+    try:
+        repaired = repair_json(json_fragment, return_objects=True)
+        if isinstance(repaired, dict) and repaired:
+            logger.warning("%s: JSON was truncated/malformed — repaired successfully", context)
+            return repaired
+        raise VideoServiceError(f"{context}: json_repair returned empty/non-dict: {type(repaired)}")
+    except VideoServiceError:
+        raise
+    except Exception as exc:
+        raise VideoServiceError(f"{context}: JSON repair failed: {exc} — raw[:300]: {raw[:300]}") from exc
 
 
 def _extract_content(msg: dict, context: str = "") -> str:
@@ -163,11 +200,9 @@ class VideoService:
             raw = _extract_content(msg, f"chunk-{chunk_id}")
             if not raw:
                 raise VideoServiceError(f"Chunk {chunk_id} returned empty content; response: {data}")
-            return json.loads(raw)
+            return _parse_json_robust(raw, f"chunk-{chunk_id}")
         except httpx.HTTPStatusError as exc:
             raise VideoServiceError(f"Chunk {chunk_id} HTTP {exc.response.status_code}: {exc.response.text[:200]}") from exc
-        except json.JSONDecodeError as exc:
-            raise VideoServiceError(f"Chunk {chunk_id} invalid JSON: {raw[:300]}") from exc
         except VideoServiceError:
             raise
         except Exception as exc:
@@ -213,7 +248,7 @@ class VideoService:
             raw = _extract_content(msg, "semantic")
             if not raw:
                 raise VideoServiceError(f"Semantic analysis returned empty content; response: {data}")
-            return json.loads(raw)
+            return _parse_json_robust(raw, "semantic")
         except httpx.HTTPStatusError as exc:
             logger.error("vLLM semantic video error %s: %s", exc.response.status_code, exc.response.text)
             raise VideoServiceError(f"vLLM error {exc.response.status_code}") from exc
