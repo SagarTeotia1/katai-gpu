@@ -2,9 +2,6 @@ networks:
   katai-net:
     driver: bridge
 
-volumes:
-  ollama_data:
-
 services:
   # ── Ollama inference server ──────────────────────────────────────────────────
   ollama:
@@ -18,7 +15,9 @@ services:
       - OLLAMA_MAX_LOADED_MODELS=1
       - OLLAMA_FLASH_ATTENTION=1
     volumes:
-      - ollama_data:/root/.ollama
+      # Bind mount to project dir — survives Docker restarts and Lightning AI sleep.
+      # Model weights (~56 GB) stored here, never re-downloaded after first pull.
+      - ./.ollama:/root/.ollama
     ports:
       - "${OLLAMA_PORT:-11434}:11434"
     healthcheck:
@@ -38,9 +37,7 @@ services:
               capabilities: [gpu]
     restart: unless-stopped
 
-  # ── Model pull (runs once, exits) ────────────────────────────────────────────
-  # Uses the same ollama image (already pulled) to run `ollama pull` via CLI.
-  # OLLAMA_HOST points the CLI at the running server container.
+  # ── Model pull (runs once, skips if already cached) ──────────────────────────
   ollama-init:
     image: python:3.11-slim
     container_name: katai-ollama-init
@@ -52,7 +49,19 @@ services:
       - |
         import urllib.request, json, os, sys
         model = os.environ.get('MODEL_ID', 'qwen3.6:27b-bf16')
-        print(f'Pulling {model} ...', flush=True)
+
+        # Check if model already exists — skip pull if cached
+        try:
+            with urllib.request.urlopen('http://ollama:11434/api/tags', timeout=10) as r:
+                tags = json.loads(r.read())
+                names = [m.get('name','') for m in tags.get('models', [])]
+                if model in names:
+                    print(f'Model {model} already cached — skipping pull.', flush=True)
+                    sys.exit(0)
+        except Exception:
+            pass
+
+        print(f'Pulling {model} (~56 GB, first run only) ...', flush=True)
         data = json.dumps({'name': model}).encode()
         req = urllib.request.Request(
             'http://ollama:11434/api/pull',
