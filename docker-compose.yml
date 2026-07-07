@@ -42,12 +42,33 @@ services:
   # Uses the same ollama image (already pulled) to run `ollama pull` via CLI.
   # OLLAMA_HOST points the CLI at the running server container.
   ollama-init:
-    image: curlimages/curl:latest
+    image: python:3.11-slim
     container_name: katai-ollama-init
     environment:
       - MODEL_ID=${MODEL_ID:-qwen3.6:27b-bf16}
-    entrypoint: ["/bin/sh", "-c"]
-    command: 'curl -X POST http://ollama:11434/api/pull -H "Content-Type: application/json" -d "{\"name\":\"$$MODEL_ID\"}" --no-buffer --max-time 7200 --silent --show-error'
+    command:
+      - python3
+      - "-c"
+      - |
+        import urllib.request, json, os, sys
+        model = os.environ.get('MODEL_ID', 'qwen3.6:27b-bf16')
+        print(f'Pulling {model} ...', flush=True)
+        data = json.dumps({'name': model}).encode()
+        req = urllib.request.Request(
+            'http://ollama:11434/api/pull',
+            data=data,
+            headers={'Content-Type': 'application/json'}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=7200) as resp:
+                for line in resp:
+                    txt = line.decode().strip()
+                    if txt:
+                        print(txt, flush=True)
+            print('Pull complete!', flush=True)
+        except Exception as e:
+            print(f'Error: {e}', file=sys.stderr, flush=True)
+            sys.exit(1)
     depends_on:
       ollama:
         condition: service_healthy
