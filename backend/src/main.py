@@ -7,7 +7,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.config import settings
 from src.routers.chat import router as chat_router
+from src.routers.vision import router as vision_router
 from src.services.llm import LLMService
+from src.services.vision import VisionService
 
 logger = logging.getLogger(__name__)
 
@@ -20,14 +22,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     Startup: create shared LLMService (single httpx.AsyncClient).
     Shutdown: gracefully close the HTTP connection pool.
     """
-    logger.info("Starting up — creating LLMService (Ollama: %s)", settings.llm_base_url)
+    logger.info("Starting up (Ollama: %s, model: %s)", settings.llm_base_url, settings.model_id)
     llm_service = LLMService()
+    vision_service = VisionService()
     app.state.llm_service = llm_service
+    app.state.vision_service = vision_service
 
-    yield  # ── app runs ──
+    yield
 
-    logger.info("Shutting down — closing LLMService")
+    logger.info("Shutting down")
     await llm_service.aclose()
+    await vision_service.aclose()
 
 
 # ── App factory ───────────────────────────────────────────────────────────────
@@ -53,6 +58,7 @@ def create_app() -> FastAPI:
 
     # Routers
     application.include_router(chat_router)
+    application.include_router(vision_router)
 
     return application
 

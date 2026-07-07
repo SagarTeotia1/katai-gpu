@@ -12,8 +12,12 @@ class Settings(BaseSettings):
     # Ollama connection
     llm_base_url: str = "http://ollama:11434"
 
-    # Model
+    # Model (multimodal — supports text + image)
     model_id: str = "qwen3.6:27b-bf16"
+
+    @property
+    def vision_model_id(self) -> str:
+        return self.model_id
 
     # Generation defaults
     max_tokens: int = 4096
