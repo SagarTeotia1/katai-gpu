@@ -1,0 +1,111 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Global resets ─────────────────────────────────────────────────────── */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  @apply bg-gray-950 text-gray-100 antialiased;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
+/* ── Custom scrollbar ───────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-gray-900;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-gray-700 rounded-full;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-gray-600;
+}
+
+/* ── Markdown prose styles (assistant messages) ─────────────────────────── */
+.prose-dark {
+  @apply text-gray-100;
+}
+
+.prose-dark p {
+  @apply mb-3 last:mb-0 leading-relaxed;
+}
+
+.prose-dark h1,
+.prose-dark h2,
+.prose-dark h3,
+.prose-dark h4 {
+  @apply font-semibold text-white mt-5 mb-2;
+}
+
+.prose-dark h1 { @apply text-xl; }
+.prose-dark h2 { @apply text-lg; }
+.prose-dark h3 { @apply text-base; }
+
+.prose-dark ul {
+  @apply list-disc list-outside pl-5 mb-3 space-y-1;
+}
+
+.prose-dark ol {
+  @apply list-decimal list-outside pl-5 mb-3 space-y-1;
+}
+
+.prose-dark li {
+  @apply leading-relaxed;
+}
+
+.prose-dark blockquote {
+  @apply border-l-4 border-blue-500 pl-4 italic text-gray-400 my-3;
+}
+
+.prose-dark strong {
+  @apply font-semibold text-white;
+}
+
+.prose-dark em {
+  @apply italic text-gray-300;
+}
+
+.prose-dark hr {
+  @apply border-gray-700 my-4;
+}
+
+.prose-dark a {
+  @apply text-blue-400 underline hover:text-blue-300 transition-colors;
+}
+
+/* ── Code blocks ────────────────────────────────────────────────────────── */
+.prose-dark code {
+  @apply bg-gray-900 text-emerald-400 rounded px-1.5 py-0.5 text-sm font-mono;
+}
+
+.prose-dark pre {
+  @apply bg-gray-900 rounded-lg p-4 overflow-x-auto mb-3 border border-gray-800;
+}
+
+.prose-dark pre code {
+  @apply bg-transparent p-0 text-sm text-gray-200;
+}
+
+/* ── Textarea auto-grow ─────────────────────────────────────────────────── */
+textarea {
+  field-sizing: content;
+}

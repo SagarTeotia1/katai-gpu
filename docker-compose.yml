@@ -1,0 +1,105 @@
+version: "3.9"
+
+networks:
+  katai-net:
+    driver: bridge
+
+volumes:
+  ollama_data:
+
+services:
+  # ── Ollama inference server ──────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: katai-ollama
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-2}
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_FLASH_ATTENTION=1
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - katai-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # ── Model pull (runs once, exits) ────────────────────────────────────────────
+  # Pulls the model from Ollama registry into the ollama_data volume.
+  # Backend waits for this to complete before starting.
+  ollama-init:
+    image: curlimages/curl:8
+    container_name: katai-ollama-init
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      curl -X POST http://ollama:11434/api/pull
+      -H "Content-Type: application/json"
+      -d "{\"name\":\"${MODEL_ID:-qwen3.6:27b-bf16}\"}"
+      --max-time 7200
+      --silent
+      --show-error
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - katai-net
+    restart: "no"
+
+  # ── FastAPI backend proxy ────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: katai-backend
+    environment:
+      - LLM_BASE_URL=http://ollama:11434
+      - MODEL_ID=${MODEL_ID:-qwen3.6:27b-bf16}
+      - MAX_TOKENS=${MAX_TOKENS:-4096}
+      - TEMPERATURE=${TEMPERATURE:-0.7}
+      - HOST=0.0.0.0
+      - PORT=8080
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    depends_on:
+      ollama-init:
+        condition: service_completed_successfully
+    networks:
+      - katai-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── React / Nginx frontend ────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: katai-frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - katai-net
+    restart: unless-stopped
