@@ -16,7 +16,10 @@ router = APIRouter(prefix="/api/vision", tags=["vision"])
 
 class VisionRequest(BaseModel):
     image_url: str = Field(..., description="Public URL of the image to analyze")
-    prompt: str = Field(default="Describe this image in detail.", description="Instruction for the model")
+    prompt: str = Field(
+        default="Provide the most exhaustive, detailed description of this image possible. Cover every visible element, color, texture, spatial relationship, lighting, mood, text, symbols, and subtle details.",
+        description="Instruction for the model",
+    )
 
 
 class VisionResponse(BaseModel):

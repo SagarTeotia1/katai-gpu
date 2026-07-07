@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     max_tokens: int = 4096
     temperature: float = 0.7
 
+    # Vision — higher token limit for exhaustive descriptions
+    vision_max_tokens: int = 8192
+
     # Server
     host: str = "0.0.0.0"
     port: int = 8080

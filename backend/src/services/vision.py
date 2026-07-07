@@ -44,14 +44,26 @@ class VisionService:
             "model": settings.vision_model_id,
             "messages": [
                 {
+                    "role": "system",
+                    "content": (
+                        "You are an expert image analyst. When given an image, produce an exhaustive, "
+                        "richly detailed description covering: all visible subjects and objects, colors, "
+                        "textures, lighting, shadows, composition, spatial relationships, background, "
+                        "foreground, any text or symbols present, mood/atmosphere, style (photographic, "
+                        "illustrated, etc.), and any notable or subtle details a casual viewer might miss. "
+                        "Structure your response in clearly labeled sections. Be thorough — length is valued."
+                    ),
+                },
+                {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
                         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_b64}"}},
                     ],
-                }
+                },
             ],
-            "max_tokens": settings.max_tokens,
+            "max_tokens": settings.vision_max_tokens,
+            "temperature": 0.3,
             "stream": stream,
         }
 
