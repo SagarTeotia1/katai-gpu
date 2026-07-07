@@ -101,6 +101,14 @@ req = urllib.request.Request('http://localhost:$(BACKEND_PORT)/api/chat', data=p
 data = json.loads(urllib.request.urlopen(req, timeout=120).read()); \
 print(data['content'])"
 
+video-chunk: ## Parallel chunk analysis — splits video into N chunks, processes concurrently, merges
+	@python3 scripts/chunk_analysis.py \
+		--vid "$(VID)" \
+		--chunks $(or $(N),4) \
+		--backend http://localhost:$(BACKEND_PORT) \
+		$(if $(DURATION),--duration "$(DURATION)") \
+		$(if $(TRANSCRIPT),--transcript "$(TRANSCRIPT)")
+
 video-semantic: ## Full semantic JSON analysis — saves to output/ — usage: make video-semantic VID="https://..."
 	@python3 scripts/semantic_analysis.py \
 		--vid "$(VID)" \

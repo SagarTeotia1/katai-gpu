@@ -6,6 +6,7 @@ import httpx
 
 from src.config import settings
 from src.prompts.semantic_video import SEMANTIC_VIDEO_SYSTEM_PROMPT
+from src.prompts.chunk_video import chunk_system_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,97 @@ class VideoService:
                 },
             },
         }
+
+    async def probe(self, video_url: str) -> float:
+        """Fast probe: ask model for video duration only. Returns duration in seconds."""
+        payload = {
+            "model": settings.model_id,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a video metadata extractor. Return ONLY valid JSON, no markdown.",
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": 'Watch this video and return ONLY this JSON: {"duration_seconds": <number>, "fps": <number_or_null>, "resolution": "<string_or_null>"}',
+                        },
+                        {"type": "video_url", "video_url": {"url": video_url}},
+                    ],
+                },
+            ],
+            "max_tokens": 128,
+            "temperature": 0.0,
+            "stream": False,
+            "response_format": {"type": "json_object"},
+            "extra_body": {
+                "top_k": 1,
+                "mm_processor_kwargs": {"fps": 1.0, "do_sample_frames": True},
+            },
+        }
+        try:
+            r = await self._client.post(settings.llm_chat_url, json=payload)
+            r.raise_for_status()
+            data = r.json()
+            raw = data["choices"][0]["message"]["content"]
+            meta = json.loads(raw)
+            return float(meta.get("duration_seconds", 0))
+        except Exception as exc:
+            raise VideoServiceError(f"Probe failed: {exc}") from exc
+
+    async def analyze_chunk(
+        self,
+        video_url: str,
+        chunk_id: int,
+        total_chunks: int,
+        start: float,
+        end: float,
+        duration: float,
+        transcript_segment: str = "",
+    ) -> dict:
+        """Analyze one temporal chunk of the video. Returns partial semantic JSON."""
+        system = chunk_system_prompt(chunk_id, total_chunks, start, end, duration)
+        user_text = f"Analyze seconds {start:.2f} to {end:.2f} of this video."
+        if transcript_segment:
+            user_text = (
+                f"Transcript for this window ({start:.2f}s-{end:.2f}s):\n\n{transcript_segment}\n\n"
+                f"Analyze seconds {start:.2f} to {end:.2f} of this video."
+            )
+        payload = {
+            "model": settings.model_id,
+            "messages": [
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {"type": "video_url", "video_url": {"url": video_url}},
+                    ],
+                },
+            ],
+            "max_tokens": 16384,
+            "temperature": 0.1,
+            "stream": False,
+            "response_format": {"type": "json_object"},
+            "extra_body": {
+                "top_k": 20,
+                "mm_processor_kwargs": {"fps": settings.video_fps, "do_sample_frames": True},
+            },
+        }
+        try:
+            r = await self._client.post(settings.llm_chat_url, json=payload)
+            r.raise_for_status()
+            data = r.json()
+            raw = data["choices"][0]["message"]["content"]
+            return json.loads(raw)
+        except httpx.HTTPStatusError as exc:
+            raise VideoServiceError(f"Chunk {chunk_id} HTTP {exc.response.status_code}") from exc
+        except json.JSONDecodeError as exc:
+            raise VideoServiceError(f"Chunk {chunk_id} returned invalid JSON") from exc
+        except Exception as exc:
+            raise VideoServiceError(f"Chunk {chunk_id} failed: {exc}") from exc
 
     async def analyze_semantic(self, video_url: str, transcript: str = "") -> dict:
         """Full semantic JSON analysis — returns parsed dict, saves to output/."""

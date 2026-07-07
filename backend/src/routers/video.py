@@ -27,6 +27,20 @@ class SemanticVideoRequest(BaseModel):
     transcript: str = Field(default="", description="Optional Whisper transcript with timestamps")
 
 
+class ProbeRequest(BaseModel):
+    video_url: str
+
+
+class ChunkRequest(BaseModel):
+    video_url: str
+    chunk_id: int
+    total_chunks: int
+    start: float
+    end: float
+    duration: float
+    transcript_segment: str = ""
+
+
 class VideoResponse(BaseModel):
     description: str
     model: str
@@ -38,6 +52,30 @@ def get_video_service(request: Request) -> VideoService:
 
 
 VideoDep = Annotated[VideoService, Depends(get_video_service)]
+
+
+@router.post("/probe")
+async def probe(req: ProbeRequest, video: VideoDep) -> dict:
+    """Fast probe — returns video duration in seconds."""
+    try:
+        duration = await video.probe(req.video_url)
+    except VideoServiceError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"duration_seconds": duration}
+
+
+@router.post("/chunk")
+async def analyze_chunk(req: ChunkRequest, video: VideoDep) -> dict:
+    """Analyze one temporal chunk. Used by parallel chunk orchestrator."""
+    try:
+        result = await video.analyze_chunk(
+            req.video_url, req.chunk_id, req.total_chunks,
+            req.start, req.end, req.duration, req.transcript_segment,
+        )
+    except VideoServiceError as exc:
+        logger.error("Chunk %d failed: %s", req.chunk_id, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return result
 
 
 @router.post("/semantic")
