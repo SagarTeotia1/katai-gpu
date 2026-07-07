@@ -100,9 +100,20 @@ class VideoService:
             r = await self._client.post(settings.llm_chat_url, json=payload)
             r.raise_for_status()
             data = r.json()
-            raw = data["choices"][0]["message"]["content"]
+            msg = data["choices"][0]["message"]
+            # --reasoning-parser qwen3 moves <think> to reasoning_content; real JSON in content
+            # If model only thinks and emits no post-think text, content is None → fall back
+            raw = msg.get("content") or msg.get("reasoning_content") or ""
+            if not raw:
+                raise VideoServiceError("Probe returned empty content")
+            # Strip think tags if reasoning_parser didn't (defensive)
+            if "<think>" in raw:
+                import re
+                raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
             meta = json.loads(raw)
             return float(meta.get("duration_seconds", 0))
+        except VideoServiceError:
+            raise
         except Exception as exc:
             raise VideoServiceError(f"Probe failed: {exc}") from exc
 
@@ -149,7 +160,11 @@ class VideoService:
             r = await self._client.post(settings.llm_chat_url, json=payload)
             r.raise_for_status()
             data = r.json()
-            raw = data["choices"][0]["message"]["content"]
+            msg = data["choices"][0]["message"]
+            raw = msg.get("content") or msg.get("reasoning_content") or ""
+            if "<think>" in raw:
+                import re
+                raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
             return json.loads(raw)
         except httpx.HTTPStatusError as exc:
             raise VideoServiceError(f"Chunk {chunk_id} HTTP {exc.response.status_code}") from exc
@@ -199,7 +214,11 @@ class VideoService:
 
         data = r.json()
         try:
-            raw = data["choices"][0]["message"]["content"]
+            msg = data["choices"][0]["message"]
+            raw = msg.get("content") or msg.get("reasoning_content") or ""
+            if "<think>" in raw:
+                import re
+                raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
             return json.loads(raw)
         except (KeyError, IndexError) as exc:
             raise VideoServiceError(f"Unexpected response shape: {data}") from exc
