@@ -42,7 +42,7 @@ services:
   # Uses the same ollama image (already pulled) to run `ollama pull` via CLI.
   # OLLAMA_HOST points the CLI at the running server container.
   ollama-init:
-    image: ollama/ollama:latest
+    image: curlimages/curl:latest
     container_name: katai-ollama-init
     entrypoint: ["/bin/sh", "-c"]
     command: >
