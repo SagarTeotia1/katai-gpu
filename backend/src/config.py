@@ -9,11 +9,11 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Ollama connection
-    llm_base_url: str = "http://ollama:11434"
+    # vLLM connection
+    llm_base_url: str = "http://vllm:8000"
 
-    # Model (multimodal — supports text + image)
-    model_id: str = "qwen3.6:27b-bf16"
+    # Model (HuggingFace model ID)
+    model_id: str = "Qwen/Qwen3.6-27B"
 
     @property
     def vision_model_id(self) -> str:
@@ -43,8 +43,7 @@ class Settings(BaseSettings):
 
     @property
     def llm_health_url(self) -> str:
-        # Ollama health endpoint — returns list of local models
-        return f"{self.llm_base_url}/api/tags"
+        return f"{self.llm_base_url}/health"
 
     @property
     def origins(self) -> list[str]:

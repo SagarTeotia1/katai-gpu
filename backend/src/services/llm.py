@@ -16,7 +16,7 @@ class LLMServiceError(Exception):
 
 
 class LLMService:
-    """Async client for Ollama's OpenAI-compatible API."""
+    """Async client for vLLM's OpenAI-compatible API."""
 
     def __init__(self) -> None:
         self._client: httpx.AsyncClient = httpx.AsyncClient(
@@ -60,11 +60,11 @@ class LLMService:
             response = await self._client.post(settings.llm_chat_url, json=payload)
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            logger.error("Ollama returned %s: %s", exc.response.status_code, exc.response.text)
-            raise LLMServiceError(f"Ollama error {exc.response.status_code}") from exc
+            logger.error("vLLM returned %s: %s", exc.response.status_code, exc.response.text)
+            raise LLMServiceError(f"vLLM error {exc.response.status_code}") from exc
         except httpx.RequestError as exc:
-            logger.error("Cannot reach Ollama at %s: %s", settings.llm_chat_url, exc)
-            raise LLMServiceError("Ollama is unreachable") from exc
+            logger.error("Cannot reach vLLM at %s: %s", settings.llm_chat_url, exc)
+            raise LLMServiceError("vLLM is unreachable") from exc
 
         data = response.json()
 
@@ -72,7 +72,7 @@ class LLMService:
             content: str = data["choices"][0]["message"]["content"]
             tokens_used: int = data.get("usage", {}).get("total_tokens", 0)
         except (KeyError, IndexError) as exc:
-            raise LLMServiceError(f"Unexpected Ollama response shape: {data}") from exc
+            raise LLMServiceError(f"Unexpected vLLM response shape: {data}") from exc
 
         return content, tokens_used
 
@@ -82,7 +82,7 @@ class LLMService:
         max_tokens: int,
         temperature: float,
     ) -> AsyncGenerator[str, None]:
-        """Yields token text chunks from Ollama's SSE stream."""
+        """Yields token text chunks from vLLM's SSE stream."""
         payload = self._build_payload(messages, max_tokens, temperature, stream=True)
 
         try:
@@ -114,11 +114,11 @@ class LLMService:
                         yield content
 
         except httpx.HTTPStatusError as exc:
-            logger.error("Ollama stream error %s: %s", exc.response.status_code, exc.response.text)
-            raise LLMServiceError(f"Ollama stream error {exc.response.status_code}") from exc
+            logger.error("vLLM stream error %s: %s", exc.response.status_code, exc.response.text)
+            raise LLMServiceError(f"vLLM stream error {exc.response.status_code}") from exc
         except httpx.RequestError as exc:
-            logger.error("Ollama stream connection error: %s", exc)
-            raise LLMServiceError("Ollama is unreachable") from exc
+            logger.error("vLLM stream connection error: %s", exc)
+            raise LLMServiceError("vLLM is unreachable") from exc
 
     async def is_healthy(self) -> bool:
         try:

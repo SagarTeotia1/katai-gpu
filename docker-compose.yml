@@ -3,29 +3,37 @@ networks:
     driver: bridge
 
 services:
-  # ── Ollama inference server ──────────────────────────────────────────────────
-  ollama:
-    image: ollama/ollama:latest
-    container_name: katai-ollama
+  # ── vLLM inference server ─────────────────────────────────────────────────────
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: katai-vllm
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-2}
-      - OLLAMA_MAX_LOADED_MODELS=1
-      - OLLAMA_FLASH_ATTENTION=1
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+      - HF_TOKEN=${HF_TOKEN}
     volumes:
-      # Bind mount to project dir — survives Docker restarts and Lightning AI sleep.
-      # Model weights (~56 GB) stored here, never re-downloaded after first pull.
-      - ./.ollama:/root/.ollama
+      # HF model cache — persists across restarts, avoids re-download (~54 GB)
+      - ./.hf-cache:/root/.cache/huggingface
     ports:
-      - "${OLLAMA_PORT:-11434}:11434"
+      - "${VLLM_PORT:-8000}:8000"
+    command: >
+      --model ${MODEL_ID:-Qwen/Qwen3.6-27B}
+      --port 8000
+      --tensor-parallel-size 1
+      --max-model-len ${MAX_MODEL_LEN:-131072}
+      --dtype bfloat16
+      --gpu-memory-utilization ${GPU_MEM_UTIL:-0.90}
+      --reasoning-parser qwen3
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_coder
     healthcheck:
-      test: ["CMD-SHELL", "ollama list || exit 1"]
-      interval: 10s
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
       timeout: 10s
-      retries: 15
-      start_period: 60s
+      retries: 30
+      start_period: 300s
     networks:
       - katai-net
     deploy:
@@ -36,54 +44,7 @@ services:
               count: all
               capabilities: [gpu]
     restart: unless-stopped
-
-  # ── Model pull (runs once, skips if already cached) ──────────────────────────
-  ollama-init:
-    image: python:3.11-slim
-    container_name: katai-ollama-init
-    environment:
-      - MODEL_ID=${MODEL_ID:-qwen3.6:27b-bf16}
-    command:
-      - python3
-      - "-c"
-      - |
-        import urllib.request, json, os, sys
-        model = os.environ.get('MODEL_ID', 'qwen3.6:27b-bf16')
-
-        # Check if model already exists — skip pull if cached
-        try:
-            with urllib.request.urlopen('http://ollama:11434/api/tags', timeout=10) as r:
-                tags = json.loads(r.read())
-                names = [m.get('name','') for m in tags.get('models', [])]
-                if model in names:
-                    print(f'Model {model} already cached — skipping pull.', flush=True)
-                    sys.exit(0)
-        except Exception:
-            pass
-
-        print(f'Pulling {model} (~56 GB, first run only) ...', flush=True)
-        data = json.dumps({'name': model}).encode()
-        req = urllib.request.Request(
-            'http://ollama:11434/api/pull',
-            data=data,
-            headers={'Content-Type': 'application/json'}
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=7200) as resp:
-                for line in resp:
-                    txt = line.decode().strip()
-                    if txt:
-                        print(txt, flush=True)
-            print('Pull complete!', flush=True)
-        except Exception as e:
-            print(f'Error: {e}', file=sys.stderr, flush=True)
-            sys.exit(1)
-    depends_on:
-      ollama:
-        condition: service_healthy
-    networks:
-      - katai-net
-    restart: "no"
+    ipc: host
 
   # ── FastAPI backend proxy ────────────────────────────────────────────────────
   backend:
@@ -92,8 +53,8 @@ services:
       dockerfile: Dockerfile
     container_name: katai-backend
     environment:
-      - LLM_BASE_URL=http://ollama:11434
-      - MODEL_ID=${MODEL_ID:-qwen3.6:27b-bf16}
+      - LLM_BASE_URL=http://vllm:8000
+      - MODEL_ID=${MODEL_ID:-Qwen/Qwen3.6-27B}
       - MAX_TOKENS=${MAX_TOKENS:-4096}
       - TEMPERATURE=${TEMPERATURE:-0.7}
       - HOST=0.0.0.0
@@ -101,8 +62,8 @@ services:
     ports:
       - "${BACKEND_PORT:-8080}:8080"
     depends_on:
-      ollama-init:
-        condition: service_completed_successfully
+      vllm:
+        condition: service_healthy
     networks:
       - katai-net
     restart: unless-stopped

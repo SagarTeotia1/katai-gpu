@@ -17,8 +17,8 @@ router = APIRouter(prefix="/api/vision", tags=["vision"])
 class VisionRequest(BaseModel):
     image_url: str = Field(..., description="Public URL of the image to analyze")
     prompt: str = Field(
-        default="/think Analyze this image completely. Extract and describe every color, every piece of text, every object, every subtle detail. Miss nothing.",
-        description="Instruction for the model — /think prefix enables Qwen3 reasoning mode",
+        default="Analyze this image completely. Extract and describe every color, every piece of text, every object, every subtle detail. Miss nothing.",
+        description="Instruction for the model",
     )
 
 

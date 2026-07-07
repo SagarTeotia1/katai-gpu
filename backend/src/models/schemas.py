@@ -36,5 +36,5 @@ class HealthResponse(BaseModel):
     """Health check response."""
 
     status: str
-    ollama_reachable: bool
+    vllm_reachable: bool
     model_id: str

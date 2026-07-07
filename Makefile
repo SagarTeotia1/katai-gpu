@@ -1,16 +1,16 @@
-.PHONY: up down logs build shell-backend shell-ollama pull-model restart clean help
+.PHONY: up down logs build shell-backend shell-vllm restart clean help
 
 ifneq (,$(wildcard .env))
   include .env
   export
 endif
 
-COMPOSE          := docker compose
-BACKEND_CONTAINER := katai-backend
-OLLAMA_CONTAINER  := katai-ollama
+COMPOSE            := docker compose
+BACKEND_CONTAINER  := katai-backend
+VLLM_CONTAINER     := katai-vllm
 FRONTEND_CONTAINER := katai-frontend
-MODEL            ?= $(MODEL_ID)
-MODEL            ?= qwen3.6:27b-bf16
+MODEL              ?= $(MODEL_ID)
+MODEL              ?= Qwen/Qwen3.6-27B
 
 ##@ General
 
@@ -19,19 +19,19 @@ help: ## Show this help message
 
 ##@ Docker
 
-up: ## Build images and start all services (pulls model on first run)
+up: ## Build images and start all services (downloads model on first run via HF)
 	@if [ ! -f .env ]; then \
 		echo "No .env found — copying from .env.example"; \
 		cp .env.example .env; \
 	fi
 	$(COMPOSE) up --build -d
 	@echo ""
-	@echo "  Services starting — model pull may take a while (~54 GB for BF16)"
-	@echo "    Ollama API  → http://localhost:$(OLLAMA_PORT)"
+	@echo "  Services starting — first run downloads model from HuggingFace (~54 GB)"
+	@echo "    vLLM API    → http://localhost:$(VLLM_PORT)"
 	@echo "    Backend     → http://localhost:$(BACKEND_PORT)"
 	@echo "    Frontend    → http://localhost:$(FRONTEND_PORT)"
 	@echo ""
-	@echo "  Run 'make logs' to follow progress."
+	@echo "  Run 'make logs-vllm' to follow vLLM startup + model load progress."
 
 down: ## Stop and remove containers
 	$(COMPOSE) down
@@ -50,8 +50,8 @@ clean: ## Remove containers, images, and volumes (WARNING: deletes model cache)
 logs: ## Follow logs for all services
 	$(COMPOSE) logs -f
 
-logs-ollama: ## Follow Ollama logs only
-	$(COMPOSE) logs -f ollama
+logs-vllm: ## Follow vLLM logs (model download + startup)
+	$(COMPOSE) logs -f vllm
 
 logs-backend: ## Follow backend logs only
 	$(COMPOSE) logs -f backend
@@ -59,25 +59,18 @@ logs-backend: ## Follow backend logs only
 logs-frontend: ## Follow frontend logs only
 	$(COMPOSE) logs -f frontend
 
-logs-init: ## Follow model pull init logs
-	$(COMPOSE) logs ollama-init
-
 ##@ Development
 
 shell-backend: ## Open a shell inside the backend container
 	docker exec -it $(BACKEND_CONTAINER) /bin/bash
 
-shell-ollama: ## Open a shell inside the Ollama container
-	docker exec -it $(OLLAMA_CONTAINER) /bin/bash
+shell-vllm: ## Open a shell inside the vLLM container
+	docker exec -it $(VLLM_CONTAINER) /bin/bash
 
 ##@ Model
 
-pull-model: ## Pull/update the model (Ollama must be running: make up)
-	@echo "Pulling $(MODEL) into Ollama..."
-	docker exec $(OLLAMA_CONTAINER) ollama pull $(MODEL)
-
-list-models: ## List models currently loaded in Ollama
-	@docker exec $(OLLAMA_CONTAINER) ollama list
+list-models: ## List models served by vLLM
+	@curl -sf http://localhost:$(VLLM_PORT)/v1/models | python3 -m json.tool
 
 ##@ Health
 
@@ -87,8 +80,8 @@ status: ## Show container status
 health-backend: ## Check backend health endpoint
 	@curl -sf http://localhost:$(BACKEND_PORT)/health | python3 -m json.tool
 
-health-ollama: ## Check Ollama health endpoint
-	@curl -sf http://localhost:$(OLLAMA_PORT)/api/tags | python3 -m json.tool
+health-vllm: ## Check vLLM health endpoint
+	@curl -sf http://localhost:$(VLLM_PORT)/health
 
-gpu-info: ## Show GPU info inside the Ollama container
-	@docker exec $(OLLAMA_CONTAINER) nvidia-smi
+gpu-info: ## Show GPU info inside the vLLM container
+	@docker exec $(VLLM_CONTAINER) nvidia-smi

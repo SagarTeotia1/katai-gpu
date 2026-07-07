@@ -22,7 +22,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     Startup: create shared LLMService (single httpx.AsyncClient).
     Shutdown: gracefully close the HTTP connection pool.
     """
-    logger.info("Starting up (Ollama: %s, model: %s)", settings.llm_base_url, settings.model_id)
+    logger.info("Starting up (vLLM: %s, model: %s)", settings.llm_base_url, settings.model_id)
     llm_service = LLMService()
     vision_service = VisionService()
     app.state.llm_service = llm_service
@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 def create_app() -> FastAPI:
     application = FastAPI(
         title="katai-gpu Backend",
-        description="FastAPI proxy for Qwen local GPU inference via Ollama",
+        description="FastAPI proxy for Qwen local GPU inference via vLLM",
         version="1.0.0",
         docs_url="/docs",
         redoc_url="/redoc",

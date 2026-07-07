@@ -15,7 +15,7 @@ class VisionServiceError(Exception):
 
 
 class VisionService:
-    """Downloads images and runs them through Ollama's vision model."""
+    """Downloads images and runs them through vLLM's vision model."""
 
     def __init__(self) -> None:
         self._client = httpx.AsyncClient(
@@ -83,9 +83,9 @@ class VisionService:
             r = await self._client.post(settings.llm_chat_url, json=payload)
             r.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise VisionServiceError(f"Ollama vision error {exc.response.status_code}") from exc
+            raise VisionServiceError(f"vLLM vision error {exc.response.status_code}") from exc
         except httpx.RequestError as exc:
-            raise VisionServiceError("Ollama unreachable") from exc
+            raise VisionServiceError("vLLM unreachable") from exc
 
         data = r.json()
         try:
@@ -116,6 +116,6 @@ class VisionService:
                     if content:
                         yield content
         except httpx.HTTPStatusError as exc:
-            raise VisionServiceError(f"Ollama stream error {exc.response.status_code}") from exc
+            raise VisionServiceError(f"vLLM stream error {exc.response.status_code}") from exc
         except httpx.RequestError as exc:
-            raise VisionServiceError("Ollama unreachable during stream") from exc
+            raise VisionServiceError("vLLM unreachable during stream") from exc

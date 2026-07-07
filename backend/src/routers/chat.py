@@ -34,10 +34,10 @@ async def health(llm: LLMDep) -> HealthResponse:
     """
     Detailed health check — probes the vLLM service.
     """
-    ollama_ok = await llm.is_healthy()
+    vllm_ok = await llm.is_healthy()
     return HealthResponse(
-        status="ok" if ollama_ok else "degraded",
-        ollama_reachable=ollama_ok,
+        status="ok" if vllm_ok else "degraded",
+        vllm_reachable=vllm_ok,
         model_id=settings.model_id,
     )
 
