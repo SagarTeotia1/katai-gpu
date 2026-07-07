@@ -100,7 +100,18 @@ req = urllib.request.Request('http://localhost:$(VLLM_PORT)/v1/chat/completions'
 data = json.loads(urllib.request.urlopen(req, timeout=60).read()); \
 print(data['choices'][0]['message']['content'])"
 
-chat: ## Interactive chat via backend SSE stream (type message as MSG=)
+analyze: ## Analyze image URL — usage: make analyze IMG="https://..." PROMPT="describe this"
+	@python3 -c "\
+import urllib.request, json; \
+img = '$(IMG)'; \
+prompt = '$(PROMPT)' or 'Analyze this image completely. Describe every object, color, text, and detail.'; \
+payload = json.dumps({'image_url': img, 'prompt': prompt}).encode(); \
+req = urllib.request.Request('http://localhost:$(BACKEND_PORT)/api/vision/analyze/stream', data=payload, headers={'Content-Type':'application/json'}); \
+resp = urllib.request.urlopen(req, timeout=300); \
+[print(json.loads(l.decode()[6:])['content'], end='', flush=True) for l in resp if l.startswith(b'data:') and b'\"done\":true' not in l]; \
+print()"
+
+chat: ## Interactive chat via backend SSE stream — usage: make chat MSG="your message"
 	@python3 -c "\
 import urllib.request, json; \
 msg = '$(MSG)' or 'Hello, what can you do?'; \
