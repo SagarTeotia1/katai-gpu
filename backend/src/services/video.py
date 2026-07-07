@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -88,53 +89,30 @@ class VideoService:
         }
 
     async def probe(self, video_url: str) -> float:
-        """Fast probe: ask model for video duration only. Returns duration in seconds."""
-        payload = {
-            "model": settings.model_id,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "/no_think\nYou are a video metadata extractor. Return ONLY valid JSON, no markdown, no thinking.",
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": '/no_think Return ONLY this JSON (no explanation): {"duration_seconds": <number>, "fps": <number_or_null>, "resolution": "<WxH_or_null>"}',
-                        },
-                        {"type": "video_url", "video_url": {"url": video_url}},
-                    ],
-                },
-            ],
-            "max_tokens": 1024,
-            "temperature": 0.0,
-            "stream": False,
-            "response_format": {"type": "json_object"},
-            "extra_body": {
-                "top_k": 1,
-                "chat_template_kwargs": {"enable_thinking": False},
-                "mm_processor_kwargs": {"fps": 1.0, "do_sample_frames": True},
-            },
-        }
+        """Get video duration via ffprobe. Fast (~1s), accurate, no LLM tokens consumed."""
         try:
-            r = await self._client.post(settings.llm_chat_url, json=payload)
-            r.raise_for_status()
-            data = r.json()
-            msg = data["choices"][0]["message"]
-            raw = _extract_content(msg, "probe")
-            if not raw:
-                raise VideoServiceError(f"Probe returned empty content; response: {data}")
-            meta = json.loads(raw)
-            return float(meta.get("duration_seconds", 0))
+            proc = await asyncio.create_subprocess_exec(
+                "ffprobe",
+                "-v", "quiet",
+                "-print_format", "json",
+                "-show_format",
+                video_url,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            if proc.returncode != 0:
+                raise VideoServiceError(f"ffprobe exited {proc.returncode}: {stderr.decode()[:300]}")
+            data = json.loads(stdout)
+            duration = float(data["format"]["duration"])
+            logger.info("ffprobe duration: %.2fs", duration)
+            return duration
         except VideoServiceError:
             raise
-        except (KeyError, IndexError) as exc:
-            raise VideoServiceError(f"Probe unexpected response shape: {exc}") from exc
-        except json.JSONDecodeError as exc:
-            raise VideoServiceError(f"Probe returned invalid JSON: {raw[:300]}") from exc
+        except asyncio.TimeoutError as exc:
+            raise VideoServiceError("ffprobe timed out after 30s") from exc
         except Exception as exc:
-            raise VideoServiceError(f"Probe failed: {exc}") from exc
+            raise VideoServiceError(f"ffprobe probe failed: {exc}") from exc
 
     async def analyze_chunk(
         self,
