@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from collections.abc import AsyncGenerator
 
 import httpx
@@ -9,6 +10,23 @@ from src.prompts.semantic_video import SEMANTIC_VIDEO_SYSTEM_PROMPT
 from src.prompts.chunk_video import chunk_system_prompt
 
 logger = logging.getLogger(__name__)
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _extract_content(msg: dict, context: str = "") -> str:
+    """Extract text content from a vLLM message dict.
+
+    --reasoning-parser qwen3 moves <think> blocks to reasoning_content.
+    Falls back to reasoning_content if content is None/empty.
+    """
+    raw = msg.get("content") or msg.get("reasoning_content") or ""
+    if not isinstance(raw, str):
+        raw = str(raw) if raw is not None else ""
+    if "<think>" in raw:
+        logger.warning("_extract_content(%s): <think> tag found — reasoning parser may not have stripped it", context)
+        raw = _THINK_RE.sub("", raw).strip()
+    return raw
 
 
 class VideoServiceError(Exception):
@@ -60,6 +78,7 @@ class VideoService:
             "stream": stream,
             "extra_body": {
                 "top_k": 20,
+                "chat_template_kwargs": {"enable_thinking": False},
                 "mm_processor_kwargs": {
                     "fps": settings.video_fps,
                     "do_sample_frames": True,
@@ -87,12 +106,13 @@ class VideoService:
                     ],
                 },
             ],
-            "max_tokens": 128,
+            "max_tokens": 256,
             "temperature": 0.0,
             "stream": False,
             "response_format": {"type": "json_object"},
             "extra_body": {
                 "top_k": 1,
+                "chat_template_kwargs": {"enable_thinking": False},
                 "mm_processor_kwargs": {"fps": 1.0, "do_sample_frames": True},
             },
         }
@@ -101,19 +121,17 @@ class VideoService:
             r.raise_for_status()
             data = r.json()
             msg = data["choices"][0]["message"]
-            # --reasoning-parser qwen3 moves <think> to reasoning_content; real JSON in content
-            # If model only thinks and emits no post-think text, content is None → fall back
-            raw = msg.get("content") or msg.get("reasoning_content") or ""
+            raw = _extract_content(msg, "probe")
             if not raw:
-                raise VideoServiceError("Probe returned empty content")
-            # Strip think tags if reasoning_parser didn't (defensive)
-            if "<think>" in raw:
-                import re
-                raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+                raise VideoServiceError(f"Probe returned empty content; response: {data}")
             meta = json.loads(raw)
             return float(meta.get("duration_seconds", 0))
         except VideoServiceError:
             raise
+        except (KeyError, IndexError) as exc:
+            raise VideoServiceError(f"Probe unexpected response shape: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise VideoServiceError(f"Probe returned invalid JSON: {raw[:300]}") from exc
         except Exception as exc:
             raise VideoServiceError(f"Probe failed: {exc}") from exc
 
@@ -153,28 +171,31 @@ class VideoService:
             "response_format": {"type": "json_object"},
             "extra_body": {
                 "top_k": 20,
+                "chat_template_kwargs": {"enable_thinking": False},
                 "mm_processor_kwargs": {"fps": settings.video_fps, "do_sample_frames": True},
             },
         }
+        raw = ""
         try:
             r = await self._client.post(settings.llm_chat_url, json=payload)
             r.raise_for_status()
             data = r.json()
             msg = data["choices"][0]["message"]
-            raw = msg.get("content") or msg.get("reasoning_content") or ""
-            if "<think>" in raw:
-                import re
-                raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+            raw = _extract_content(msg, f"chunk-{chunk_id}")
+            if not raw:
+                raise VideoServiceError(f"Chunk {chunk_id} returned empty content; response: {data}")
             return json.loads(raw)
         except httpx.HTTPStatusError as exc:
-            raise VideoServiceError(f"Chunk {chunk_id} HTTP {exc.response.status_code}") from exc
+            raise VideoServiceError(f"Chunk {chunk_id} HTTP {exc.response.status_code}: {exc.response.text[:200]}") from exc
         except json.JSONDecodeError as exc:
-            raise VideoServiceError(f"Chunk {chunk_id} returned invalid JSON") from exc
+            raise VideoServiceError(f"Chunk {chunk_id} invalid JSON: {raw[:300]}") from exc
+        except VideoServiceError:
+            raise
         except Exception as exc:
             raise VideoServiceError(f"Chunk {chunk_id} failed: {exc}") from exc
 
     async def analyze_semantic(self, video_url: str, transcript: str = "") -> dict:
-        """Full semantic JSON analysis — returns parsed dict, saves to output/."""
+        """Full semantic JSON analysis — returns parsed dict."""
         user_text = "Analyze this video completely."
         if transcript:
             user_text = f"Transcript (use as temporal ground truth):\n\n{transcript}\n\nAnalyze this video completely."
@@ -197,51 +218,56 @@ class VideoService:
             "response_format": {"type": "json_object"},
             "extra_body": {
                 "top_k": 20,
+                "chat_template_kwargs": {"enable_thinking": False},
                 "mm_processor_kwargs": {
                     "fps": settings.video_fps,
                     "do_sample_frames": True,
                 },
             },
         }
+        raw = ""
         try:
             r = await self._client.post(settings.llm_chat_url, json=payload)
             r.raise_for_status()
+            data = r.json()
+            msg = data["choices"][0]["message"]
+            raw = _extract_content(msg, "semantic")
+            if not raw:
+                raise VideoServiceError(f"Semantic analysis returned empty content; response: {data}")
+            return json.loads(raw)
         except httpx.HTTPStatusError as exc:
             logger.error("vLLM semantic video error %s: %s", exc.response.status_code, exc.response.text)
             raise VideoServiceError(f"vLLM error {exc.response.status_code}") from exc
         except httpx.RequestError as exc:
             raise VideoServiceError("vLLM is unreachable") from exc
-
-        data = r.json()
-        try:
-            msg = data["choices"][0]["message"]
-            raw = msg.get("content") or msg.get("reasoning_content") or ""
-            if "<think>" in raw:
-                import re
-                raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-            return json.loads(raw)
-        except (KeyError, IndexError) as exc:
-            raise VideoServiceError(f"Unexpected response shape: {data}") from exc
         except json.JSONDecodeError as exc:
-            raise VideoServiceError(f"Model returned invalid JSON: {raw[:500]}") from exc
+            raise VideoServiceError(f"Semantic analysis invalid JSON: {raw[:500]}") from exc
+        except VideoServiceError:
+            raise
+        except (KeyError, IndexError) as exc:
+            raise VideoServiceError(f"Unexpected response shape: {exc}") from exc
 
     async def analyze(self, video_url: str, prompt: str) -> str:
         payload = self._build_payload(video_url, prompt, stream=False)
         try:
             r = await self._client.post(settings.llm_chat_url, json=payload)
             r.raise_for_status()
+            data = r.json()
+            msg = data["choices"][0]["message"]
+            raw = _extract_content(msg, "analyze")
+            if not raw:
+                raise VideoServiceError(f"analyze() returned empty content; response: {data}")
+            return raw
         except httpx.HTTPStatusError as exc:
             logger.error("vLLM video error %s: %s", exc.response.status_code, exc.response.text)
             raise VideoServiceError(f"vLLM video error {exc.response.status_code}") from exc
         except httpx.RequestError as exc:
             logger.error("vLLM unreachable: %s", exc)
             raise VideoServiceError("vLLM is unreachable") from exc
-
-        data = r.json()
-        try:
-            return str(data["choices"][0]["message"]["content"])
+        except VideoServiceError:
+            raise
         except (KeyError, IndexError) as exc:
-            raise VideoServiceError(f"Unexpected response shape: {data}") from exc
+            raise VideoServiceError(f"Unexpected response shape: {exc}") from exc
 
     async def stream(self, video_url: str, prompt: str) -> AsyncGenerator[str, None]:
         payload = self._build_payload(video_url, prompt, stream=True)
@@ -257,7 +283,8 @@ class VideoService:
                         return
                     try:
                         chunk = json.loads(raw)
-                        content = chunk["choices"][0]["delta"].get("content", "")
+                        delta = chunk["choices"][0]["delta"]
+                        content = delta.get("content") or delta.get("reasoning_content") or ""
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
                     if content:
