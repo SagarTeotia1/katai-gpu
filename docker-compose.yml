@@ -22,11 +22,11 @@ services:
     ports:
       - "${OLLAMA_PORT:-11434}:11434"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      test: ["CMD-SHELL", "ollama list || exit 1"]
       interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
+      timeout: 10s
+      retries: 15
+      start_period: 60s
     networks:
       - katai-net
     deploy:
