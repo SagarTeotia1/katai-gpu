@@ -1,4 +1,4 @@
-.PHONY: up down logs build shell-backend shell-vllm restart clean help
+.PHONY: up down logs build shell-backend shell-vllm restart clean test chat help
 
 ifneq (,$(wildcard .env))
   include .env
@@ -9,6 +9,9 @@ COMPOSE            := docker compose
 BACKEND_CONTAINER  := katai-backend
 VLLM_CONTAINER     := katai-vllm
 FRONTEND_CONTAINER := katai-frontend
+VLLM_PORT          ?= 8000
+BACKEND_PORT       ?= 8080
+FRONTEND_PORT      ?= 3000
 MODEL              ?= $(MODEL_ID)
 MODEL              ?= Qwen/Qwen3.6-27B
 
@@ -67,10 +70,54 @@ shell-backend: ## Open a shell inside the backend container
 shell-vllm: ## Open a shell inside the vLLM container
 	docker exec -it $(VLLM_CONTAINER) /bin/bash
 
+##@ Testing
+
+test: ## Full stack health check — vLLM, backend, model list, test inference
+	@echo "=== vLLM health ==="
+	@python3 -c "\
+import urllib.request, json, sys; \
+r = urllib.request.urlopen('http://localhost:$(VLLM_PORT)/health', timeout=5); \
+print('vLLM:', r.status, r.reason)"
+	@echo ""
+	@echo "=== Backend health ==="
+	@python3 -c "\
+import urllib.request, json, sys; \
+r = urllib.request.urlopen('http://localhost:$(BACKEND_PORT)/health', timeout=5); \
+print(json.dumps(json.loads(r.read()), indent=2))"
+	@echo ""
+	@echo "=== Models ==="
+	@python3 -c "\
+import urllib.request, json; \
+r = urllib.request.urlopen('http://localhost:$(VLLM_PORT)/v1/models', timeout=5); \
+data = json.loads(r.read()); \
+[print(' •', m['id']) for m in data.get('data', [])]"
+	@echo ""
+	@echo "=== Test inference (say hi) ==="
+	@python3 -c "\
+import urllib.request, json; \
+payload = json.dumps({'model':'$(MODEL)','messages':[{'role':'user','content':'say hi in one sentence'}],'max_tokens':60}).encode(); \
+req = urllib.request.Request('http://localhost:$(VLLM_PORT)/v1/chat/completions', data=payload, headers={'Content-Type':'application/json'}); \
+data = json.loads(urllib.request.urlopen(req, timeout=60).read()); \
+print(data['choices'][0]['message']['content'])"
+
+chat: ## Interactive chat via backend SSE stream (type message as MSG=)
+	@python3 -c "\
+import urllib.request, json; \
+msg = '$(MSG)' or 'Hello, what can you do?'; \
+payload = json.dumps({'messages':[{'role':'user','content':msg}],'max_tokens':512}).encode(); \
+req = urllib.request.Request('http://localhost:$(BACKEND_PORT)/api/chat/stream', data=payload, headers={'Content-Type':'application/json'}); \
+resp = urllib.request.urlopen(req, timeout=120); \
+[print(json.loads(l.decode()[6:])['content'], end='', flush=True) for l in resp if l.startswith(b'data:') and l.strip() != b'data: {\"content\":\"\",\"done\":true}']; \
+print()"
+
 ##@ Model
 
 list-models: ## List models served by vLLM
-	@curl -sf http://localhost:$(VLLM_PORT)/v1/models | python3 -m json.tool
+	@python3 -c "\
+import urllib.request, json; \
+r = urllib.request.urlopen('http://localhost:$(VLLM_PORT)/v1/models', timeout=5); \
+data = json.loads(r.read()); \
+[print(m['id']) for m in data.get('data', [])]"
 
 ##@ Health
 
@@ -78,10 +125,16 @@ status: ## Show container status
 	$(COMPOSE) ps
 
 health-backend: ## Check backend health endpoint
-	@curl -sf http://localhost:$(BACKEND_PORT)/health | python3 -m json.tool
+	@python3 -c "\
+import urllib.request, json; \
+r = urllib.request.urlopen('http://localhost:$(BACKEND_PORT)/health', timeout=5); \
+print(json.dumps(json.loads(r.read()), indent=2))"
 
 health-vllm: ## Check vLLM health endpoint
-	@curl -sf http://localhost:$(VLLM_PORT)/health
+	@python3 -c "\
+import urllib.request; \
+r = urllib.request.urlopen('http://localhost:$(VLLM_PORT)/health', timeout=5); \
+print(r.status, r.reason)"
 
 gpu-info: ## Show GPU info inside the vLLM container
 	@docker exec $(VLLM_CONTAINER) nvidia-smi
