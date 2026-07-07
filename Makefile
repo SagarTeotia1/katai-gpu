@@ -111,6 +111,9 @@ req = urllib.request.Request('http://localhost:$(BACKEND_PORT)/api/vision/analyz
 data = json.loads(urllib.request.urlopen(req, timeout=300).read()); \
 print(data['description'])"
 
+vision-bench: ## Fire all 4 images in parallel — full vision benchmark
+	@python3 scripts/vision_bench.py --backend http://localhost:$(BACKEND_PORT)
+
 parallel: ## Fire N concurrent requests to test vLLM concurrency — usage: make parallel N=8 IMG="https://..."
 	@python3 -c "\
 import urllib.request, json, time; \
