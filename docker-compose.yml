@@ -44,10 +44,15 @@ services:
   ollama-init:
     image: ollama/ollama:latest
     container_name: katai-ollama-init
-    environment:
-      - OLLAMA_HOST=http://ollama:11434
     entrypoint: ["/bin/sh", "-c"]
-    command: "ollama pull ${MODEL_ID:-qwen3.6:27b-bf16}"
+    command: >
+      curl -X POST http://ollama:11434/api/pull
+      -H "Content-Type: application/json"
+      -d "{\"name\":\"${MODEL_ID:-qwen3.6:27b-bf16}\"}"
+      --no-buffer
+      --max-time 7200
+      --silent
+      --show-error
     depends_on:
       ollama:
         condition: service_healthy
