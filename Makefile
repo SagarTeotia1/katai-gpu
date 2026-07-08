@@ -178,6 +178,24 @@ transcribe-urls: ## Transcribe raw video URLs — usage: make transcribe-urls VI
 analyze-context: ## Full semantic video context — fuses cast+transcript+video per video
 	@python3 scripts/analyze_context.py --cast $(CAST) --vllm http://localhost:$(VLLM_PORT)/v1/chat/completions
 
+index-context: ## Index context JSONs → Pinecone + Neo4j — usage: make index-context [FILES="output/context_*.json"]
+	@python3 scripts/index_context.py $(FILES)
+
+index-pinecone: ## Index to Pinecone only (skip Neo4j)
+	@python3 scripts/index_context.py --no-neo4j $(FILES)
+
+index-neo4j: ## Index to Neo4j only (skip Pinecone)
+	@python3 scripts/index_context.py --no-pinecone $(FILES)
+
+query: ## Natural language query — usage: make query Q="find all moments where samay laughs"
+	@python3 scripts/query_context.py "$(Q)" --vllm http://localhost:$(VLLM_PORT)/v1/chat/completions
+
+neo4j-up: ## Start Neo4j standalone
+	@$(COMPOSE) up -d neo4j
+
+neo4j-logs: ## Follow Neo4j logs
+	@$(COMPOSE) logs -f neo4j
+
 parallel: ## Fire N concurrent requests to test vLLM concurrency — usage: make parallel N=8 IMG="https://..."
 	@python3 -c "\
 import urllib.request, json, time; \
