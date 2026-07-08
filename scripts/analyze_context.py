@@ -1128,8 +1128,9 @@ def analyze_one_chunk(
     total_duration: float,
     vllm_url: str,
     model_id: str,
-    progress: dict,
-    progress_lock: threading.Lock,
+    global_progress: dict,
+    global_lock: threading.Lock,
+    n_video_chunks: int,
 ) -> dict:
     """
     Analyze one temporal chunk with retry. Returns chunk result dict.
@@ -1147,13 +1148,13 @@ def analyze_one_chunk(
     )
     system    = build_chunk_system_prompt(
         person_db, transcript_seg, video_label,
-        chunk_id, progress["total_chunks"],
+        chunk_id, n_video_chunks,
         strict_start, strict_end, total_duration,
     )
     # vLLM clip URL: use pad window for frame context, strict window for event output
     # Pass pad timestamps as query params if supported, else just use full URL
     user_text = (
-        f"Analyze chunk {chunk_id+1}/{progress['total_chunks']} of video {video_label}. "
+        f"Analyze chunk {chunk_id+1}/{n_video_chunks} of video {video_label}. "
         f"Output ONLY events between {strict_start:.2f}s and {strict_end:.2f}s. "
         f"All timestamps absolute from video start."
     )
@@ -1186,10 +1187,10 @@ def analyze_one_chunk(
             elapsed = round(time.time() - t0, 1)
 
             tl = len(result.get("timeline", []))
-            with progress_lock:
-                progress["chunks_done"] += 1
-                done  = progress["chunks_done"]
-                total = progress["total_chunks_all"]
+            with global_lock:
+                global_progress["chunks_done"] += 1
+                done  = global_progress["chunks_done"]
+                total = global_progress["total_chunks_all"]
                 pct   = int(done / total * 100)
                 bar   = "█" * int(done / total * 24) + "░" * (24 - int(done / total * 24))
 
@@ -1225,8 +1226,8 @@ def analyze_one_chunk(
 
     elapsed = round(time.time() - t0, 1)
     log(label, f"Agent-{agent_id} GAVE UP ({elapsed}s) — {last_error}")
-    with progress_lock:
-        progress["chunks_failed"] += 1
+    with global_lock:
+        global_progress["chunks_failed"] += 1
     return {"ok": False, "error": last_error, "elapsed": elapsed,
             "chunk_id": chunk_id, "timeline": []}
 
@@ -1246,6 +1247,7 @@ def analyze_video_chunked(
     backend_url: str,
     global_progress: dict,
     global_lock: threading.Lock,
+    agent_base: int = 0,
 ) -> dict:
     """
     Split one video into n_chunks, fire all in parallel, merge, synthesize.
@@ -1263,13 +1265,6 @@ def analyze_video_chunked(
         f"Splitting into {n_chunks} chunks "
         f"(~{total_duration/n_chunks:.0f}s each) — firing all in parallel")
 
-    chunk_progress = {
-        "chunks_done":      0,
-        "chunks_failed":    0,
-        "total_chunks":     n_chunks,
-        "total_chunks_all": global_progress.get("total_chunks_all", n_chunks),
-    }
-
     # IMPORTANT: use list comprehension NOT [{}]*n — that creates shared dict refs
     chunk_results: list[dict] = [
         {"ok": False, "error": "not started", "chunk_id": i, "timeline": []}
@@ -1280,7 +1275,7 @@ def analyze_video_chunked(
         futures = {
             pool.submit(
                 analyze_one_chunk,
-                video_idx * n_chunks + c["chunk_id"],  # globally unique agent_id
+                agent_base + c["chunk_id"],  # globally unique agent_id (no overlap)
                 video_label,
                 safe_url,
                 c,
@@ -1289,8 +1284,9 @@ def analyze_video_chunked(
                 total_duration,
                 vllm_url,
                 model_id,
-                chunk_progress,
+                global_progress,   # shared across all videos — correct global count
                 global_lock,
+                n_chunks,          # per-video chunk count for the prompt
             ): c["chunk_id"]
             for c in chunks
         }
@@ -1479,6 +1475,13 @@ def main() -> None:
     print(flush=True)
 
     # ── Shared progress ───────────────────────────────────────────────────────
+    # _agent_base: cumulative chunk offset per video so agent IDs never overlap
+    agent_bases: dict[str, int] = {}
+    _base = 0
+    for v in videos:
+        agent_bases[v["label"]] = _base
+        _base += chunk_alloc.get(v["label"], n_chunks)
+
     progress = {
         "done":             0,
         "failed":           0,
@@ -1521,10 +1524,11 @@ def main() -> None:
                     i, v["label"], v["url"],
                     cast_analysis, transcripts,
                     out_dir, ts,
-                    chunk_alloc.get(v["label"], n_chunks),   # per-video chunk count
+                    chunk_alloc.get(v["label"], n_chunks),
                     durations.get(v["label"], 600.0),
                     vllm_url, model_id, backend_url,
                     progress, progress_lock,
+                    agent_bases[v["label"]],  # unique base so agent IDs never overlap
                 ): v["label"]
                 for i, v in enumerate(videos)
             }
