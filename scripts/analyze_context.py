@@ -147,7 +147,7 @@ def get_video_duration(video_url: str, backend_url: str) -> float:
     )
     resp = urllib.request.urlopen(req, timeout=30)
     data = json.loads(resp.read())
-    return float(data["duration_s"])
+    return float(data.get("duration_s") or data["duration_seconds"])
 
 
 # ── Chunk planning ────────────────────────────────────────────────────────────
