@@ -152,6 +152,48 @@ def get_video_duration(video_url: str, backend_url: str) -> float:
 
 # ── Chunk planning ────────────────────────────────────────────────────────────
 
+def allocate_chunks(durations: dict[str, float], total_budget: int) -> dict[str, int]:
+    """
+    Proportionally allocate chunk budget across videos by duration.
+    Longer video → more chunks → finer-grained parallel analysis.
+    Guarantees every video gets >= 1 chunk and sum == total_budget.
+
+    Example: video1=160s, video2=70s, budget=8
+      → video1: round(8 * 160/230) = 6
+      → video2: round(8 *  70/230) = 2
+    """
+    n_videos  = len(durations)
+    total_dur = sum(durations.values())
+
+    if total_dur == 0 or n_videos == 0:
+        per = max(1, total_budget // max(1, n_videos))
+        return {k: per for k in durations}
+
+    # Raw proportional allocation, minimum 1 per video
+    alloc = {k: max(1, round(total_budget * d / total_dur))
+             for k, d in durations.items()}
+
+    # Adjust to hit exact budget (rounding may drift by ±1 or 2)
+    diff = total_budget - sum(alloc.values())
+    if diff > 0:
+        # Give extra chunks to longest videos first
+        for k in sorted(durations, key=durations.get, reverse=True):
+            if diff == 0:
+                break
+            alloc[k] += 1
+            diff -= 1
+    elif diff < 0:
+        # Remove from shortest videos first (never below 1)
+        for k in sorted(durations, key=durations.get):
+            if diff == 0:
+                break
+            if alloc[k] > 1:
+                alloc[k] -= 1
+                diff += 1
+
+    return alloc
+
+
 def plan_chunks(duration: float, n: int) -> list[dict]:
     """
     Split [0, duration] into n chunks with CHUNK_OVERLAP frames on each side
@@ -1386,35 +1428,10 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    total_agents = n * n_chunks
-    # Cap global thread pool — no point exceeding total chunks
-    workers = min(args.workers, total_agents)
-
-    print(f"\n{'='*62}")
-    print(f"  Semantic Video Context Analyzer")
-    print(f"  Cast:          {cast_path}")
-    print(f"  Cast Analysis: {ca_path}")
-    print(f"  Transcripts:   {tr_path}")
-    print(f"  Videos:        {n}  ×  {n_chunks} chunks  =  {total_agents} parallel agents")
-    print(f"  Max workers:   {workers}  |  Retries: {MAX_RETRIES}/chunk")
-    print(f"  Token budgets: {TOKEN_BUDGETS}  |  Timeouts: {TIMEOUTS}s")
-    print(f"{'='*62}")
-    print(f"\n  Persons: {len(cast_analysis.get('persons', []))}")
-    for p in cast_analysis.get("persons", []):
-        print(f"    · {p['name']}")
-    print(f"\n  Agent plan:")
-    for i, v in enumerate(videos):
-        for c in range(n_chunks):
-            agent_id = i * n_chunks + c
-            start    = round(c / n_chunks * 100, 0)
-            end      = round((c+1) / n_chunks * 100, 0)
-            print(f"    Agent-{agent_id}  →  {v['label']} chunk {c+1}/{n_chunks} (~{start:.0f}%-{end:.0f}%)")
-    print(flush=True)
-
-    # ── Get video durations via ffprobe ──────────────────────────────────────
+    # ── Get video durations via ffprobe (always — needed for proportional alloc) ─
     durations: dict[str, float] = {}
     if n_chunks > 1:
-        print(f"  Probing video durations via ffprobe...", flush=True)
+        print(f"\n  Probing video durations via ffprobe...", flush=True)
         for v in videos:
             try:
                 dur = get_video_duration(v["url"], backend_url)
@@ -1423,7 +1440,43 @@ def main() -> None:
             except Exception as e:
                 print(f"    {v['label']} → probe FAILED ({e}) — using 600s estimate", flush=True)
                 durations[v["label"]] = 600.0
-        print(flush=True)
+
+    # ── Proportional chunk allocation ─────────────────────────────────────────
+    if n_chunks > 1 and durations:
+        chunk_alloc = allocate_chunks(durations, n_chunks * n)
+    else:
+        chunk_alloc = {v["label"]: n_chunks for v in videos}
+
+    total_agents = sum(chunk_alloc.values()) if n_chunks > 1 else n
+    workers      = min(args.workers, total_agents)
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    print(f"\n{'='*62}")
+    print(f"  Semantic Video Context Analyzer")
+    print(f"  Cast:          {cast_path}")
+    print(f"  Cast Analysis: {ca_path}")
+    print(f"  Transcripts:   {tr_path}")
+    print(f"  Chunk budget:  {n_chunks} per video → proportionally allocated")
+    print(f"  Total agents:  {total_agents}  |  Retries: {MAX_RETRIES}/chunk")
+    print(f"  Token budgets: {TOKEN_BUDGETS}  |  Timeouts: {TIMEOUTS}s")
+    print(f"{'='*62}")
+    print(f"\n  Persons: {len(cast_analysis.get('persons', []))}")
+    for p in cast_analysis.get("persons", []):
+        print(f"    · {p['name']}")
+
+    print(f"\n  Agent allocation (proportional by duration):")
+    agent_id = 0
+    for v in videos:
+        nc  = chunk_alloc.get(v["label"], n_chunks)
+        dur = durations.get(v["label"], 0)
+        seg = dur / nc if nc and dur else 0
+        print(f"    {v['label']}  {dur:.0f}s  →  {nc} chunks  (~{seg:.0f}s each)")
+        for c in range(nc):
+            s = round(c * seg, 0)
+            e = round(min(dur, (c+1) * seg), 0)
+            print(f"      Agent-{agent_id}  {s:.0f}s–{e:.0f}s")
+            agent_id += 1
+    print(flush=True)
 
     # ── Shared progress ───────────────────────────────────────────────────────
     progress = {
@@ -1460,8 +1513,7 @@ def main() -> None:
                     results[label] = {"ok": False, "error": str(exc)}
                     log(label, f"CRASHED — {exc}")
     else:
-        # ── Chunked mode: N chunks per video, all parallel ───────────────────
-        # Each video runs in its own thread; within that thread, chunks are parallel
+        # ── Chunked mode: proportional chunks per video, all parallel ─────────
         with ThreadPoolExecutor(max_workers=n) as pool:
             futures = {
                 pool.submit(
@@ -1469,7 +1521,7 @@ def main() -> None:
                     i, v["label"], v["url"],
                     cast_analysis, transcripts,
                     out_dir, ts,
-                    n_chunks,
+                    chunk_alloc.get(v["label"], n_chunks),   # per-video chunk count
                     durations.get(v["label"], 600.0),
                     vllm_url, model_id, backend_url,
                     progress, progress_lock,
