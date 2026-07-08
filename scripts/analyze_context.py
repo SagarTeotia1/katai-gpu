@@ -62,10 +62,10 @@ def parse_robust(raw: str, ctx: str = "") -> dict:
     raise ValueError(f"{ctx}: JSON parse failed. Preview: {fragment[:300]}")
 
 
-def post_vllm(payload: dict, timeout: int = 900) -> dict:
+def post_vllm(payload: dict, vllm_url: str, timeout: int = 900) -> dict:
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
-        VLLM_URL, data=data,
+        vllm_url, data=data,
         headers={"Content-Type": "application/json"},
     )
     resp = urllib.request.urlopen(req, timeout=timeout)
@@ -338,6 +338,8 @@ def analyze_video(
     transcripts: dict,
     out_dir: Path,
     ts: str,
+    vllm_url: str = VLLM_URL,
+    model_id: str = MODEL_ID,
 ) -> dict:
     t0 = time.time()
     print(f"\n  [{video_label}] Building context and calling vLLM...", flush=True)
@@ -349,7 +351,7 @@ def analyze_video(
     user   = f"Analyze this video completely. Video ID: {video_label}. Video URL: {video_url}"
 
     payload = {
-        "model": MODEL_ID,
+        "model": model_id,
         "messages": [
             {"role": "system", "content": system},
             {
@@ -372,7 +374,7 @@ def analyze_video(
     }
 
     try:
-        raw_resp = post_vllm(payload, timeout=900)
+        raw_resp = post_vllm(payload, vllm_url, timeout=900)
         msg  = raw_resp["choices"][0]["message"]
         raw  = msg.get("content") or msg.get("reasoning") or ""
         if not raw:
@@ -434,10 +436,8 @@ def main() -> None:
     parser.add_argument("--model", default=MODEL_ID, help=f"Model ID (default: {MODEL_ID})")
     args = parser.parse_args()
 
-    # Update globals if overridden
-    global VLLM_URL, MODEL_ID
-    VLLM_URL = args.vllm
-    MODEL_ID = args.model
+    vllm_url = args.vllm
+    model_id = args.model
 
     # Load cast
     cast_path = Path(args.cast)
@@ -490,6 +490,7 @@ def main() -> None:
                 v["label"], v["url"],
                 cast_analysis, transcripts,
                 out_dir, ts,
+                vllm_url, model_id,
             ): v["label"]
             for v in videos
         }
