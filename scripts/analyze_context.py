@@ -47,6 +47,7 @@ TOKEN_BUDGETS  = [20480, 14336, 8192]   # tokens per chunk attempt (shorter = le
 TIMEOUTS       = [900, 1200, 1500]      # timeout per chunk attempt (s)
 CHUNK_OVERLAP  = 3.0             # seconds of frame overlap each side for visual context
 DEFAULT_CHUNKS = 4               # chunks per video when --chunks not specified
+FRACTURE_SPLIT = 2               # sub-chunks to split into when attempt 1 times out/fails
 
 _THINK_RE   = re.compile(r"<think>.*?</think>", re.DOTALL)
 _JSON_START = re.compile(r"\{", re.DOTALL)
@@ -1118,6 +1119,131 @@ def analyze_video(
 
 # ── Chunked video analysis ────────────────────────────────────────────────────
 
+def _run_chunk_attempt(
+    label: str,
+    safe_url: str,
+    system: str,
+    user_text: str,
+    vllm_url: str,
+    model_id: str,
+    max_tokens: int,
+    timeout: int,
+    attempt: int,
+) -> dict:
+    """Single raw vLLM call for a chunk. Raises on any failure — caller handles retry/fracture."""
+    payload = _build_payload(model_id, system, user_text, safe_url, max_tokens, attempt)
+    payload["extra_body"]["mm_processor_kwargs"] = {"fps": 2.0, "do_sample_frames": True}
+    raw_resp = post_vllm(payload, vllm_url, timeout=timeout)
+    msg = raw_resp["choices"][0]["message"]
+    raw = msg.get("content") or msg.get("reasoning") or ""
+    if not raw:
+        raise ValueError(
+            f"Empty content, finish_reason={raw_resp['choices'][0].get('finish_reason')}"
+        )
+    return parse_robust(raw, label)
+
+
+def _fracture_chunk(
+    agent_id: int,
+    video_label: str,
+    safe_url: str,
+    chunk: dict,
+    person_db: str,
+    transcripts: dict,
+    total_duration: float,
+    vllm_url: str,
+    model_id: str,
+    n_video_chunks: int,
+) -> dict:
+    """
+    Split a timed-out chunk into FRACTURE_SPLIT sub-chunks, fire all in parallel,
+    merge results. Returns merged dict (ok=True if ≥1 sub-chunk succeeds).
+
+    Strategy: each sub-chunk covers half the time window → fewer frames →
+    faster inference → less likely to truncate → better accuracy per segment.
+    """
+    strict_start = chunk["strict_start"]
+    strict_end   = chunk["strict_end"]
+    chunk_id     = chunk["chunk_id"]
+    label        = f"{video_label}/chunk{chunk_id}"
+    sub_span     = (strict_end - strict_start) / FRACTURE_SPLIT
+
+    log(label, f"FRACTURING into {FRACTURE_SPLIT} sub-chunks "
+        f"({sub_span:.1f}s each, {TOKEN_BUDGETS[1]} tokens each) — firing in parallel")
+
+    sub_results: list[dict] = [
+        {"ok": False, "timeline": [], "chunk_id": i} for i in range(FRACTURE_SPLIT)
+    ]
+
+    with ThreadPoolExecutor(max_workers=FRACTURE_SPLIT) as pool:
+        futures: dict = {}
+        for i in range(FRACTURE_SPLIT):
+            ss     = strict_start + i * sub_span
+            se     = strict_start + (i + 1) * sub_span
+            pad_s  = max(0.0, ss - CHUNK_OVERLAP)
+            pad_e  = min(total_duration, se + CHUNK_OVERLAP)
+            sub_lbl = f"{video_label}/chunk{chunk_id}.{i}"
+
+            transcript_seg = build_transcript_block(
+                transcripts, video_label, start_s=ss, end_s=se
+            )
+            # Sub-chunk prompt: tell model its precise mini-window
+            system = build_chunk_system_prompt(
+                person_db, transcript_seg, video_label,
+                chunk_id * FRACTURE_SPLIT + i,
+                n_video_chunks * FRACTURE_SPLIT,
+                ss, se, total_duration,
+            )
+            user_text = (
+                f"Analyze sub-chunk {i+1}/{FRACTURE_SPLIT} of chunk {chunk_id+1}/{n_video_chunks} "
+                f"of video {video_label}. "
+                f"Output ONLY events between {ss:.2f}s and {se:.2f}s. "
+                f"All timestamps absolute from video start."
+            )
+            log(sub_lbl, f"Sub-agent {agent_id}.{i} ({ss:.1f}s-{se:.1f}s)")
+            futures[pool.submit(
+                _run_chunk_attempt,
+                sub_lbl, safe_url, system, user_text,
+                vllm_url, model_id,
+                TOKEN_BUDGETS[1], TIMEOUTS[1], attempt=2,
+            )] = i
+
+        for future in as_completed(futures):
+            i = futures[future]
+            sub_lbl = f"{video_label}/chunk{chunk_id}.{i}"
+            try:
+                result = future.result()
+                tl = len(result.get("timeline", []))
+                log(sub_lbl, f"Sub-agent {agent_id}.{i} ✓ {tl} events")
+                sub_results[i] = {"ok": True, **result}
+            except Exception as e:
+                log(sub_lbl, f"Sub-agent {agent_id}.{i} FAILED — {type(e).__name__}: {e}")
+                sub_results[i] = {"ok": False, "error": str(e), "timeline": []}
+
+    ok_subs = sum(1 for r in sub_results if r.get("ok"))
+    if ok_subs == 0:
+        log(label, "All sub-chunks failed")
+        return {"ok": False, "error": "all sub-chunks failed", "timeline": []}
+
+    # Merge sub-chunk results using existing merge helpers (skip failed ones)
+    merged = {
+        "ok":             True,
+        "timeline":       _merge_sorted(sub_results, "timeline"),
+        "known_people":   _merge_people(sub_results),
+        "shot_boundaries": _merge_sorted(sub_results, "shot_boundaries"),
+        "audio_events":   _merge_sorted(sub_results, "audio_events"),
+        "speaker_timeline": _merge_sorted(sub_results, "speaker_timeline"),
+        "window_start":   strict_start,
+        "window_end":     strict_end,
+        "fractured":      True,
+        "sub_chunks_ok":  ok_subs,
+        "sub_chunks_total": FRACTURE_SPLIT,
+    }
+    log(label, f"Fracture merged: {ok_subs}/{FRACTURE_SPLIT} sub-chunks, "
+        f"{len(merged['timeline'])} events")
+    return merged
+
+
 def analyze_one_chunk(
     agent_id: int,
     video_label: str,
@@ -1133,14 +1259,18 @@ def analyze_one_chunk(
     n_video_chunks: int,
 ) -> dict:
     """
-    Analyze one temporal chunk with retry. Returns chunk result dict.
-    agent_id is globally unique across all chunks of all videos.
+    Analyze one temporal chunk. Strategy:
+      Attempt 1: full window, 20480 tokens
+        → success → done
+        → timeout / parse fail → FRACTURE: split into FRACTURE_SPLIT sub-chunks
+            each sub-chunk: half the window, 14336 tokens, fired in parallel
+            → if ≥1 sub-chunk succeeds → merge and return (ok=True, fractured=True)
+        → all fracture fails → Attempt 3: original window, 8192 tokens (last resort)
+      Network / HTTP errors → skip fracture, go straight to attempt 3.
     """
     chunk_id     = chunk["chunk_id"]
     strict_start = chunk["strict_start"]
     strict_end   = chunk["strict_end"]
-    pad_start    = chunk["pad_start"]
-    pad_end      = chunk["pad_end"]
     label        = f"{video_label}/chunk{chunk_id}"
 
     transcript_seg = build_transcript_block(
@@ -1151,8 +1281,6 @@ def analyze_one_chunk(
         chunk_id, n_video_chunks,
         strict_start, strict_end, total_duration,
     )
-    # vLLM clip URL: use pad window for frame context, strict window for event output
-    # Pass pad timestamps as query params if supported, else just use full URL
     user_text = (
         f"Analyze chunk {chunk_id+1}/{n_video_chunks} of video {video_label}. "
         f"Output ONLY events between {strict_start:.2f}s and {strict_end:.2f}s. "
@@ -1161,68 +1289,79 @@ def analyze_one_chunk(
 
     t0         = time.time()
     last_error = "unknown"
+    result     = None
+    fractured  = False
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            max_tokens = TOKEN_BUDGETS[attempt - 1]
-            timeout    = TIMEOUTS[attempt - 1]
-            log(label, f"Agent-{agent_id} attempt {attempt}/{MAX_RETRIES} "
-                f"({strict_start:.1f}s-{strict_end:.1f}s, tokens={max_tokens})")
+    def _mark_done(r: dict, frac: bool) -> dict:
+        tl = len(r.get("timeline", []))
+        frac_str = (f" [fractured {r.get('sub_chunks_ok')}/{r.get('sub_chunks_total')} sub]"
+                    if frac else "")
+        elapsed = round(time.time() - t0, 1)
+        with global_lock:
+            global_progress["chunks_done"] += 1
+            done  = global_progress["chunks_done"]
+            total = global_progress["total_chunks_all"]
+            pct   = int(done / total * 100)
+            bar   = "█" * int(done / total * 24) + "░" * (24 - int(done / total * 24))
+        log(label, f"Agent-{agent_id} ✓ {elapsed}s | {tl} events{frac_str}")
+        with _print_lock:
+            print(f"\n  Chunks: [{bar}] {done}/{total} ({pct}%)\n", flush=True)
+        return {"ok": True, "elapsed": elapsed, "fractured": frac, **r}
 
-            payload = _build_payload(model_id, system, user_text, safe_url, max_tokens, attempt)
-            # Override fps — chunks are shorter so we can afford more frames
-            payload["extra_body"]["mm_processor_kwargs"] = {
-                "fps": 2.0,
-                "do_sample_frames": True,
-            }
+    # ── Attempt 1: full window ────────────────────────────────────────────────
+    log(label, f"Agent-{agent_id} attempt 1/3 "
+        f"({strict_start:.1f}s-{strict_end:.1f}s, tokens={TOKEN_BUDGETS[0]})")
+    try:
+        result = _run_chunk_attempt(
+            label, safe_url, system, user_text,
+            vllm_url, model_id,
+            TOKEN_BUDGETS[0], TIMEOUTS[0], attempt=1,
+        )
+        return _mark_done(result, False)
 
-            raw_resp = post_vllm(payload, vllm_url, timeout=timeout)
-            msg = raw_resp["choices"][0]["message"]
-            raw = msg.get("content") or msg.get("reasoning") or ""
-            if not raw:
-                raise ValueError(f"Empty content, finish_reason="
-                                 f"{raw_resp['choices'][0].get('finish_reason')}")
+    except urllib.error.HTTPError as e:
+        body = ""
+        try: body = e.read().decode()[:200]
+        except Exception: pass
+        last_error = f"HTTP {e.code}: {body}"
+        log(label, f"Agent-{agent_id} FATAL HTTP {e.code} — skipping fracture")
+        if 400 <= e.code < 500 and e.code != 429:
+            with global_lock: global_progress["chunks_failed"] += 1
+            return {"ok": False, "error": last_error,
+                    "elapsed": round(time.time()-t0, 1), "chunk_id": chunk_id, "timeline": []}
 
-            result = parse_robust(raw, label)
-            elapsed = round(time.time() - t0, 1)
+    except (TimeoutError, ValueError) as e:
+        last_error = f"{type(e).__name__}: {e}"
+        log(label, f"Agent-{agent_id} attempt 1 FAILED ({last_error}) → FRACTURING")
 
-            tl = len(result.get("timeline", []))
-            with global_lock:
-                global_progress["chunks_done"] += 1
-                done  = global_progress["chunks_done"]
-                total = global_progress["total_chunks_all"]
-                pct   = int(done / total * 100)
-                bar   = "█" * int(done / total * 24) + "░" * (24 - int(done / total * 24))
+    except Exception as e:
+        last_error = f"{type(e).__name__}: {e}"
+        log(label, f"Agent-{agent_id} attempt 1 FAILED ({last_error}) → FRACTURING")
 
-            log(label, f"Agent-{agent_id} ✓ {elapsed}s | {tl} events | attempt {attempt}")
-            with _print_lock:
-                print(f"\n  Chunks: [{bar}] {done}/{total} ({pct}%)\n", flush=True)
+    # ── Fracture pass: split window → parallel sub-chunks ────────────────────
+    frac = _fracture_chunk(
+        agent_id, video_label, safe_url, chunk,
+        person_db, transcripts, total_duration,
+        vllm_url, model_id, n_video_chunks,
+    )
+    if frac.get("ok"):
+        return _mark_done(frac, True)
 
-            return {"ok": True, "elapsed": elapsed, "attempts": attempt, **result}
+    last_error = frac.get("error", last_error)
+    log(label, f"Agent-{agent_id} fracture failed → attempt 3 ({TOKEN_BUDGETS[2]} tokens)")
 
-        except urllib.error.HTTPError as e:
-            body = ""
-            try: body = e.read().decode()[:200]
-            except Exception: pass
-            last_error = f"HTTP {e.code}: {body}"
-            if 400 <= e.code < 500 and e.code != 429:
-                log(label, f"Agent-{agent_id} FATAL {e.code} — abort")
-                break
-
-        except (urllib.error.URLError, TimeoutError) as e:
-            last_error = f"{type(e).__name__}: {e}"
-
-        except ValueError as e:
-            last_error = f"ParseError: {e}"
-
-        except Exception as e:
-            last_error = f"{type(e).__name__}: {e}"
-
-        log(label, f"Agent-{agent_id} attempt {attempt} FAILED — {last_error}")
-        if attempt < MAX_RETRIES:
-            delay = RETRY_DELAYS[attempt - 1]
-            log(label, f"Agent-{agent_id} retrying in {delay}s...")
-            time.sleep(delay)
+    # ── Attempt 3: last resort — original window, minimum tokens ─────────────
+    time.sleep(RETRY_DELAYS[1])  # brief pause before last shot
+    try:
+        result = _run_chunk_attempt(
+            label, safe_url, system, user_text,
+            vllm_url, model_id,
+            TOKEN_BUDGETS[2], TIMEOUTS[2], attempt=3,
+        )
+        return _mark_done(result, False)
+    except Exception as e:
+        last_error = f"{type(e).__name__}: {e}"
+        log(label, f"Agent-{agent_id} attempt 3 FAILED — {last_error}")
 
     elapsed = round(time.time() - t0, 1)
     log(label, f"Agent-{agent_id} GAVE UP ({elapsed}s) — {last_error}")
