@@ -55,15 +55,19 @@ def transcribe_video(label: str, source: str, url: str, whisper_base: str, langu
             "ok": True,
             "error": None,
             "transcription_time_s": round(elapsed, 1),
-            **data,
+            "language": data["language"],
+            "language_probability": data["language_probability"],
+            "duration_s": data["duration_s"],
+            "transcript": data["transcript"],
+            "segments": data["segments"],
         }
     except urllib.error.HTTPError as e:
         err = f"HTTP {e.code}: {e.read().decode()[:300]}"
         print(f"  [{label}] FAILED — {err}", flush=True)
-        return {"video": label, "source": source, "url": url, "ok": False, "error": err, "segments": [], "transcript": None}
+        return {"video": label, "source": source, "url": url, "ok": False, "error": err, "language": None, "duration_s": None, "transcript": None, "segments": []}
     except Exception as e:
         print(f"  [{label}] FAILED — {e}", flush=True)
-        return {"video": label, "source": source, "url": url, "ok": False, "error": str(e), "segments": [], "transcript": None}
+        return {"video": label, "source": source, "url": url, "ok": False, "error": str(e), "language": None, "duration_s": None, "transcript": None, "segments": []}
 
 
 def load_videos_from_cast(cast_path: str) -> list[dict]:

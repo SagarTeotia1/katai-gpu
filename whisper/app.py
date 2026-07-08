@@ -4,10 +4,10 @@ Accepts video URLs, extracts audio via ffmpeg, returns timestamped segments.
 """
 import asyncio
 import logging
+import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
-import tempfile
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -20,12 +20,20 @@ MODEL_SIZE = "large-v3"
 _model: Optional[WhisperModel] = None
 
 
+def _load_model() -> WhisperModel:
+    """Blocking model load — called in thread pool from lifespan."""
+    logger.info("Loading Whisper %s on CUDA float16...", MODEL_SIZE)
+    m = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
+    logger.info("Whisper model ready.")
+    return m
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _model
-    logger.info("Loading Whisper %s on CUDA...", MODEL_SIZE)
-    _model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
-    logger.info("Whisper model ready.")
+    # Run blocking model load in thread pool — keeps event loop alive
+    loop = asyncio.get_running_loop()
+    _model = await loop.run_in_executor(None, _load_model)
     yield
     _model = None
 
@@ -81,7 +89,7 @@ async def transcribe(req: TranscribeRequest) -> TranscribeResponse:
         tmp_path = tmp.name
 
     try:
-        logger.info("Extracting audio: %s", req.video_url)
+        logger.info("Extracting audio from: %s", req.video_url)
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y",
             "-i", req.video_url,
@@ -97,14 +105,9 @@ async def transcribe(req: TranscribeRequest) -> TranscribeResponse:
         if proc.returncode != 0:
             raise HTTPException(502, f"ffmpeg failed: {stderr.decode()[:400]}")
 
-        logger.info("Transcribing...")
-
-        # Run blocking Whisper in thread pool — keeps event loop free
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: _transcribe_sync(tmp_path, req),
-        )
+        logger.info("Transcribing with Whisper %s...", MODEL_SIZE)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, lambda: _transcribe_sync(tmp_path, req))
         return result
 
     finally:
@@ -112,6 +115,7 @@ async def transcribe(req: TranscribeRequest) -> TranscribeResponse:
 
 
 def _transcribe_sync(audio_path: str, req: TranscribeRequest) -> TranscribeResponse:
+    """Runs Whisper synchronously — always called from thread pool, never on event loop."""
     segments_iter, info = _model.transcribe(
         audio_path,
         language=req.language,
@@ -155,7 +159,7 @@ def _transcribe_sync(audio_path: str, req: TranscribeRequest) -> TranscribeRespo
         )
 
     logger.info(
-        "Done: %d segments, lang=%s (%.2f), duration=%.1fs",
+        "Transcription done: %d segments, lang=%s (%.2f), duration=%.1fs",
         len(segments), info.language, info.language_probability, info.duration,
     )
 

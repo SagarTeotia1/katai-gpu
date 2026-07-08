@@ -47,7 +47,7 @@ piercings, anything that uniquely identifies this person
 Output as flowing prose, not bullet points. Be exhaustive — this is a reference document."""
 
 
-def analyze_image(image_url: str, backend: str, max_tokens: int) -> str:
+def analyze_image(image_url: str, backend: str) -> str:
     """Call /api/vision/analyze, return description string."""
     payload = json.dumps({"image_url": image_url, "prompt": APPEARANCE_PROMPT}).encode()
     req = urllib.request.Request(
@@ -65,12 +65,11 @@ def analyze_video_crop(
     video_label: str,
     crop_url: str,
     backend: str,
-    max_tokens: int,
 ) -> dict:
     """Analyze one crop image. Returns result dict."""
     t0 = time.time()
     try:
-        description = analyze_image(crop_url, backend, max_tokens)
+        description = analyze_image(crop_url, backend)
         elapsed = time.time() - t0
         print(f"    [✓] {person_name} / {video_label} — {elapsed:.1f}s", flush=True)
         return {"ok": True, "description": description, "elapsed": round(elapsed, 1), "error": None}
@@ -85,7 +84,7 @@ def analyze_video_crop(
         return {"ok": False, "description": None, "elapsed": round(elapsed, 1), "error": str(e)}
 
 
-def process_person(person: dict, backend: str, max_tokens: int) -> dict:
+def process_person(person: dict, backend: str) -> dict:
     """
     One parallel agent per person.
     Fires all video crop analyses concurrently within the person.
@@ -101,7 +100,7 @@ def process_person(person: dict, backend: str, max_tokens: int) -> dict:
     if analyzable:
         with ThreadPoolExecutor(max_workers=len(analyzable)) as pool:
             futures = {
-                pool.submit(analyze_video_crop, name, v["video"], v["crop_url"], backend, max_tokens): v["video"]
+                pool.submit(analyze_video_crop, name, v["video"], v["crop_url"], backend): v["video"]
                 for v in analyzable
             }
             for future in as_completed(futures):
@@ -165,10 +164,6 @@ def main() -> None:
         "--backend", default="http://localhost:8080",
         help="Backend URL (default: http://localhost:8080)"
     )
-    parser.add_argument(
-        "--max-tokens", type=int, default=2048,
-        help="Max tokens per image description (default: 2048)"
-    )
     args = parser.parse_args()
 
     cast_path = Path(args.input)
@@ -192,7 +187,6 @@ def main() -> None:
     print(f"  Persons:    {len(persons)}")
     print(f"  Total crops: {total_crops} (all fired in parallel → vLLM batched)")
     print(f"  Backend:    {args.backend}")
-    print(f"  Max tokens: {args.max_tokens} per image")
     print(f"  Output:     {output_path}")
     print(f"{'='*60}")
     print(f"\n  Spawning {len(persons)} parallel agents...\n", flush=True)
@@ -203,7 +197,7 @@ def main() -> None:
     # One ThreadPoolExecutor thread = one agent per person
     with ThreadPoolExecutor(max_workers=len(persons)) as pool:
         futures = {
-            pool.submit(process_person, p, args.backend, args.max_tokens): i
+            pool.submit(process_person, p, args.backend): i
             for i, p in enumerate(persons)
         }
         for future in as_completed(futures):

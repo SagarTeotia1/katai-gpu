@@ -107,6 +107,7 @@ services:
               count: all
               capabilities: [gpu]
     restart: unless-stopped
+    ipc: host
 
   # ── React / Nginx frontend ────────────────────────────────────────────────────
   frontend:
