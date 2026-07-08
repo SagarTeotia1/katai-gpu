@@ -24,27 +24,36 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Prompt — focused on physical appearance for cross-video re-identification
 # ---------------------------------------------------------------------------
-APPEARANCE_PROMPT = """Describe this person's physical appearance in exhaustive detail.
-This description will be used to recognize and track this person across video footage.
+APPEARANCE_PROMPT = """You are analyzing a person in an image. Write a detailed identification profile \
+so that anyone reading it can immediately recognize this person in a video — who they are and exactly \
+what they are wearing.
 
-Cover ALL sections below. Be specific with colors (e.g. "navy blue", not just "blue").
+Be highly specific with colors. Not "blue" — say "royal blue", "navy", "sky blue". \
+Not "red shirt" — say "loose-fit crimson cotton crew-neck t-shirt with a small white graphic logo on \
+the left chest". Every garment, every color, every visible detail matters.
 
-1. FACE — skin tone, face shape, eyes (color/shape/size), eyebrows, nose, lips, jawline, \
-cheekbones, ears, any facial hair (beard/stubble/mustache — color, length, style)
-2. HAIR — color (exact shade), length, style (straight/wavy/curly/tied/braided/shaved), \
-texture, part direction, any highlights or unusual features
-3. BUILD & POSTURE — body type (slim/athletic/stocky/heavyset), approximate height impression, \
-shoulder width, posture, visible muscle definition
-4. CLOTHING — every garment visible: type (shirt/jacket/hoodie/etc), color, pattern \
-(solid/stripes/plaid/print), fabric texture, any logos/text/graphics, fit (loose/fitted/oversized)
-5. ACCESSORIES — glasses (frame shape, color), jewelry (earrings, necklace, rings, bracelet), \
-watch (brand/color if visible), hat or headwear, bags
-6. DISTINGUISHING FEATURES — tattoos (location, design), scars, moles, birthmarks, \
-piercings, anything that uniquely identifies this person
-7. EXPRESSION & DEMEANOR — current expression, eye contact, mood, energy, confidence level
-8. OVERALL STYLE — fashion aesthetic (casual/formal/streetwear/sporty/etc), overall vibe
+Write in clear descriptive paragraphs under these headings:
 
-Output as flowing prose, not bullet points. Be exhaustive — this is a reference document."""
+CLOTHING (most important):
+Describe every single garment visible from top to bottom. For each item: exact color, type, \
+fabric/texture if visible, fit (tight/loose/oversized), any logos, text, graphics, patterns, \
+brand markings, collar type, sleeve length. Include footwear if visible.
+
+ACCESSORIES:
+Glasses (frame shape, color, lens tint), hat or headwear (type, color, logo), watch (wrist, color), \
+jewelry (chains, rings, earrings), bag (type, color, strap style). Write "None visible" if absent.
+
+PHYSICAL APPEARANCE:
+Face shape, skin tone, eye color, eyebrow thickness/shape, nose, lips, jawline. \
+Facial hair: describe precisely (clean-shaven / light stubble / full beard — color, length, shape). \
+Hair: exact color, length, style, texture. Build: slim/athletic/stocky/heavyset, shoulder width, \
+visible physique. Height impression. Posture.
+
+DISTINGUISHING FEATURES:
+Tattoos (location + design), scars, moles, piercings, birthmarks, anything unique to this person.
+
+OVERALL IMPRESSION:
+One sentence — if you saw this person walking in a crowd, what would you notice first."""
 
 
 def analyze_image(image_url: str, backend: str) -> str:
@@ -134,10 +143,7 @@ def process_person(person: dict, backend: str) -> dict:
     parts = []
     for v in output_videos:
         if v["description"]:
-            parts.append(
-                f"=== {v['video']} (timestamp {v['timestamp_s']}s, similarity {v['similarity']:.3f}) ===\n"
-                f"{v['description']}"
-            )
+            parts.append(f"=== {v['video']} ===\n{v['description']}")
 
     return {
         "name": name,
