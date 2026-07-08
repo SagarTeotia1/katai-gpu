@@ -22,6 +22,7 @@ import argparse
 import json
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -36,11 +37,22 @@ try:
 except ImportError:
     HAS_REPAIR = False
 
-VLLM_URL = "http://localhost:8000/v1/chat/completions"
-MODEL_ID  = "Qwen/Qwen3.6-27B"
-MAX_TOKENS = 32768
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+VLLM_URL    = "http://localhost:8000/v1/chat/completions"
+MODEL_ID    = "Qwen/Qwen3.6-27B"
+MAX_TOKENS  = 32768
+MAX_WORKERS = 8          # max parallel agents (capped, vLLM batches all on GPU)
+MAX_RETRIES = 3          # per-video retry attempts
+RETRY_DELAYS   = [30, 90]        # seconds before attempt 2, 3
+TOKEN_BUDGETS  = [32768, 20480, 12288]  # tokens per attempt — reduce to avoid truncation
+TIMEOUTS       = [1200,  1500,   1800]  # timeout per attempt (s)
+
+_THINK_RE   = re.compile(r"<think>.*?</think>", re.DOTALL)
 _JSON_START = re.compile(r"\{", re.DOTALL)
+_print_lock = threading.Lock()
+
+def log(label: str, msg: str, flush: bool = True) -> None:
+    with _print_lock:
+        print(f"  [{label}] {msg}", flush=flush)
 
 
 # ── JSON helpers ──────────────────────────────────────────────────────────────
@@ -421,45 +433,40 @@ OUTPUT SCHEMA — return ONLY valid JSON, nothing else
 }}"""
 
 
-# ── Per-video analysis ────────────────────────────────────────────────────────
+# ── Per-video analysis — single attempt ──────────────────────────────────────
 
-def analyze_video(
-    video_label: str,
-    video_url: str,
-    cast_analysis: dict,
-    transcripts: dict,
-    out_dir: Path,
-    ts: str,
-    vllm_url: str = VLLM_URL,
-    model_id: str = MODEL_ID,
+def _build_payload(
+    model_id: str,
+    system: str,
+    user_text: str,
+    safe_url: str,
+    max_tokens: int,
+    attempt: int,
 ) -> dict:
-    t0 = time.time()
-    # URL-encode spaces and special chars so vLLM/ffmpeg can fetch correctly
-    safe_url = urllib.parse.quote(video_url, safe=":/?=&%#@!")
-    print(f"\n  [{video_label}] Building context and calling vLLM...", flush=True)
-    if safe_url != video_url:
-        print(f"  [{video_label}] URL encoded: {safe_url}", flush=True)
+    """Build vLLM payload. Attempt 2+ adds an extra JSON-enforcement reminder."""
+    messages = [{"role": "system", "content": system}]
 
-    person_db      = build_person_database(cast_analysis, video_label)
-    transcript_str = build_transcript_block(transcripts, video_label)
+    user_content: list = [
+        {"type": "text", "text": user_text},
+        {"type": "video_url", "video_url": {"url": safe_url}},
+    ]
 
-    system = build_system_prompt(person_db, transcript_str, video_label)
-    user   = f"Analyze this video completely. Video ID: {video_label}. Video URL: {safe_url}"
+    # On retry: prepend hard JSON reminder (model drifted to prose on attempt 1)
+    if attempt > 1:
+        reminder = (
+            "CRITICAL REMINDER: Your ENTIRE response must be one valid JSON object. "
+            "Start with { and end with }. Zero prose before or after JSON. "
+            "Do NOT wrap in markdown. Do NOT explain. Just JSON."
+        )
+        user_content.insert(0, {"type": "text", "text": reminder})
 
-    payload = {
+    messages.append({"role": "user", "content": user_content})
+
+    return {
         "model": model_id,
-        "messages": [
-            {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user},
-                    {"type": "video_url", "video_url": {"url": safe_url}},
-                ],
-            },
-        ],
-        "max_tokens": MAX_TOKENS,
-        "temperature": 0.1,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0.05 if attempt > 1 else 0.1,  # lower temp on retry
         "stream": False,
         "response_format": {"type": "json_object"},
         "extra_body": {
@@ -469,43 +476,162 @@ def analyze_video(
         },
     }
 
-    try:
-        raw_resp = post_vllm(payload, vllm_url, timeout=1200)
-        msg  = raw_resp["choices"][0]["message"]
-        raw  = msg.get("content") or msg.get("reasoning") or ""
-        if not raw:
-            raise ValueError(f"Empty response from vLLM. Full response: {raw_resp}")
 
-        result = parse_robust(raw, video_label)
-        # Ensure video_url is set even if model forgot
-        result.setdefault("video_url", video_url)
-        result.setdefault("video_id", video_label)
+def _attempt_analysis(
+    agent_id: int,
+    video_label: str,
+    safe_url: str,
+    system: str,
+    user_text: str,
+    out_dir: Path,
+    ts: str,
+    vllm_url: str,
+    model_id: str,
+    attempt: int,
+) -> dict:
+    """Single vLLM call attempt. Raises on failure so caller can retry."""
+    max_tokens = TOKEN_BUDGETS[attempt - 1]
+    timeout    = TIMEOUTS[attempt - 1]
 
-        elapsed = time.time() - t0
-        slug    = video_label.replace(" ", "_")
-        out_path = out_dir / f"context_{slug}_{ts}.json"
-        out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    log(video_label, f"Agent-{agent_id} attempt {attempt}/{MAX_RETRIES} "
+        f"(max_tokens={max_tokens}, timeout={timeout}s)")
 
-        size_kb = out_path.stat().st_size / 1024
-        tl_count = len(result.get("timeline", []))
-        hi_count = len(result.get("highlights", []))
-        cl_count = len(result.get("clip_candidates", []))
+    payload  = _build_payload(model_id, system, user_text, safe_url, max_tokens, attempt)
+    raw_resp = post_vllm(payload, vllm_url, timeout=timeout)
 
-        print(
-            f"  [{video_label}] Done — {elapsed:.1f}s | "
-            f"{tl_count} events | {hi_count} highlights | {cl_count} clips | "
-            f"{size_kb:.1f} KB → {out_path}",
-            flush=True,
-        )
-        return {"ok": True, "path": str(out_path), "elapsed": round(elapsed, 1)}
+    msg = raw_resp["choices"][0]["message"]
+    raw = msg.get("content") or msg.get("reasoning") or ""
+    if not raw:
+        raise ValueError(f"vLLM returned empty content. finish_reason="
+                         f"{raw_resp['choices'][0].get('finish_reason')}")
 
-    except urllib.error.HTTPError as e:
-        err = f"HTTP {e.code}: {e.read().decode()[:300]}"
-        print(f"  [{video_label}] FAILED — {err}", flush=True)
-        return {"ok": False, "error": err}
-    except Exception as e:
-        print(f"  [{video_label}] FAILED — {e}", flush=True)
-        return {"ok": False, "error": str(e)}
+    result = parse_robust(raw, video_label)
+    result.setdefault("video_url", safe_url)
+    result.setdefault("video_id",  video_label)
+
+    slug     = video_label.replace(" ", "_")
+    out_path = out_dir / f"context_{slug}_{ts}.json"
+    out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    tl = len(result.get("timeline", []))
+    hi = len(result.get("highlights", []))
+    cl = len(result.get("clip_candidates", []))
+    kb = out_path.stat().st_size / 1024
+
+    return {"ok": True, "path": str(out_path), "timeline_events": tl,
+            "highlights": hi, "clips": cl, "size_kb": round(kb, 1)}
+
+
+# ── Per-video analysis — with retry ──────────────────────────────────────────
+
+def analyze_video(
+    agent_id: int,
+    video_label: str,
+    video_url: str,
+    cast_analysis: dict,
+    transcripts: dict,
+    out_dir: Path,
+    ts: str,
+    vllm_url: str = VLLM_URL,
+    model_id: str = MODEL_ID,
+    progress: dict | None = None,      # shared progress counter
+    progress_lock: "threading.Lock | None" = None,
+) -> dict:
+    t0       = time.time()
+    safe_url = urllib.parse.quote(video_url, safe=":/?=&%#@!")
+
+    if safe_url != video_url:
+        log(video_label, f"URL encoded: {safe_url}")
+
+    # Build prompts once — reused across retries
+    person_db      = build_person_database(cast_analysis, video_label)
+    transcript_str = build_transcript_block(transcripts, video_label)
+    system    = build_system_prompt(person_db, transcript_str, video_label)
+    user_text = (
+        f"Analyze this video completely. Video ID: {video_label}. "
+        f"Video URL: {safe_url}"
+    )
+
+    last_error: str = "unknown"
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            result = _attempt_analysis(
+                agent_id, video_label, safe_url,
+                system, user_text, out_dir, ts,
+                vllm_url, model_id, attempt,
+            )
+            elapsed = round(time.time() - t0, 1)
+            result["elapsed"] = elapsed
+            result["attempts"] = attempt
+
+            # Update shared progress counter
+            if progress is not None and progress_lock is not None:
+                with progress_lock:
+                    progress["done"] += 1
+                    done  = progress["done"]
+                    total = progress["total"]
+                    pct   = int(done / total * 100)
+                    bar   = "█" * int(done / total * 20) + "░" * (20 - int(done / total * 20))
+
+            log(video_label,
+                f"Agent-{agent_id} ✓ done in {elapsed}s | attempt {attempt} | "
+                f"{result['timeline_events']} events | {result['highlights']} highlights | "
+                f"{result['clips']} clips | {result['size_kb']} KB → {result['path']}")
+
+            if progress is not None and progress_lock is not None:
+                with _print_lock:
+                    print(
+                        f"\n  Progress: [{bar}] {done}/{total} videos ({pct}%)\n",
+                        flush=True,
+                    )
+
+            return result
+
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode()[:300]
+            except Exception:
+                pass
+            last_error = f"HTTP {e.code}: {body}"
+            # 4xx (except 429) → fatal, don't retry
+            if 400 <= e.code < 500 and e.code != 429:
+                log(video_label, f"Agent-{agent_id} FATAL HTTP {e.code} — not retrying")
+                break
+
+        except urllib.error.URLError as e:
+            last_error = f"URLError: {e.reason}"
+
+        except TimeoutError as e:
+            last_error = f"Timeout: {e}"
+
+        except ValueError as e:
+            # JSON parse failure or empty content — retry with stronger prompt
+            last_error = f"ParseError: {e}"
+
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+
+        log(video_label, f"Agent-{agent_id} attempt {attempt} FAILED — {last_error}")
+
+        if attempt < MAX_RETRIES:
+            delay = RETRY_DELAYS[attempt - 1]
+            log(video_label,
+                f"Agent-{agent_id} waiting {delay}s before attempt {attempt + 1}...")
+            time.sleep(delay)
+
+    # All retries exhausted
+    elapsed = round(time.time() - t0, 1)
+    log(video_label,
+        f"Agent-{agent_id} GAVE UP after {MAX_RETRIES} attempts ({elapsed}s) — {last_error}")
+
+    if progress is not None and progress_lock is not None:
+        with progress_lock:
+            progress["failed"] += 1
+
+    return {"ok": False, "error": last_error, "elapsed": elapsed,
+            "attempts": MAX_RETRIES}
 
 
 # ── File discovery helpers ────────────────────────────────────────────────────
@@ -530,6 +656,8 @@ def main() -> None:
     parser.add_argument("--output", default="output", help="Output directory (default: output/)")
     parser.add_argument("--vllm", default=VLLM_URL, help=f"vLLM URL (default: {VLLM_URL})")
     parser.add_argument("--model", default=MODEL_ID, help=f"Model ID (default: {MODEL_ID})")
+    parser.add_argument("--workers", type=int, default=MAX_WORKERS,
+                        help=f"Max parallel agents (default: {MAX_WORKERS})")
     args = parser.parse_args()
 
     vllm_url = args.vllm
@@ -557,6 +685,8 @@ def main() -> None:
     transcripts: dict = json.loads(tr_path.read_text(encoding="utf-8"))
 
     videos   = cast["videos"]
+    n        = len(videos)
+    workers  = min(args.workers, n)   # never more workers than videos
     out_dir  = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -566,29 +696,43 @@ def main() -> None:
     print(f"  Cast:          {cast_path}")
     print(f"  Cast Analysis: {ca_path}")
     print(f"  Transcripts:   {tr_path}")
-    print(f"  Videos:        {len(videos)} (processed in parallel)")
-    print(f"  Max tokens:    {MAX_TOKENS} per video")
+    print(f"  Videos:        {n}  |  Parallel agents: {workers}  |  Retries: {MAX_RETRIES}/video")
+    print(f"  Token budgets: {TOKEN_BUDGETS}  (reduces each retry to avoid truncation)")
+    print(f"  Timeouts:      {TIMEOUTS}s per attempt")
     print(f"  Output dir:    {out_dir}/")
     print(f"{'='*60}")
     print(f"\n  Persons in database: {len(cast_analysis.get('persons', []))}")
     for p in cast_analysis.get("persons", []):
         print(f"    · {p['name']} — {p.get('videos_described', 0)} video(s) described")
+    print(f"\n  Agents:")
+    for i, v in enumerate(videos, 1):
+        print(f"    Agent-{i}  →  {v['label']}")
     print(flush=True)
 
-    t_wall  = time.time()
-    results = {}
+    # Shared progress counter (thread-safe)
+    progress      = {"done": 0, "failed": 0, "total": n}
+    progress_lock = threading.Lock()
 
-    # Parallel — one thread per video, vLLM batches them on GPU
-    with ThreadPoolExecutor(max_workers=len(videos)) as pool:
+    t_wall  = time.time()
+    results: dict = {}
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(
                 analyze_video,
-                v["label"], v["url"],
-                cast_analysis, transcripts,
-                out_dir, ts,
-                vllm_url, model_id,
+                i,            # agent_id
+                v["label"],
+                v["url"],
+                cast_analysis,
+                transcripts,
+                out_dir,
+                ts,
+                vllm_url,
+                model_id,
+                progress,
+                progress_lock,
             ): v["label"]
-            for v in videos
+            for i, v in enumerate(videos, 1)
         }
         for future in as_completed(futures):
             label = futures[future]
@@ -596,24 +740,32 @@ def main() -> None:
                 results[label] = future.result()
             except Exception as exc:
                 results[label] = {"ok": False, "error": str(exc)}
-                print(f"  [{label}] CRASHED — {exc}", flush=True)
+                log(label, f"CRASHED (unhandled) — {exc}")
 
     wall = time.time() - t_wall
     ok   = sum(1 for r in results.values() if r.get("ok"))
 
     print(f"\n{'='*60}")
-    print(f"  {ok}/{len(videos)} videos analyzed | wall: {wall:.1f}s")
+    print(f"  {ok}/{n} videos analyzed | wall: {wall:.1f}s")
     for label, r in results.items():
+        atts   = r.get("attempts", "?")
         status = "✓" if r.get("ok") else "✗"
-        detail = r.get("path", r.get("error", ""))
+        detail = (
+            f"{r['path']}  ({r.get('timeline_events','?')} events, "
+            f"attempt {atts}/{MAX_RETRIES})"
+            if r.get("ok")
+            else r.get("error", "")
+        )
         print(f"  [{status}] {label} — {detail}")
-    print(f"\n  Output files:")
-    for r in results.values():
-        if r.get("path"):
-            print(f"    {r['path']}")
+
+    if ok > 0:
+        print(f"\n  Output files:")
+        for r in results.values():
+            if r.get("path"):
+                print(f"    {r['path']}")
     print(f"{'='*60}\n")
 
-    if ok < len(videos):
+    if ok < n:
         sys.exit(1)
 
 
