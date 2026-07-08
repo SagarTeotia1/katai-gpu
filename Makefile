@@ -175,6 +175,9 @@ transcribe: ## Transcribe videos from cast JSON — usage: make transcribe CAST=
 transcribe-urls: ## Transcribe raw video URLs — usage: make transcribe-urls VIDS="url1 url2"
 	@python3 scripts/transcribe.py --videos $(VIDS) --whisper http://localhost:$(WHISPER_PORT)
 
+analyze-context: ## Full semantic video context — fuses cast+transcript+video per video
+	@python3 scripts/analyze_context.py --cast $(CAST) --vllm http://localhost:$(VLLM_PORT)/v1/chat/completions
+
 parallel: ## Fire N concurrent requests to test vLLM concurrency — usage: make parallel N=8 IMG="https://..."
 	@python3 -c "\
 import urllib.request, json, time; \
