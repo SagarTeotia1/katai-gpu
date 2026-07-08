@@ -24,6 +24,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -342,13 +343,17 @@ def analyze_video(
     model_id: str = MODEL_ID,
 ) -> dict:
     t0 = time.time()
+    # URL-encode spaces and special chars so vLLM/ffmpeg can fetch correctly
+    safe_url = urllib.parse.quote(video_url, safe=":/?=&%#@!")
     print(f"\n  [{video_label}] Building context and calling vLLM...", flush=True)
+    if safe_url != video_url:
+        print(f"  [{video_label}] URL encoded: {safe_url}", flush=True)
 
     person_db      = build_person_database(cast_analysis, video_label)
     transcript_str = build_transcript_block(transcripts, video_label)
 
     system = build_system_prompt(person_db, transcript_str, video_label)
-    user   = f"Analyze this video completely. Video ID: {video_label}. Video URL: {video_url}"
+    user   = f"Analyze this video completely. Video ID: {video_label}. Video URL: {safe_url}"
 
     payload = {
         "model": model_id,
@@ -358,7 +363,7 @@ def analyze_video(
                 "role": "user",
                 "content": [
                     {"type": "text", "text": user},
-                    {"type": "video_url", "video_url": {"url": video_url}},
+                    {"type": "video_url", "video_url": {"url": safe_url}},
                 ],
             },
         ],
@@ -374,7 +379,7 @@ def analyze_video(
     }
 
     try:
-        raw_resp = post_vllm(payload, vllm_url, timeout=900)
+        raw_resp = post_vllm(payload, vllm_url, timeout=1200)
         msg  = raw_resp["choices"][0]["message"]
         raw  = msg.get("content") or msg.get("reasoning") or ""
         if not raw:
