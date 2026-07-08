@@ -178,6 +178,27 @@ transcribe-urls: ## Transcribe raw video URLs — usage: make transcribe-urls VI
 analyze-context: ## Full semantic video context — fuses cast+transcript+video per video
 	@python3 scripts/analyze_context.py --cast $(CAST) --vllm http://localhost:$(VLLM_PORT)/v1/chat/completions
 
+pipeline: ## ONE CMD — full pipeline: cast→transcript→context→index — usage: make pipeline CAST=cast.json
+	@python3 scripts/pipeline.py $(CAST) \
+		--backend http://localhost:$(BACKEND_PORT) \
+		--vllm http://localhost:$(VLLM_PORT)/v1/chat/completions \
+		--whisper http://localhost:$(WHISPER_PORT)
+
+pipeline-reindex: ## Re-run indexing only (skip all analysis) — usage: make pipeline-reindex CAST=cast.json
+	@python3 scripts/pipeline.py $(CAST) \
+		--skip-cast auto --skip-transcribe auto --skip-context \
+		--backend http://localhost:$(BACKEND_PORT) \
+		--vllm http://localhost:$(VLLM_PORT)/v1/chat/completions \
+		--whisper http://localhost:$(WHISPER_PORT)
+
+pipeline-status: ## Show last pipeline run summary JSON
+	@python3 -c "\
+import json, glob, sys; \
+files = sorted(glob.glob('output/pipeline_*.json')); \
+f = files[-1] if files else None; \
+(print('No pipeline runs found in output/') or sys.exit(1)) if not f else \
+print(json.dumps(json.loads(open(f).read()), indent=2))"
+
 index-context: ## Index context JSONs → Pinecone + Neo4j — usage: make index-context [FILES="output/context_*.json"]
 	@python3 scripts/index_context.py $(FILES)
 
