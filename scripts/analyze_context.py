@@ -40,11 +40,13 @@ except ImportError:
 VLLM_URL    = "http://localhost:8000/v1/chat/completions"
 MODEL_ID    = "Qwen/Qwen3.6-27B"
 MAX_TOKENS  = 32768
-MAX_WORKERS = 8          # max parallel agents (capped, vLLM batches all on GPU)
-MAX_RETRIES = 3          # per-video retry attempts
+MAX_WORKERS    = 8               # max parallel agents across ALL chunks of ALL videos
+MAX_RETRIES    = 3               # per-chunk retry attempts
 RETRY_DELAYS   = [30, 90]        # seconds before attempt 2, 3
-TOKEN_BUDGETS  = [32768, 20480, 12288]  # tokens per attempt — reduce to avoid truncation
-TIMEOUTS       = [1200,  1500,   1800]  # timeout per attempt (s)
+TOKEN_BUDGETS  = [20480, 14336, 8192]   # tokens per chunk attempt (shorter = less truncation)
+TIMEOUTS       = [900, 1200, 1500]      # timeout per chunk attempt (s)
+CHUNK_OVERLAP  = 3.0             # seconds of frame overlap each side for visual context
+DEFAULT_CHUNKS = 4               # chunks per video when --chunks not specified
 
 _THINK_RE   = re.compile(r"<think>.*?</think>", re.DOTALL)
 _JSON_START = re.compile(r"\{", re.DOTALL)
@@ -116,20 +118,452 @@ def build_person_database(cast_analysis: dict, video_label: str) -> str:
     return "\n\n".join(blocks) if blocks else "  No known persons."
 
 
-def build_transcript_block(transcripts: dict, video_label: str) -> str:
-    """Extract transcript segments for this video as compact JSON array string."""
+def build_transcript_block(transcripts: dict, video_label: str,
+                           start_s: float = 0.0, end_s: float = 1e9) -> str:
+    """Extract transcript segments for this video (optionally filtered by time window)."""
     for v in transcripts.get("videos", []):
         if v.get("video") == video_label:
             segs = v.get("segments", [])
             if not segs:
                 return "[]"
-            # Compact: just id, start, end, text (skip words to save tokens)
             compact = [
                 {"id": s["id"], "start": s["start"], "end": s["end"], "text": s["text"]}
                 for s in segs
+                if s["start"] >= start_s - 2 and s["end"] <= end_s + 2
             ]
             return json.dumps(compact, ensure_ascii=False)
     return "[]"
+
+
+# ── Video duration via backend ffprobe ────────────────────────────────────────
+
+def get_video_duration(video_url: str, backend_url: str) -> float:
+    """Call /api/video/probe to get duration in seconds. Fast (~0.3s, no GPU)."""
+    payload = json.dumps({"video_url": video_url}).encode()
+    req = urllib.request.Request(
+        f"{backend_url}/api/video/probe",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    resp = urllib.request.urlopen(req, timeout=30)
+    data = json.loads(resp.read())
+    return float(data["duration_s"])
+
+
+# ── Chunk planning ────────────────────────────────────────────────────────────
+
+def plan_chunks(duration: float, n: int) -> list[dict]:
+    """
+    Split [0, duration] into n chunks with CHUNK_OVERLAP frames on each side
+    for visual context. Each chunk has a strict window (for event output) and
+    a padded window (for frame sampling).
+    """
+    seg = duration / n
+    chunks = []
+    for i in range(n):
+        strict_start = round(i * seg, 2)
+        strict_end   = round(min(duration, (i + 1) * seg), 2)
+        pad_start    = round(max(0.0, strict_start - CHUNK_OVERLAP), 2)
+        pad_end      = round(min(duration, strict_end + CHUNK_OVERLAP), 2)
+        chunks.append({
+            "chunk_id":     i,
+            "strict_start": strict_start,
+            "strict_end":   strict_end,
+            "pad_start":    pad_start,
+            "pad_end":      pad_end,
+        })
+    return chunks
+
+
+# ── Chunk-aware system prompt ─────────────────────────────────────────────────
+
+def build_chunk_system_prompt(
+    person_db: str,
+    transcript_json: str,
+    video_label: str,
+    chunk_id: int,
+    total_chunks: int,
+    strict_start: float,
+    strict_end: float,
+    total_duration: float,
+) -> str:
+    return f"""You are a semantic video analysis engine working on ONE CHUNK of a video.
+
+════════════════════════════════════════════
+CHUNK CONTEXT — READ THIS FIRST
+════════════════════════════════════════════
+Video ID: {video_label}
+Total video duration: {total_duration:.2f}s
+This chunk: {chunk_id + 1} of {total_chunks}
+YOUR STRICT TIME WINDOW: {strict_start:.2f}s → {strict_end:.2f}s
+
+You will see frames slightly outside this window for visual continuity.
+OUTPUT ONLY events where start >= {strict_start:.2f} AND end <= {strict_end:.2f}.
+ALL timestamps must be ABSOLUTE from video start (NOT relative to chunk).
+NEVER create an event longer than 8 seconds.
+
+════════════════════════════════════════════
+CRITICAL TIMELINE RULE
+════════════════════════════════════════════
+For a {strict_end - strict_start:.0f}s window: expect {max(5, int((strict_end-strict_start)/2))}-{max(10, int((strict_end-strict_start)/1))} events.
+Every speaker change, laugh, reaction, pause >1s, interruption = separate event.
+
+════════════════════════════════════════════
+PERSON DATABASE
+════════════════════════════════════════════
+{person_db}
+
+════════════════════════════════════════════
+TRANSCRIPT — your window only
+════════════════════════════════════════════
+{transcript_json}
+
+════════════════════════════════════════════
+OUTPUT — return ONLY valid JSON, no prose
+════════════════════════════════════════════
+{{
+  "chunk_id": {chunk_id},
+  "video_id": "{video_label}",
+  "window_start": {strict_start},
+  "window_end": {strict_end},
+
+  "known_people": [
+    {{
+      "person_id": "P001",
+      "display_name": "<name>",
+      "first_seen_s": <float>,
+      "last_seen_s": <float>,
+      "appearance": {{
+        "clothing": "<exact — color, type, fit>",
+        "hair": "<color, style>",
+        "facial_hair": "<clean-shaven|stubble|beard>",
+        "glasses": <true|false>,
+        "accessories": "<or none>"
+      }}
+    }}
+  ],
+
+  "timeline": [
+    {{
+      "id": "E{chunk_id:02d}_{'{:03d}'.format(0)}",
+      "start": <float ≥ {strict_start:.2f}>,
+      "end": <float ≤ {strict_end:.2f}, max 8s after start>,
+      "type": "<dialogue|reaction|laugh|interruption|pause|joke|question|answer|transition>",
+      "description": "<specific — what exactly happens>",
+      "visible_people": ["P001"],
+      "speaker": "<person_id or null>",
+      "speaker_confidence": <0.0-1.0>,
+      "transcript_text": "<exact words or empty string>",
+      "topic": "<micro-topic>",
+      "listener_reactions": [{{"person_id": "P002", "reaction": "<laughing|nodding|surprised>"}}],
+      "body_language": {{
+        "P001": {{"pose": "<>", "gesture": "<>", "head": "<>", "facial": "<>", "energy": "<high|medium|low>"}}
+      }},
+      "camera": {{
+        "shot_type": "<wide|medium|close-up|over-shoulder|two-shot>",
+        "movement": "<static|zoom-in|zoom-out|pan-left|cut>"
+      }},
+      "audio": {{
+        "type": "<speech|laughter|silence|music|overlap>",
+        "notable": "<any notable audio event>"
+      }},
+      "emotion": "<funny|tense|emotional|informative|awkward|excited|calm>",
+      "scores": {{
+        "importance": <0-10>, "hook": <0-10>, "clip": <0-10>,
+        "viral": <0-10>, "emotion": <0-10>
+      }},
+      "editing_reasoning": {{
+        "should_keep": <true|false>,
+        "why": "<one sentence>",
+        "hook": "<what grabs attention>"
+      }},
+      "clip_worthy": <true|false>,
+      "thumbnail_worthy": <true|false>
+    }}
+  ],
+
+  "shot_boundaries": [
+    {{"shot_id": "SH{chunk_id:02d}_001", "start": <float>, "end": <float>,
+      "shot_type": "<wide|medium|close-up>", "primary_subject": "<person_id or object>"}}
+  ],
+
+  "audio_events": [
+    {{"start": <float>, "end": <float>,
+      "type": "<laughter|music|silence|crosstalk|ambient>",
+      "intensity": "<soft|medium|loud>", "description": "<what you hear>"}}
+  ],
+
+  "speaker_timeline": [
+    {{"start": <float>, "end": <float>, "person_id": "<P001>",
+      "text": "<spoken words>", "confidence": <0.0-1.0>}}
+  ]
+}}"""
+
+
+# ── Synthesis prompt — text-only second pass after chunk merge ────────────────
+
+def build_synthesis_prompt(
+    video_label: str,
+    video_url: str,
+    person_db: str,
+    timeline_summary: str,
+    total_duration: float,
+) -> str:
+    return f"""You are a senior video editor analyzing a complete merged timeline from parallel chunk analysis.
+
+Video ID: {video_label}
+Total duration: {total_duration:.1f}s
+Known people:
+{person_db}
+
+MERGED TIMELINE (all events, chronological):
+{timeline_summary}
+
+Based on this complete timeline, generate the editorial intelligence layer.
+Return ONLY valid JSON:
+
+{{
+  "video_metadata": {{
+    "duration_s": {total_duration},
+    "setting": "<location description>",
+    "format": "<podcast|interview|vlog|comedy|debate>",
+    "language": "<language>",
+    "overall_context": "<2-3 sentences: what this video is, who, what discussed>"
+  }},
+
+  "conversation": {{
+    "turns": [
+      {{"turn_id": "T001", "speaker": "P001", "start": <float>, "end": <float>, "text": "<words>"}}
+    ],
+    "interruptions": [
+      {{"at_s": <float>, "interrupted": "P001", "by": "P002", "context": "<what was cut off>"}}
+    ],
+    "callbacks": [
+      {{"at_s": <float>, "references_event": "<event_id>", "description": "<what was called back>"}}
+    ],
+    "question_answer_pairs": [
+      {{"question_event": "<E_id>", "answer_event": "<E_id>", "asker": "P001", "answerer": "P002", "topic": "<>"}}
+    ],
+    "agreements": [{{"at_s": <float>, "between": ["P001","P002"], "about": "<>"}}],
+    "disagreements": [{{"at_s": <float>, "between": ["P001","P002"], "about": "<>", "intensity": "<mild|heated>"}}],
+    "jokes": [{{"event_id": "<>", "setup_event": "<>", "punchline": "<>", "landed": <true|false>}}]
+  }},
+
+  "story": {{
+    "hook": {{"event_id": "<>", "description": "<first 10s attention grab>"}},
+    "setup": {{"start": <float>, "end": <float>, "description": "<>"}},
+    "conflict": {{"start": <float>, "end": <float>, "description": "<>", "present": <true|false>}},
+    "escalation": {{"start": <float>, "end": <float>, "description": "<>", "present": <true|false>}},
+    "resolution": {{"start": <float>, "end": <float>, "description": "<>", "present": <true|false>}},
+    "ending": {{"event_id": "<>", "description": "<how video ends and feeling it leaves>"}}
+  }},
+
+  "highlights": [
+    {{"id": "H001", "start": <float>, "end": <float>, "title": "<catchy>",
+      "reason": "<why highlight>", "type": "<funny|emotional|informative|shocking>",
+      "event_ids": ["<E_id>"], "score": <0-10>}}
+  ],
+
+  "clip_candidates": [
+    {{"id": "C001", "start": <float>, "end": <float>, "duration_s": <float>,
+      "title": "<>", "hook": "<opening line>", "why_complete": "<standalone reason>",
+      "platform": "<YouTube Shorts|Instagram Reels|TikTok|full clip>",
+      "depends_on_events": ["<E_id>"],
+      "scores": {{"clip": <0-10>, "viral": <0-10>, "hook": <0-10>}}}}
+  ],
+
+  "thumbnail_candidates": [
+    {{"timestamp_s": <float>, "event_id": "<>", "description": "<exact frame>",
+      "why_good_thumbnail": "<reason>", "primary_person": "<P_id>",
+      "expression": "<surprised|laughing|serious|intense>", "score": <0-10>}}
+  ],
+
+  "ocr_results": [
+    {{"timestamp_s": <float>, "text": "<on-screen text>",
+      "location": "<top-left|center|lower-third>", "type": "<title-card|lower-third|logo>"}}
+  ],
+
+  "editorial_summary": {{
+    "overall_summary": "<4-6 sentences: complete summary>",
+    "main_topics": ["<topic1>", "<topic2>"],
+    "emotional_arc": "<e.g. starts slow → builds → big laugh at 72s → calm ending>",
+    "key_moments": [{{"timestamp_s": <float>, "description": "<what happens and why>"}}],
+    "best_clip": {{"start": <float>, "end": <float>, "reason": "<why best standalone>"}},
+    "viral_potential": "<low|medium|high|very high>",
+    "suggested_title": "<YouTube title>",
+    "suggested_description": "<YouTube description opening>",
+    "editor_notes": "<3-5 specific editing recommendations>"
+  }}
+}}"""
+
+
+# ── Merge chunk results ───────────────────────────────────────────────────────
+
+def _merge_sorted(chunks: list[dict], key: str) -> list:
+    items = []
+    for c in chunks:
+        items.extend(c.get(key, []))
+    return sorted(items, key=lambda x: x.get("start", x.get("timestamp_s", 0)))
+
+
+def _merge_people(chunks: list[dict]) -> list[dict]:
+    seen: dict = {}
+    for c in chunks:
+        for p in c.get("known_people", []):
+            pid = p.get("person_id", "")
+            if pid not in seen:
+                seen[pid] = p
+            else:
+                # Extend time range
+                seen[pid]["last_seen_s"] = max(
+                    seen[pid].get("last_seen_s", 0),
+                    p.get("last_seen_s", 0),
+                )
+    return list(seen.values())
+
+
+def merge_chunks(
+    chunk_results: list[dict],
+    video_label: str,
+    video_url: str,
+    total_duration: float,
+) -> dict:
+    """Combine N chunk outputs into one coherent context dict (minus synthesis fields)."""
+    # Sort chunks by window_start so events are chronological
+    chunk_results = sorted(chunk_results, key=lambda c: c.get("window_start", 0))
+
+    # Merge and renumber timeline events
+    all_events = _merge_sorted(chunk_results, "timeline")
+    for i, ev in enumerate(all_events, 1):
+        ev["id"] = f"E{i:03d}"
+
+    return {
+        "video_id":       video_label,
+        "video_url":      video_url,
+        "known_people":   _merge_people(chunk_results),
+        "timeline":       all_events,
+        "shot_boundaries": _merge_sorted(chunk_results, "shot_boundaries"),
+        "audio_events":   _merge_sorted(chunk_results, "audio_events"),
+        "speaker_timeline": _merge_sorted(chunk_results, "speaker_timeline"),
+        # Synthesis fields filled in by synthesize_merged()
+        "video_metadata":     {},
+        "scenes":             [],
+        "conversation":       {},
+        "story":              {},
+        "highlights":         [],
+        "clip_candidates":    [],
+        "thumbnail_candidates": [],
+        "ocr_results":        [],
+        "editorial_summary":  {},
+    }
+
+
+def synthesize_merged(
+    merged: dict,
+    person_db: str,
+    total_duration: float,
+    vllm_url: str,
+    model_id: str,
+) -> dict:
+    """
+    Second LLM pass — text only (no video), fast ~30-60s.
+    Takes merged timeline, generates conversation/story/highlights/clips/editorial.
+    """
+    video_label = merged["video_id"]
+    video_url   = merged["video_url"]
+
+    # Compact timeline text (cap to 600 events to stay within tokens)
+    events = merged["timeline"][:600]
+    tl_lines = []
+    for ev in events:
+        speaker = ev.get("speaker", "")
+        txt     = ev.get("transcript_text", "")
+        tl_lines.append(
+            f"  {ev['id']} [{ev.get('start',0):.1f}s-{ev.get('end',0):.1f}s] "
+            f"{ev.get('type','?')} | speaker:{speaker} | emotion:{ev.get('emotion','')} | "
+            f"clip:{ev.get('clip_worthy',False)} | \"{txt[:80]}\""
+        )
+    timeline_text = "\n".join(tl_lines)
+
+    system = build_synthesis_prompt(
+        video_label, video_url, person_db, timeline_text, total_duration
+    )
+
+    payload = {
+        "model": model_id,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content":
+             "Generate the complete editorial intelligence layer for this video."},
+        ],
+        "max_tokens": 16384,
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+    }
+
+    log(video_label, "Synthesis pass — text-only LLM call for conversation/story/editorial...")
+    raw_resp = post_vllm(payload, vllm_url, timeout=300)
+    msg = raw_resp["choices"][0]["message"]
+    raw = msg.get("content") or msg.get("reasoning") or ""
+    if not raw:
+        log(video_label, "Synthesis returned empty — skipping (timeline still saved)")
+        return merged
+
+    try:
+        synth = parse_robust(raw, f"{video_label}_synthesis")
+    except Exception as e:
+        log(video_label, f"Synthesis parse failed ({e}) — timeline still saved")
+        return merged
+
+    # Merge synthesis fields into the combined dict
+    for key in ("video_metadata", "conversation", "story", "highlights",
+                "clip_candidates", "thumbnail_candidates", "ocr_results",
+                "editorial_summary"):
+        if key in synth:
+            merged[key] = synth[key]
+
+    # Build scenes from event clusters if synthesis didn't provide them
+    if not merged.get("scenes"):
+        merged["scenes"] = _scenes_from_timeline(merged["timeline"])
+
+    return merged
+
+
+def _scenes_from_timeline(events: list[dict]) -> list[dict]:
+    """Heuristic: group consecutive events into scenes (max 30s, breaks on transition type)."""
+    if not events:
+        return []
+    scenes = []
+    scene_events = [events[0]]
+    for ev in events[1:]:
+        prev_end = scene_events[-1].get("end", 0)
+        gap      = ev.get("start", 0) - prev_end
+        too_long = ev.get("end", 0) - scene_events[0].get("start", 0) > 30
+        is_cut   = ev.get("type", "") == "transition" or gap > 2
+        if too_long or is_cut:
+            scenes.append(_make_scene(scenes, scene_events))
+            scene_events = [ev]
+        else:
+            scene_events.append(ev)
+    if scene_events:
+        scenes.append(_make_scene(scenes, scene_events))
+    return scenes
+
+
+def _make_scene(existing: list, events: list[dict]) -> dict:
+    idx = len(existing) + 1
+    return {
+        "scene_id":         f"S{idx:03d}",
+        "start":            events[0].get("start", 0),
+        "end":              events[-1].get("end", 0),
+        "title":            f"Scene {idx}",
+        "description":      "; ".join(e.get("description","")[:60] for e in events[:3]),
+        "people_present":   list({p for e in events for p in e.get("visible_people",[])}),
+        "dominant_emotion": events[len(events)//2].get("emotion", ""),
+        "narrative_purpose": "",
+        "event_ids":        [e.get("id","") for e in events],
+    }
 
 
 def build_system_prompt(person_db: str, transcript_json: str, video_label: str) -> str:
@@ -433,7 +867,7 @@ OUTPUT SCHEMA — return ONLY valid JSON, nothing else
 }}"""
 
 
-# ── Per-video analysis — single attempt ──────────────────────────────────────
+# ── Per-video/chunk analysis — single attempt ─────────────────────────────────
 
 def _build_payload(
     model_id: str,
@@ -634,6 +1068,238 @@ def analyze_video(
             "attempts": MAX_RETRIES}
 
 
+# ── Chunked video analysis ────────────────────────────────────────────────────
+
+def analyze_one_chunk(
+    agent_id: int,
+    video_label: str,
+    safe_url: str,
+    chunk: dict,
+    person_db: str,
+    transcripts: dict,
+    total_duration: float,
+    vllm_url: str,
+    model_id: str,
+    progress: dict,
+    progress_lock: threading.Lock,
+) -> dict:
+    """
+    Analyze one temporal chunk with retry. Returns chunk result dict.
+    agent_id is globally unique across all chunks of all videos.
+    """
+    chunk_id     = chunk["chunk_id"]
+    strict_start = chunk["strict_start"]
+    strict_end   = chunk["strict_end"]
+    pad_start    = chunk["pad_start"]
+    pad_end      = chunk["pad_end"]
+    label        = f"{video_label}/chunk{chunk_id}"
+
+    transcript_seg = build_transcript_block(
+        transcripts, video_label, start_s=strict_start, end_s=strict_end
+    )
+    system    = build_chunk_system_prompt(
+        person_db, transcript_seg, video_label,
+        chunk_id, progress["total_chunks"],
+        strict_start, strict_end, total_duration,
+    )
+    # vLLM clip URL: use pad window for frame context, strict window for event output
+    # Pass pad timestamps as query params if supported, else just use full URL
+    user_text = (
+        f"Analyze chunk {chunk_id+1}/{progress['total_chunks']} of video {video_label}. "
+        f"Output ONLY events between {strict_start:.2f}s and {strict_end:.2f}s. "
+        f"All timestamps absolute from video start."
+    )
+
+    t0         = time.time()
+    last_error = "unknown"
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            max_tokens = TOKEN_BUDGETS[attempt - 1]
+            timeout    = TIMEOUTS[attempt - 1]
+            log(label, f"Agent-{agent_id} attempt {attempt}/{MAX_RETRIES} "
+                f"({strict_start:.1f}s-{strict_end:.1f}s, tokens={max_tokens})")
+
+            payload = _build_payload(model_id, system, user_text, safe_url, max_tokens, attempt)
+            # Override fps — chunks are shorter so we can afford more frames
+            payload["extra_body"]["mm_processor_kwargs"] = {
+                "fps": 2.0,
+                "do_sample_frames": True,
+            }
+
+            raw_resp = post_vllm(payload, vllm_url, timeout=timeout)
+            msg = raw_resp["choices"][0]["message"]
+            raw = msg.get("content") or msg.get("reasoning") or ""
+            if not raw:
+                raise ValueError(f"Empty content, finish_reason="
+                                 f"{raw_resp['choices'][0].get('finish_reason')}")
+
+            result = parse_robust(raw, label)
+            elapsed = round(time.time() - t0, 1)
+
+            tl = len(result.get("timeline", []))
+            with progress_lock:
+                progress["chunks_done"] += 1
+                done  = progress["chunks_done"]
+                total = progress["total_chunks_all"]
+                pct   = int(done / total * 100)
+                bar   = "█" * int(done / total * 24) + "░" * (24 - int(done / total * 24))
+
+            log(label, f"Agent-{agent_id} ✓ {elapsed}s | {tl} events | attempt {attempt}")
+            with _print_lock:
+                print(f"\n  Chunks: [{bar}] {done}/{total} ({pct}%)\n", flush=True)
+
+            return {"ok": True, "elapsed": elapsed, "attempts": attempt, **result}
+
+        except urllib.error.HTTPError as e:
+            body = ""
+            try: body = e.read().decode()[:200]
+            except Exception: pass
+            last_error = f"HTTP {e.code}: {body}"
+            if 400 <= e.code < 500 and e.code != 429:
+                log(label, f"Agent-{agent_id} FATAL {e.code} — abort")
+                break
+
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_error = f"{type(e).__name__}: {e}"
+
+        except ValueError as e:
+            last_error = f"ParseError: {e}"
+
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+
+        log(label, f"Agent-{agent_id} attempt {attempt} FAILED — {last_error}")
+        if attempt < MAX_RETRIES:
+            delay = RETRY_DELAYS[attempt - 1]
+            log(label, f"Agent-{agent_id} retrying in {delay}s...")
+            time.sleep(delay)
+
+    elapsed = round(time.time() - t0, 1)
+    log(label, f"Agent-{agent_id} GAVE UP ({elapsed}s) — {last_error}")
+    with progress_lock:
+        progress["chunks_failed"] += 1
+    return {"ok": False, "error": last_error, "elapsed": elapsed,
+            "chunk_id": chunk_id, "timeline": []}
+
+
+def analyze_video_chunked(
+    video_idx: int,
+    video_label: str,
+    video_url: str,
+    cast_analysis: dict,
+    transcripts: dict,
+    out_dir: Path,
+    ts: str,
+    n_chunks: int,
+    total_duration: float,
+    vllm_url: str,
+    model_id: str,
+    backend_url: str,
+    global_progress: dict,
+    global_lock: threading.Lock,
+) -> dict:
+    """
+    Split one video into n_chunks, fire all in parallel, merge, synthesize.
+    Returns same shape as analyze_video().
+    """
+    t0       = time.time()
+    safe_url = urllib.parse.quote(video_url, safe=":/?=&%#@!")
+    if safe_url != video_url:
+        log(video_label, f"URL encoded: {safe_url}")
+
+    person_db = build_person_database(cast_analysis, video_label)
+    chunks    = plan_chunks(total_duration, n_chunks)
+
+    log(video_label,
+        f"Splitting into {n_chunks} chunks "
+        f"(~{total_duration/n_chunks:.0f}s each) — firing all in parallel")
+
+    chunk_progress = {
+        "chunks_done":      0,
+        "chunks_failed":    0,
+        "total_chunks":     n_chunks,
+        "total_chunks_all": global_progress.get("total_chunks_all", n_chunks),
+    }
+
+    chunk_results: list[dict] = [{}] * n_chunks
+
+    with ThreadPoolExecutor(max_workers=n_chunks) as pool:
+        futures = {
+            pool.submit(
+                analyze_one_chunk,
+                video_idx * n_chunks + c["chunk_id"],  # globally unique agent_id
+                video_label,
+                safe_url,
+                c,
+                person_db,
+                transcripts,
+                total_duration,
+                vllm_url,
+                model_id,
+                chunk_progress,
+                global_lock,
+            ): c["chunk_id"]
+            for c in chunks
+        }
+        for future in as_completed(futures):
+            cid = futures[future]
+            try:
+                chunk_results[cid] = future.result()
+            except Exception as exc:
+                log(video_label, f"Chunk {cid} CRASHED — {exc}")
+                chunk_results[cid] = {"ok": False, "error": str(exc),
+                                      "chunk_id": cid, "timeline": []}
+
+    ok_chunks  = sum(1 for r in chunk_results if r.get("ok"))
+    fail_chunks = n_chunks - ok_chunks
+    log(video_label, f"Chunks: {ok_chunks}/{n_chunks} OK, {fail_chunks} failed")
+
+    if ok_chunks == 0:
+        return {"ok": False,
+                "error": f"All {n_chunks} chunks failed",
+                "elapsed": round(time.time() - t0, 1),
+                "attempts": MAX_RETRIES}
+
+    # Merge chunks → one coherent dict
+    merged = merge_chunks(chunk_results, video_label, video_url, total_duration)
+
+    # Synthesis pass — text-only LLM call for conversation/story/editorial
+    try:
+        merged = synthesize_merged(merged, person_db, total_duration, vllm_url, model_id)
+    except Exception as e:
+        log(video_label, f"Synthesis failed ({e}) — saving without editorial layer")
+
+    # Save final file
+    slug     = video_label.replace(" ", "_")
+    out_path = out_dir / f"context_{slug}_{ts}.json"
+    out_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    elapsed = round(time.time() - t0, 1)
+    tl = len(merged.get("timeline", []))
+    hi = len(merged.get("highlights", []))
+    cl = len(merged.get("clip_candidates", []))
+    kb = out_path.stat().st_size / 1024
+
+    # Update global video progress
+    with global_lock:
+        global_progress["done"] += 1
+        done  = global_progress["done"]
+        total = global_progress["total"]
+        bar   = "█" * int(done/total*20) + "░" * (20 - int(done/total*20))
+
+    log(video_label,
+        f"✓ COMPLETE {elapsed}s | {ok_chunks}/{n_chunks} chunks | "
+        f"{tl} events | {hi} highlights | {cl} clips | {kb:.0f}KB → {out_path}")
+    with _print_lock:
+        print(f"\n  Videos: [{bar}] {done}/{total} ({int(done/total*100)}%)\n", flush=True)
+
+    return {"ok": True, "path": str(out_path), "elapsed": elapsed,
+            "timeline_events": tl, "highlights": hi, "clips": cl,
+            "size_kb": round(kb, 1), "chunks_ok": ok_chunks,
+            "chunks_total": n_chunks, "attempts": 1}
+
+
 # ── File discovery helpers ────────────────────────────────────────────────────
 
 def latest_file(pattern: str) -> Path | None:
@@ -648,114 +1314,161 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Semantic video context analyzer — fuses cast + transcript + video"
     )
-    parser.add_argument("--cast", default="cast.json", help="Cast JSON path (default: cast.json)")
-    parser.add_argument("--cast-analysis", default=None,
-                        help="Cast analysis JSON (default: latest output/cast_analysis_*.json)")
-    parser.add_argument("--transcripts", default=None,
-                        help="Transcripts JSON (default: latest output/transcripts_*.json)")
-    parser.add_argument("--output", default="output", help="Output directory (default: output/)")
-    parser.add_argument("--vllm", default=VLLM_URL, help=f"vLLM URL (default: {VLLM_URL})")
-    parser.add_argument("--model", default=MODEL_ID, help=f"Model ID (default: {MODEL_ID})")
-    parser.add_argument("--workers", type=int, default=MAX_WORKERS,
-                        help=f"Max parallel agents (default: {MAX_WORKERS})")
+    parser.add_argument("--cast", default="cast.json")
+    parser.add_argument("--cast-analysis", default=None)
+    parser.add_argument("--transcripts",   default=None)
+    parser.add_argument("--output",   default="output")
+    parser.add_argument("--vllm",     default=VLLM_URL)
+    parser.add_argument("--backend",  default="http://localhost:8080")
+    parser.add_argument("--model",    default=MODEL_ID)
+    parser.add_argument("--workers",  type=int, default=MAX_WORKERS,
+                        help="Max parallel agents across all chunks (default 8)")
+    parser.add_argument("--chunks",   type=int, default=DEFAULT_CHUNKS,
+                        help=f"Chunks per video (default {DEFAULT_CHUNKS}). "
+                             f"1 = single full-video pass (slow). "
+                             f"4 = 4x faster. Total agents = videos × chunks.")
     args = parser.parse_args()
 
-    vllm_url = args.vllm
-    model_id = args.model
+    vllm_url    = args.vllm
+    model_id    = args.model
+    n_chunks    = max(1, args.chunks)
+    backend_url = args.backend
 
-    # Load cast
+    # ── Load inputs ──────────────────────────────────────────────────────────
     cast_path = Path(args.cast)
     if not cast_path.exists():
-        print(f"ERROR: cast file not found: {cast_path}")
-        sys.exit(1)
+        print(f"ERROR: {cast_path} not found"); sys.exit(1)
     cast: dict = json.loads(cast_path.read_text(encoding="utf-8"))
 
-    # Auto-discover cast_analysis
-    ca_path = Path(args.cast_analysis) if args.cast_analysis else latest_file("output/cast_analysis_*.json")
+    ca_path = (Path(args.cast_analysis) if args.cast_analysis
+               else latest_file("output/cast_analysis_*.json"))
     if not ca_path or not ca_path.exists():
-        print("ERROR: no cast_analysis JSON found. Run: make cast-analysis CAST=cast.json")
-        sys.exit(1)
+        print("ERROR: no cast_analysis JSON. Run: make cast-analysis CAST=cast.json"); sys.exit(1)
     cast_analysis: dict = json.loads(ca_path.read_text(encoding="utf-8"))
 
-    # Auto-discover transcripts
-    tr_path = Path(args.transcripts) if args.transcripts else latest_file("output/transcripts_*.json")
+    tr_path = (Path(args.transcripts) if args.transcripts
+               else latest_file("output/transcripts_*.json"))
     if not tr_path or not tr_path.exists():
-        print("ERROR: no transcripts JSON found. Run: make transcribe CAST=cast.json")
-        sys.exit(1)
+        print("ERROR: no transcripts JSON. Run: make transcribe CAST=cast.json"); sys.exit(1)
     transcripts: dict = json.loads(tr_path.read_text(encoding="utf-8"))
 
-    videos   = cast["videos"]
-    n        = len(videos)
-    workers  = min(args.workers, n)   # never more workers than videos
-    out_dir  = Path(args.output)
+    videos  = cast["videos"]
+    n       = len(videos)
+    out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
-    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    print(f"\n{'='*60}")
+    total_agents = n * n_chunks
+    # Cap global thread pool — no point exceeding total chunks
+    workers = min(args.workers, total_agents)
+
+    print(f"\n{'='*62}")
     print(f"  Semantic Video Context Analyzer")
     print(f"  Cast:          {cast_path}")
     print(f"  Cast Analysis: {ca_path}")
     print(f"  Transcripts:   {tr_path}")
-    print(f"  Videos:        {n}  |  Parallel agents: {workers}  |  Retries: {MAX_RETRIES}/video")
-    print(f"  Token budgets: {TOKEN_BUDGETS}  (reduces each retry to avoid truncation)")
-    print(f"  Timeouts:      {TIMEOUTS}s per attempt")
-    print(f"  Output dir:    {out_dir}/")
-    print(f"{'='*60}")
-    print(f"\n  Persons in database: {len(cast_analysis.get('persons', []))}")
+    print(f"  Videos:        {n}  ×  {n_chunks} chunks  =  {total_agents} parallel agents")
+    print(f"  Max workers:   {workers}  |  Retries: {MAX_RETRIES}/chunk")
+    print(f"  Token budgets: {TOKEN_BUDGETS}  |  Timeouts: {TIMEOUTS}s")
+    print(f"{'='*62}")
+    print(f"\n  Persons: {len(cast_analysis.get('persons', []))}")
     for p in cast_analysis.get("persons", []):
-        print(f"    · {p['name']} — {p.get('videos_described', 0)} video(s) described")
-    print(f"\n  Agents:")
-    for i, v in enumerate(videos, 1):
-        print(f"    Agent-{i}  →  {v['label']}")
+        print(f"    · {p['name']}")
+    print(f"\n  Agent plan:")
+    for i, v in enumerate(videos):
+        for c in range(n_chunks):
+            agent_id = i * n_chunks + c
+            start    = round(c / n_chunks * 100, 0)
+            end      = round((c+1) / n_chunks * 100, 0)
+            print(f"    Agent-{agent_id}  →  {v['label']} chunk {c+1}/{n_chunks} (~{start:.0f}%-{end:.0f}%)")
     print(flush=True)
 
-    # Shared progress counter (thread-safe)
-    progress      = {"done": 0, "failed": 0, "total": n}
+    # ── Get video durations via ffprobe ──────────────────────────────────────
+    durations: dict[str, float] = {}
+    if n_chunks > 1:
+        print(f"  Probing video durations via ffprobe...", flush=True)
+        for v in videos:
+            try:
+                dur = get_video_duration(v["url"], backend_url)
+                durations[v["label"]] = dur
+                print(f"    {v['label']} → {dur:.1f}s", flush=True)
+            except Exception as e:
+                print(f"    {v['label']} → probe FAILED ({e}) — using 600s estimate", flush=True)
+                durations[v["label"]] = 600.0
+        print(flush=True)
+
+    # ── Shared progress ───────────────────────────────────────────────────────
+    progress = {
+        "done":             0,
+        "failed":           0,
+        "total":            n,
+        "chunks_done":      0,
+        "chunks_failed":    0,
+        "total_chunks_all": total_agents,
+    }
     progress_lock = threading.Lock()
 
     t_wall  = time.time()
     results: dict = {}
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(
-                analyze_video,
-                i,            # agent_id
-                v["label"],
-                v["url"],
-                cast_analysis,
-                transcripts,
-                out_dir,
-                ts,
-                vllm_url,
-                model_id,
-                progress,
-                progress_lock,
-            ): v["label"]
-            for i, v in enumerate(videos, 1)
-        }
-        for future in as_completed(futures):
-            label = futures[future]
-            try:
-                results[label] = future.result()
-            except Exception as exc:
-                results[label] = {"ok": False, "error": str(exc)}
-                log(label, f"CRASHED (unhandled) — {exc}")
+    if n_chunks == 1:
+        # ── Original single-pass mode ─────────────────────────────────────────
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    analyze_video,
+                    i, v["label"], v["url"],
+                    cast_analysis, transcripts,
+                    out_dir, ts, vllm_url, model_id,
+                    progress, progress_lock,
+                ): v["label"]
+                for i, v in enumerate(videos, 1)
+            }
+            for future in as_completed(futures):
+                label = futures[future]
+                try:
+                    results[label] = future.result()
+                except Exception as exc:
+                    results[label] = {"ok": False, "error": str(exc)}
+                    log(label, f"CRASHED — {exc}")
+    else:
+        # ── Chunked mode: N chunks per video, all parallel ───────────────────
+        # Each video runs in its own thread; within that thread, chunks are parallel
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            futures = {
+                pool.submit(
+                    analyze_video_chunked,
+                    i, v["label"], v["url"],
+                    cast_analysis, transcripts,
+                    out_dir, ts,
+                    n_chunks,
+                    durations.get(v["label"], 600.0),
+                    vllm_url, model_id, backend_url,
+                    progress, progress_lock,
+                ): v["label"]
+                for i, v in enumerate(videos)
+            }
+            for future in as_completed(futures):
+                label = futures[future]
+                try:
+                    results[label] = future.result()
+                except Exception as exc:
+                    results[label] = {"ok": False, "error": str(exc)}
+                    log(label, f"CRASHED — {exc}")
 
     wall = time.time() - t_wall
     ok   = sum(1 for r in results.values() if r.get("ok"))
 
-    print(f"\n{'='*60}")
-    print(f"  {ok}/{n} videos analyzed | wall: {wall:.1f}s")
+    print(f"\n{'='*62}")
+    print(f"  {ok}/{n} videos done | wall: {wall:.1f}s")
     for label, r in results.items():
-        atts   = r.get("attempts", "?")
         status = "✓" if r.get("ok") else "✗"
-        detail = (
-            f"{r['path']}  ({r.get('timeline_events','?')} events, "
-            f"attempt {atts}/{MAX_RETRIES})"
-            if r.get("ok")
-            else r.get("error", "")
-        )
+        if r.get("ok"):
+            chunks_str = (f" | {r['chunks_ok']}/{r['chunks_total']} chunks"
+                          if r.get("chunks_total") else "")
+            detail = (f"{r.get('timeline_events','?')} events{chunks_str} → {r['path']}")
+        else:
+            detail = r.get("error", "unknown")
         print(f"  [{status}] {label} — {detail}")
 
     if ok > 0:
@@ -763,7 +1476,7 @@ def main() -> None:
         for r in results.values():
             if r.get("path"):
                 print(f"    {r['path']}")
-    print(f"{'='*60}\n")
+    print(f"{'='*62}\n")
 
     if ok < n:
         sys.exit(1)

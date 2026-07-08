@@ -181,11 +181,14 @@ transcribe-urls: ## Transcribe raw video URLs — usage: make transcribe-urls VI
 	@python3 scripts/transcribe.py --videos $(VIDS) --whisper http://localhost:$(WHISPER_PORT)
 
 WORKERS ?= 8
+CHUNKS  ?= 4
 
-analyze-context: ## Full semantic video context — fuses cast+transcript+video per video
+analyze-context: ## Full semantic video context — usage: make analyze-context CAST=cast.json CHUNKS=4
 	@python3 scripts/analyze_context.py --cast $(CAST) \
 		--vllm http://localhost:$(VLLM_PORT)/v1/chat/completions \
-		--workers $(WORKERS)
+		--backend http://localhost:$(BACKEND_PORT) \
+		--workers $(WORKERS) \
+		--chunks $(CHUNKS)
 
 pipeline: ## ONE CMD — full pipeline: cast→transcript→context→index — usage: make pipeline CAST=cast.json
 	@python3 scripts/pipeline.py $(CAST) \

@@ -208,6 +208,9 @@ def main() -> None:
                         help="Skip transcription. Pass file path or 'auto' to use latest.")
     parser.add_argument("--skip-context",    action="store_true",
                         help="Skip context analysis — use existing output/context_*.json")
+    parser.add_argument("--chunks",   type=int, default=4,
+                        help="Chunks per video for context analysis (default 4). "
+                             "Higher = faster but more GPU concurrency.")
     parser.add_argument("--no-index",    action="store_true", help="Skip Pinecone + Neo4j indexing")
     parser.add_argument("--no-pinecone", action="store_true", help="Index to Neo4j only")
     parser.add_argument("--no-neo4j",    action="store_true", help="Index to Pinecone only")
@@ -395,7 +398,11 @@ def main() -> None:
         print(f"  {yellow('Note:')} This step is GPU-bound (~{fmt_time(est_context)} estimated).", flush=True)
         print(f"  Check {summary_path} for live progress.\n", flush=True)
 
-        cmd = [PYTHON, SCRIPTS / "analyze_context.py", "--cast", cast_path, "--vllm", args.vllm]
+        cmd = [PYTHON, SCRIPTS / "analyze_context.py",
+               "--cast", cast_path,
+               "--vllm", args.vllm,
+               "--backend", args.backend,
+               "--chunks", str(args.chunks)]
         if cast_analysis_file:
             cmd += ["--cast-analysis", cast_analysis_file]
         if transcript_file:
