@@ -76,31 +76,32 @@ def post_vllm(payload: dict, vllm_url: str, timeout: int = 900) -> dict:
 # ── Prompt builders ──────────────────────────────────────────────────────────
 
 def build_person_database(cast_analysis: dict, video_label: str) -> str:
-    """Convert cast_analysis persons into compact person database string for prompt."""
-    lines = []
+    """Build rich person database block injected into system prompt."""
+    blocks = []
     for i, p in enumerate(cast_analysis.get("persons", []), 1):
-        pid = f"P{i:03d}"
+        pid  = f"P{i:03d}"
         name = p.get("name", f"Person{i}")
-        lines.append(f'\n  {{"person_id": "{pid}", "display_name": "{name}",')
-        lines.append(f'   "face_url": "{p.get("face_url", "")}",')
-        lines.append(f'   "overall_similarity": {p.get("overall_best_similarity", 0)},')
 
-        # Find appearance for this specific video
-        appearance_for_video = None
+        # Prefer appearance description for THIS video, fall back to combined
+        desc = None
         for v in p.get("videos", []):
             if v.get("video") == video_label and v.get("description"):
-                appearance_for_video = v["description"]
+                desc = v["description"]
                 break
+        if not desc:
+            desc = p.get("combined_description") or "No description available"
 
-        # Fall back to combined description
-        if not appearance_for_video:
-            appearance_for_video = p.get("combined_description") or "No description available"
+        # Truncate but keep generous — 1200 chars per person
+        desc_safe = desc[:1200].replace('"', "'")
 
-        # Truncate to keep prompt manageable (~800 chars per person)
-        truncated = appearance_for_video[:800].replace('"', "'")
-        lines.append(f'   "appearance": "{truncated}..."}}')
+        block = f"""  PERSON {pid} — {name}
+  face_url: {p.get("face_url", "N/A")}
+  match_confidence: {p.get("overall_best_similarity", 0):.3f}
+  full_appearance: {desc_safe}
+  tracking_hints: Use face shape, hair, clothing, voice, posture to re-identify across cuts."""
+        blocks.append(block)
 
-    return "\n".join(lines) if lines else "  No known persons."
+    return "\n\n".join(blocks) if blocks else "  No known persons."
 
 
 def build_transcript_block(transcripts: dict, video_label: str) -> str:
@@ -125,126 +126,200 @@ def build_system_prompt(person_db: str, transcript_json: str, video_label: str) 
 Your job is NOT to caption frames. Your job is NOT to summarize.
 Your job is to build a complete semantic digital twin of this video.
 
-This JSON will become the permanent representation of the video.
-No future AI system will receive the original video.
-Every future system will receive ONLY your JSON.
-Therefore preserve every important semantic, editorial, visual, conversational and temporal detail.
+This JSON is the PERMANENT record. No future system sees the video — only your JSON.
+Therefore: preserve every semantic, editorial, visual, conversational and temporal detail.
 
-Think like: Film Director · Professional Video Editor · Cinematographer · Story Analyst · Human Observer.
+Think like: Film Director · Video Editor · Cinematographer · Story Analyst · Human Observer.
 Think in events. Think in relationships. Think in narrative. Think in editing opportunities.
 
-════════════════════════════════════════════════
-INPUT 1 — PERSON DATABASE (already identified)
-════════════════════════════════════════════════
-The following people are known. Use ONLY these person_ids. Never create duplicates.
-Track each person using face, hair, clothing, accessories, posture, voice, spatial continuity.
-If appearance changes mid-video, keep the same person_id.
+════════════════════════════════════════════
+CRITICAL TIMELINE RULE — READ THIS FIRST
+════════════════════════════════════════════
+NEVER create a timeline event longer than 8 seconds.
+Every single one of these MUST be a separate event:
+  • Speaker changes       → new event
+  • Laugh or smile        → new event
+  • Reaction (nod/shock)  → new event
+  • Camera cut            → new event
+  • Pause > 1 second      → new event
+  • Interruption          → new event
+  • Emotion change        → new event
+  • Topic shift           → new event
+
+For a 2-minute video: expect 60–150 timeline events.
+For an 80-second video: expect 40–100 timeline events.
+If your timeline has fewer than 30 events for any video over 60s, you are wrong.
+Granularity is the most important quality dimension.
+
+════════════════════════════════════════════
+INPUT 1 — PERSON DATABASE
+════════════════════════════════════════════
+These people are pre-identified. Use ONLY their person_ids. Never invent new ones.
+Track using: face, hair, clothing, accessories, posture, voice, spatial continuity.
+Same person_id even if they move, change angle, or are partially occluded.
 
 {person_db}
 
-════════════════════════════════════════════════
-INPUT 2 — TRANSCRIPT (timestamps are ground truth)
-════════════════════════════════════════════════
-These timestamps are pre-aligned. Never re-transcribe.
-Use transcript to determine: topic, dialogue, speaker changes, interruptions,
-reactions, callbacks, jokes, emotional flow. Every segment must have a speaker person_id.
+════════════════════════════════════════════
+INPUT 2 — TRANSCRIPT (timestamps = ground truth)
+════════════════════════════════════════════
+Never re-transcribe. These timestamps are authoritative.
+Use to determine: speakers, topic, interruptions, reactions, callbacks, jokes, emotional flow.
 
 {transcript_json}
 
-════════════════════════════════════════════════
-INPUT 3 — VIDEO (visual ground truth)
-════════════════════════════════════════════════
-The video is attached. Fuse it with the transcript and person database above.
-Cover every frame from first to last. Never leave a time gap.
+════════════════════════════════════════════
+INPUT 3 — VIDEO
+════════════════════════════════════════════
+Fuse video with transcript and person database. Cover every frame first to last.
 
-════════════════════════════════════════════════
-SPEAKER IDENTIFICATION
-════════════════════════════════════════════════
-For every transcript segment determine the speaker using:
-lip movement, mouth openness, eye contact, body orientation, conversation flow, voice.
-
-════════════════════════════════════════════════
-EDITORIAL INTELLIGENCE
-════════════════════════════════════════════════
-For every timeline event score (0-10):
-  importance_score  — how significant to the overall story
-  hook_score        — would make viewer stop scrolling
-  retention_score   — keeps viewer watching
-  emotion_score     — emotional intensity
-  clip_score        — worthy of standalone short clip
-  viral_score       — potential to go viral
-  thumbnail_score   — strong visual for thumbnail
-
-════════════════════════════════════════════════
-OUTPUT SCHEMA — return ONLY this JSON, nothing else
-════════════════════════════════════════════════
+════════════════════════════════════════════
+OUTPUT SCHEMA — return ONLY valid JSON, nothing else
+════════════════════════════════════════════
 {{
   "video_id": "{video_label}",
   "video_url": "<url>",
+
   "video_metadata": {{
     "duration_s": <float>,
-    "setting": "<where this takes place>",
-    "format": "<interview|podcast|vlog|comedy|etc>",
+    "setting": "<location description>",
+    "format": "<podcast|interview|vlog|comedy|debate|etc>",
     "language": "<language>",
-    "overall_context": "<2-3 sentence summary of what this video is about>"
+    "overall_context": "<2-3 sentences: what this video is, who's in it, what they discuss>"
   }},
 
   "known_people": [
     {{
       "person_id": "P001",
       "display_name": "<name>",
+      "role_in_video": "<host|guest|interviewer|subject|background>",
       "screen_time_s": <float>,
       "speaking_time_s": <float>,
       "first_appears_s": <float>,
       "last_seen_s": <float>,
       "dominant_position": "<left|center|right|off-screen>",
-      "mood_arc": "<starts energetic, becomes serious, etc>",
-      "role_in_video": "<host|guest|background|interviewer|etc>"
+      "mood_arc": "<e.g. starts nervous, relaxes after 30s, becomes animated at 90s>",
+      "appearance": {{
+        "clothing": "<exact description of what they wear in THIS video>",
+        "hair": "<hair color, style, length>",
+        "facial_hair": "<clean-shaven|stubble|beard — describe>",
+        "glasses": <true|false>,
+        "accessories": "<hat, jewelry, watch, etc or none>",
+        "distinguishing": "<any unique feature visible in this video>"
+      }},
+      "voice_characteristics": "<pace, tone, accent, energy level>"
     }}
   ],
 
   "timeline": [
     {{
       "id": "E001",
-      "start": <float>,
-      "end": <float>,
-      "type": "<dialogue|reaction|action|joke|argument|transition|b-roll|etc>",
-      "description": "<detailed description of what happens>",
+      "start": <float — to 2 decimal places>,
+      "end": <float — to 2 decimal places, MAX 8s after start>,
+      "type": "<dialogue|reaction|laugh|interruption|pause|joke|argument|question|answer|transition|cutaway|silence>",
+      "description": "<what exactly happens — be specific, not vague>",
       "visible_people": ["P001", "P002"],
-      "speaker": "<person_id or null>",
+      "speaker": "<person_id or null if no speech>",
       "speaker_confidence": <0.0-1.0>,
+      "transcript_text": "<exact words spoken, empty string if silent>",
+      "topic": "<micro-topic of this exact moment>",
       "listener_reactions": [
-        {{"person_id": "P002", "reaction": "<laughing|nodding|surprised|etc>"}}
+        {{"person_id": "P002", "reaction": "<laughing|nodding|surprised|eye-roll|smile|frown|looking away>"}}
       ],
-      "location": "<indoor studio|outdoor|car|etc>",
-      "camera_shot": "<wide|medium|close-up|over-shoulder|etc>",
-      "transcript_text": "<exact spoken words in this interval>",
-      "topic": "<what is being discussed>",
-      "emotion": "<funny|tense|emotional|informative|awkward|etc>",
-      "importance_score": <0-10>,
-      "hook_score": <0-10>,
-      "retention_score": <0-10>,
-      "emotion_score": <0-10>,
-      "clip_score": <0-10>,
-      "viral_score": <0-10>,
-      "thumbnail_score": <0-10>,
+      "body_language": {{
+        "P001": {{
+          "pose": "<leaning forward|back|upright|slouched>",
+          "gesture": "<pointing|waving|shrugging|none|hands on table>",
+          "head": "<nodding|shaking|tilting left|tilting right|still>",
+          "facial": "<smiling|laughing|serious|surprised|thinking|neutral>",
+          "eye_contact": <true|false>,
+          "energy": "<high|medium|low>"
+        }}
+      }},
+      "visual_attention": {{
+        "primary_focus": "<P001 or object name>",
+        "secondary_focus": "<P002 or null>",
+        "viewer_attention": "<what a viewer's eye goes to first>",
+        "composition": "<rule-of-thirds|centered|off-center|split-screen>"
+      }},
+      "camera": {{
+        "shot_type": "<wide|medium|close-up|extreme-close-up|over-shoulder|cutaway|two-shot>",
+        "movement": "<static|zoom-in|zoom-out|pan-left|pan-right|cut>",
+        "subject_in_frame": "<who or what>"
+      }},
+      "audio": {{
+        "type": "<speech|laughter|silence|music|crowd|ambient|overlap>",
+        "background": "<none|music|crowd noise|ambient>",
+        "notable": "<any notable audio event — punchline lands, gasp, etc>"
+      }},
+      "emotion": "<funny|tense|emotional|informative|awkward|excited|calm|sad|angry>",
+      "scores": {{
+        "importance": <0-10>,
+        "hook": <0-10>,
+        "retention": <0-10>,
+        "emotion": <0-10>,
+        "clip": <0-10>,
+        "viral": <0-10>,
+        "thumbnail": <0-10>
+      }},
+      "editing_reasoning": {{
+        "hook": "<what grabs attention in this moment>",
+        "payoff": "<what the payoff is, or null>",
+        "callback": "<does this reference an earlier moment? which one?>",
+        "should_keep": <true|false>,
+        "why": "<one sentence: why an editor should keep or cut this>",
+        "cut_point": "<good cut point description or null>"
+      }},
+      "depends_on": ["<E007>"],
       "clip_worthy": <true|false>,
-      "thumbnail_worthy": <true|false>,
-      "why_matters": "<why an editor should keep this moment>"
+      "thumbnail_worthy": <true|false>
     }}
   ],
+
+  "conversation": {{
+    "turns": [
+      {{"turn_id": "T001", "speaker": "P001", "start": <float>, "end": <float>, "text": "<what they said>"}}
+    ],
+    "interruptions": [
+      {{"at_s": <float>, "interrupted": "P001", "by": "P002", "context": "<what was interrupted>"}}
+    ],
+    "callbacks": [
+      {{"at_s": <float>, "references_event": "E007", "description": "<what was called back>"}}
+    ],
+    "question_answer_pairs": [
+      {{"question_event": "E003", "answer_event": "E005", "asker": "P001", "answerer": "P002", "topic": "<topic>"}}
+    ],
+    "agreements": [
+      {{"at_s": <float>, "between": ["P001", "P002"], "about": "<what they agreed on>"}}
+    ],
+    "disagreements": [
+      {{"at_s": <float>, "between": ["P001", "P002"], "about": "<what they disagreed on>", "intensity": "<mild|heated|argument>"}}
+    ],
+    "jokes": [
+      {{"event_id": "E012", "setup_event": "E010", "punchline": "<the joke>", "landed": <true|false>, "reactions": ["P002 laughed"]}}
+    ]
+  }},
+
+  "story": {{
+    "hook": {{"event_id": "E001", "description": "<what grabs attention in first 10s>"}},
+    "setup": {{"start": <float>, "end": <float>, "description": "<how context is established>"}},
+    "conflict": {{"start": <float>, "end": <float>, "description": "<the central tension or debate>", "present": <true|false>}},
+    "escalation": {{"start": <float>, "end": <float>, "description": "<how tension or interest builds>", "present": <true|false>}},
+    "resolution": {{"start": <float>, "end": <float>, "description": "<how it resolves>", "present": <true|false>}},
+    "ending": {{"event_id": "<last_event_id>", "description": "<how the video ends and what feeling it leaves>"}}
+  }},
 
   "scenes": [
     {{
       "scene_id": "S001",
       "start": <float>,
       "end": <float>,
-      "title": "<short scene title>",
+      "title": "<short scene name>",
       "description": "<what happens in this scene>",
-      "location": "<setting>",
       "people_present": ["P001"],
       "dominant_emotion": "<emotion>",
-      "narrative_purpose": "<what this scene does for the story>"
+      "narrative_purpose": "<what this scene contributes to the story>",
+      "event_ids": ["E001", "E002", "E003"]
     }}
   ],
 
@@ -253,21 +328,40 @@ OUTPUT SCHEMA — return ONLY this JSON, nothing else
       "shot_id": "SH001",
       "start": <float>,
       "end": <float>,
-      "shot_type": "<wide|medium|close-up|extreme-close-up|over-shoulder|cutaway>",
-      "subject": "<who or what is in frame>",
-      "camera_movement": "<static|pan|zoom|cut>"
+      "shot_type": "<wide|medium|close-up|extreme-close-up|over-shoulder|cutaway|two-shot>",
+      "primary_subject": "<person_id or object>",
+      "camera_movement": "<static|pan|zoom-in|zoom-out|cut>"
     }}
   ],
 
   "speaker_timeline": [
     {{
-      "segment_id": 0,
+      "segment_id": <int>,
       "start": <float>,
       "end": <float>,
       "person_id": "<P001 or unknown>",
-      "text": "<spoken text>",
+      "text": "<spoken words>",
       "confidence": <0.0-1.0>,
-      "visual_reason": "<why you identified this speaker>"
+      "visual_reason": "<lip movement|body orientation|diarization|conversation flow>"
+    }}
+  ],
+
+  "audio_events": [
+    {{
+      "start": <float>,
+      "end": <float>,
+      "type": "<laughter|applause|music|silence|crosstalk|ambient|sound-effect>",
+      "intensity": "<soft|medium|loud>",
+      "description": "<what you hear>"
+    }}
+  ],
+
+  "ocr_results": [
+    {{
+      "timestamp_s": <float>,
+      "text": "<exact text on screen>",
+      "location": "<top-left|center|lower-third|corner>",
+      "type": "<title-card|lower-third|caption|logo|graphic>"
     }}
   ],
 
@@ -276,9 +370,10 @@ OUTPUT SCHEMA — return ONLY this JSON, nothing else
       "id": "H001",
       "start": <float>,
       "end": <float>,
-      "title": "<catchy title for this highlight>",
+      "title": "<catchy short title>",
       "reason": "<why this is a highlight>",
-      "type": "<funny|emotional|informative|dramatic|shocking|etc>",
+      "type": "<funny|emotional|informative|dramatic|shocking|wholesome>",
+      "event_ids": ["E012", "E013"],
       "score": <0-10>
     }}
   ],
@@ -290,42 +385,38 @@ OUTPUT SCHEMA — return ONLY this JSON, nothing else
       "end": <float>,
       "duration_s": <float>,
       "title": "<suggested clip title>",
-      "hook": "<first sentence that grabs attention>",
-      "platform": "<YouTube Shorts|Instagram Reels|TikTok|full clip>",
-      "clip_score": <0-10>,
-      "viral_score": <0-10>
+      "hook": "<opening line that grabs attention>",
+      "why_complete": "<why this works as a standalone clip — has setup AND payoff>",
+      "platform": "<YouTube Shorts|Instagram Reels|TikTok|LinkedIn|full clip>",
+      "depends_on_events": ["<event_ids needed for context>"],
+      "scores": {{"clip": <0-10>, "viral": <0-10>, "hook": <0-10>}}
     }}
   ],
 
   "thumbnail_candidates": [
     {{
       "timestamp_s": <float>,
-      "description": "<what is visible at this frame>",
-      "why_good_thumbnail": "<reason>",
+      "event_id": "<E_id>",
+      "description": "<exact frame description>",
+      "why_good_thumbnail": "<emotion/expression/composition reason>",
+      "primary_person": "<person_id>",
+      "expression": "<surprised|laughing|serious|intense|etc>",
       "score": <0-10>
     }}
   ],
 
-  "ocr_results": [
-    {{
-      "timestamp_s": <float>,
-      "text": "<text visible on screen>",
-      "location": "<top-left|center|lower-third|etc>",
-      "type": "<title-card|lower-third|caption|brand-logo|etc>"
-    }}
-  ],
-
   "editorial_summary": {{
-    "overall_summary": "<3-5 sentence complete summary of the entire video>",
+    "overall_summary": "<4-6 sentences: complete summary of the entire video>",
     "main_topics": ["<topic1>", "<topic2>"],
-    "emotional_arc": "<how the mood changes from start to end>",
-    "key_moments": ["<moment1 with timestamp>", "<moment2 with timestamp>"],
-    "best_clip_start": <float>,
-    "best_clip_end": <float>,
-    "best_clip_reason": "<why this is the single best clip>",
+    "emotional_arc": "<e.g. starts slow → builds tension at 45s → big laugh at 72s → calm ending>",
+    "key_moments": [
+      {{"timestamp_s": <float>, "description": "<what happens and why it matters>"}}
+    ],
+    "best_clip": {{"start": <float>, "end": <float>, "reason": "<why this is the best standalone clip>"}},
     "viral_potential": "<low|medium|high|very high>",
-    "suggested_title": "<YouTube title suggestion>",
-    "suggested_description": "<YouTube description first paragraph>"
+    "suggested_title": "<YouTube title>",
+    "suggested_description": "<YouTube description opening paragraph>",
+    "editor_notes": "<3-5 specific editing recommendations for this video>"
   }}
 }}"""
 
@@ -374,7 +465,7 @@ def analyze_video(
         "extra_body": {
             "top_k": 20,
             "chat_template_kwargs": {"enable_thinking": False},
-            "mm_processor_kwargs": {"fps": 1.0, "do_sample_frames": True},
+            "mm_processor_kwargs": {"fps": 2.0, "do_sample_frames": True},
         },
     }
 
