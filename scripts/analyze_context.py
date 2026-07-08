@@ -402,13 +402,19 @@ Return ONLY valid JSON:
 def _merge_sorted(chunks: list[dict], key: str) -> list:
     items = []
     for c in chunks:
-        items.extend(c.get(key, []))
+        if not c.get("ok"):
+            continue  # skip failed chunks entirely
+        raw = c.get(key, [])
+        if isinstance(raw, list):
+            items.extend(raw)
     return sorted(items, key=lambda x: x.get("start", x.get("timestamp_s", 0)))
 
 
 def _merge_people(chunks: list[dict]) -> list[dict]:
     seen: dict = {}
     for c in chunks:
+        if not c.get("ok"):
+            continue
         for p in c.get("known_people", []):
             pid = p.get("person_id", "")
             if pid not in seen:
@@ -1222,7 +1228,11 @@ def analyze_video_chunked(
         "total_chunks_all": global_progress.get("total_chunks_all", n_chunks),
     }
 
-    chunk_results: list[dict] = [{}] * n_chunks
+    # IMPORTANT: use list comprehension NOT [{}]*n — that creates shared dict refs
+    chunk_results: list[dict] = [
+        {"ok": False, "error": "not started", "chunk_id": i, "timeline": []}
+        for i in range(n_chunks)
+    ]
 
     with ThreadPoolExecutor(max_workers=n_chunks) as pool:
         futures = {
@@ -1245,30 +1255,48 @@ def analyze_video_chunked(
         for future in as_completed(futures):
             cid = futures[future]
             try:
-                chunk_results[cid] = future.result()
+                result = future.result()
+                chunk_results[cid] = result
+                if not result.get("ok"):
+                    log(video_label,
+                        f"Chunk {cid} failed (retries exhausted) — "
+                        f"continuing merge without it: {result.get('error','?')}")
             except Exception as exc:
-                log(video_label, f"Chunk {cid} CRASHED — {exc}")
+                # Unhandled crash in thread — still don't let it kill other chunks
+                log(video_label, f"Chunk {cid} CRASHED (unhandled) — {exc} — continuing")
                 chunk_results[cid] = {"ok": False, "error": str(exc),
                                       "chunk_id": cid, "timeline": []}
 
-    ok_chunks  = sum(1 for r in chunk_results if r.get("ok"))
+    ok_chunks   = sum(1 for r in chunk_results if r.get("ok"))
     fail_chunks = n_chunks - ok_chunks
-    log(video_label, f"Chunks: {ok_chunks}/{n_chunks} OK, {fail_chunks} failed")
+
+    if fail_chunks:
+        failed_ids = [r["chunk_id"] for r in chunk_results if not r.get("ok")]
+        log(video_label,
+            f"WARNING: {fail_chunks}/{n_chunks} chunks failed {failed_ids} — "
+            f"merging {ok_chunks} successful chunks. "
+            f"Time coverage may have gaps.")
 
     if ok_chunks == 0:
+        log(video_label, "FATAL: all chunks failed — aborting this video")
         return {"ok": False,
                 "error": f"All {n_chunks} chunks failed",
                 "elapsed": round(time.time() - t0, 1),
                 "attempts": MAX_RETRIES}
 
-    # Merge chunks → one coherent dict
-    merged = merge_chunks(chunk_results, video_label, video_url, total_duration)
+    # Merge chunks → one coherent dict (safe even with partial failures)
+    try:
+        merged = merge_chunks(chunk_results, video_label, video_url, total_duration)
+    except Exception as e:
+        log(video_label, f"merge_chunks CRASHED — {e}")
+        return {"ok": False, "error": f"merge failed: {e}",
+                "elapsed": round(time.time() - t0, 1), "attempts": MAX_RETRIES}
 
     # Synthesis pass — text-only LLM call for conversation/story/editorial
     try:
         merged = synthesize_merged(merged, person_db, total_duration, vllm_url, model_id)
     except Exception as e:
-        log(video_label, f"Synthesis failed ({e}) — saving without editorial layer")
+        log(video_label, f"Synthesis failed ({e}) — saving merged timeline without editorial")
 
     # Save final file
     slug     = video_label.replace(" ", "_")
