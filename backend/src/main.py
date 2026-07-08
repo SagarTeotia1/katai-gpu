@@ -12,6 +12,7 @@ from src.routers.video import router as video_router
 from src.services.llm import LLMService
 from src.services.vision import VisionService
 from src.services.video import VideoService
+from src.services.fast_video import FastVideoService
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +29,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     llm_service = LLMService()
     vision_service = VisionService()
     video_service = VideoService()
+    fast_video_service = FastVideoService()
     app.state.llm_service = llm_service
     app.state.vision_service = vision_service
     app.state.video_service = video_service
+    app.state.fast_video_service = fast_video_service
 
     yield
 
@@ -38,6 +41,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await llm_service.aclose()
     await vision_service.aclose()
     await video_service.aclose()
+    await fast_video_service.aclose()
 
 
 # ── App factory ───────────────────────────────────────────────────────────────

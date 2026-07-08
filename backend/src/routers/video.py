@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from src.config import settings
 from src.models.schemas import StreamChunk
 from src.services.video import VideoService, VideoServiceError
+from src.services.fast_video import FastVideoService
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,12 @@ def get_video_service(request: Request) -> VideoService:
 VideoDep = Annotated[VideoService, Depends(get_video_service)]
 
 
+def get_fast_video_service(request: Request) -> FastVideoService:
+    return request.app.state.fast_video_service
+
+FastVideoDep = Annotated[FastVideoService, Depends(get_fast_video_service)]
+
+
 @router.post("/probe")
 async def probe(req: ProbeRequest, video: VideoDep) -> dict:
     """Fast probe — returns video duration in seconds."""
@@ -88,6 +95,31 @@ async def semantic_analyze(req: SemanticVideoRequest, video: VideoDep) -> dict:
         result = await video.analyze_semantic(req.video_url, req.transcript)
     except VideoServiceError as exc:
         logger.error("Semantic video analysis failed: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return result
+
+
+class FastChunkRequest(BaseModel):
+    video_url: str
+    chunk_id: int
+    total_chunks: int
+    start: float
+    end: float
+    duration: float
+    transcript_segment: str = ""
+    fps: float = 0.5
+
+
+@router.post("/fast-chunk")
+async def fast_analyze_chunk(req: FastChunkRequest, fast_video: FastVideoDep) -> dict:
+    """Two-phase fast analysis: ffmpeg frames → parallel image analysis → JSON aggregation."""
+    try:
+        result = await fast_video.analyze_chunk(
+            req.video_url, req.chunk_id, req.total_chunks,
+            req.start, req.end, req.duration, req.transcript_segment, req.fps,
+        )
+    except VideoServiceError as exc:
+        logger.error("Fast chunk %d failed: %s", req.chunk_id, exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return result
 
