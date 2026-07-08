@@ -12,6 +12,7 @@ FRONTEND_CONTAINER := katai-frontend
 VLLM_PORT          ?= 8000
 BACKEND_PORT       ?= 8080
 FRONTEND_PORT      ?= 3000
+WHISPER_PORT       ?= 9000
 MODEL              ?= $(MODEL_ID)
 MODEL              ?= Qwen/Qwen3.6-27B
 N                  ?= 4
@@ -155,8 +156,24 @@ vision-bench: ## Fire all 4 images in parallel — full vision benchmark
 	@python3 scripts/vision_bench.py --backend http://localhost:$(BACKEND_PORT)
 
 CAST ?= cast.json
+
 cast-analysis: ## Analyze cast appearance from crop images — usage: make cast-analysis CAST=cast.json
 	@python3 scripts/cast_analysis.py $(CAST) --backend http://localhost:$(BACKEND_PORT)
+
+whisper-up: ## Start only the whisper service — usage: make whisper-up
+	@$(COMPOSE) up --build -d whisper
+
+whisper-logs: ## Follow whisper service logs
+	@$(COMPOSE) logs -f whisper
+
+whisper-health: ## Check whisper service health
+	@curl -s http://localhost:$(WHISPER_PORT)/health | python3 -m json.tool
+
+transcribe: ## Transcribe videos from cast JSON — usage: make transcribe CAST=cast.json
+	@python3 scripts/transcribe.py --cast $(CAST) --whisper http://localhost:$(WHISPER_PORT)
+
+transcribe-urls: ## Transcribe raw video URLs — usage: make transcribe-urls VIDS="url1 url2"
+	@python3 scripts/transcribe.py --videos $(VIDS) --whisper http://localhost:$(WHISPER_PORT)
 
 parallel: ## Fire N concurrent requests to test vLLM concurrency — usage: make parallel N=8 IMG="https://..."
 	@python3 -c "\
