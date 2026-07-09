@@ -23,7 +23,45 @@ from datetime import datetime
 from pathlib import Path
 
 WHISPER_PORT = 9000
-DEFAULT_WORKERS = 3
+BACKEND_PORT = 8080
+DEFAULT_WORKERS = 0   # 0 = auto (dynamic based on video durations)
+
+
+def probe_duration(backend_base: str, video_url: str) -> float | None:
+    """Get video duration via backend /api/video/probe (ffprobe). Returns None on failure."""
+    try:
+        payload = json.dumps({"video_url": video_url}).encode()
+        req = urllib.request.Request(
+            f"{backend_base}/api/video/probe",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        resp = urllib.request.urlopen(req, timeout=45)
+        data = json.loads(resp.read())
+        return float(data.get("duration_s") or data.get("duration") or 0) or None
+    except Exception:
+        return None
+
+
+def dynamic_worker_count(durations: list[float | None], n_videos: int) -> int:
+    """Pick worker count from video durations. Longer videos → fewer parallel to
+    keep whisper service healthy; short videos → more parallelism."""
+    if n_videos <= 1:
+        return 1
+    known = [d for d in durations if d and d > 0]
+    if not known:
+        # No probe data — fall back to a moderate default.
+        return min(n_videos, 4)
+    max_d = max(known)
+    if max_d <= 60:
+        cap = 8
+    elif max_d <= 300:
+        cap = 5
+    elif max_d <= 900:
+        cap = 3
+    else:
+        cap = 2
+    return max(1, min(n_videos, cap))
 
 
 def call_whisper(video_url: str, whisper_base: str, language: str | None = None) -> dict:
@@ -95,7 +133,10 @@ def main() -> None:
     parser.add_argument("--whisper", default=f"http://localhost:{WHISPER_PORT}", help="Whisper service URL")
     parser.add_argument("--language", default=None, help="Force language (e.g. 'en', 'hi') — default: auto-detect")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
-                        help=f"Parallel whisper workers (default {DEFAULT_WORKERS}). vLLM idle during this stage.")
+                        help="Parallel whisper workers. 0 = auto (scales with video durations). "
+                             "vLLM idle during this stage.")
+    parser.add_argument("--backend", default=f"http://localhost:{BACKEND_PORT}",
+                        help="Backend URL (used for ffprobe duration lookup when --workers=0).")
     args = parser.parse_args()
 
     # Build video list
@@ -132,8 +173,18 @@ def main() -> None:
     results = []
 
     # Parallel — vLLM idle during transcribe stage, safe to stack whisper workers.
-    workers = max(1, min(args.workers, len(videos)))
-    print(f"  Parallel workers: {workers}\n", flush=True)
+    if args.workers and args.workers > 0:
+        workers = max(1, min(args.workers, len(videos)))
+        print(f"  Parallel workers: {workers} (manual)\n", flush=True)
+    else:
+        print("  Probing durations (ffprobe via backend) for dynamic worker count...", flush=True)
+        durations = [probe_duration(args.backend, v["url"]) for v in videos]
+        for v, d in zip(videos, durations):
+            print(f"    [{v['label']}] {d:.1f}s" if d else f"    [{v['label']}] unknown", flush=True)
+        workers = dynamic_worker_count(durations, len(videos))
+        known = [d for d in durations if d]
+        max_d = max(known) if known else 0
+        print(f"  Parallel workers: {workers} (auto — max duration {max_d:.0f}s)\n", flush=True)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(transcribe_video, v["label"], v["source"], v["url"],

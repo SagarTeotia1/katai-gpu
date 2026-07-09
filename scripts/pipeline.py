@@ -213,8 +213,9 @@ def main() -> None:
                              "Higher = faster but more GPU concurrency.")
     parser.add_argument("--workers",  type=int, default=24,
                         help="Max parallel local agents across all chunks (default 24).")
-    parser.add_argument("--whisper-workers", type=int, default=3,
-                        help="Parallel whisper transcription workers (default 3). "
+    parser.add_argument("--whisper-workers", type=int, default=0,
+                        help="Parallel whisper transcription workers. 0 = auto "
+                             "(dynamic based on video durations, via ffprobe). "
                              "vLLM idle during this stage so safe to stack.")
     parser.add_argument("--no-index",    action="store_true", help="Skip Pinecone + Neo4j indexing")
     parser.add_argument("--no-pinecone", action="store_true", help="Index to Neo4j only")
@@ -363,7 +364,8 @@ def main() -> None:
         t0 = time.time()
         ok, metrics, _ = run_step(
             [PYTHON, SCRIPTS / "transcribe.py", "--cast", cast_path,
-             "--whisper", args.whisper, "--workers", str(args.whisper_workers)],
+             "--whisper", args.whisper, "--backend", args.backend,
+             "--workers", str(args.whisper_workers)],
             parse_transcribe,
         )
         found = new_files_since("output/transcripts_*.json", t0)
