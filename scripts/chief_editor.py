@@ -159,8 +159,24 @@ Before making any edit:
 9. Preserve jokes.
 10. Never break continuity.
 
+## EDIT MODE — DETECT FIRST, PLAN SECOND
+
+Before planning ops, classify the user intent into one of these modes:
+
+**MODE: FULL_VIDEO_REORDER**
+Trigger words: "complete", "full video", "entire", "whole", "play video X then video Y", "reorder", "put X first", "end of X to beginning".
+Rule: DO NOT CUT any events. Only MOVE/SWAP/REORDER events between positions. Inserts (text, zoom, sound) allowed. No TRIM unless user specifies a specific section. Target duration = sum of all events from all source videos.
+
+**MODE: HIGHLIGHT_CUT**
+Trigger words: "best moments", "short", "60s", "45s", "30s", "reel", "short", "clip", target duration specified.
+Rule: Aggressive CUT/TRIM to fit duration budget. Every op must serve retention.
+
+**MODE: NARRATIVE_EDIT**
+Default when no clear mode. Moderate trimming, preserve story arcs.
+
 You are allowed ONLY these primitive editing operations:
-  CUT TRIM MOVE MERGE SPLIT
+  CUT TRIM MOVE SWAP REORDER
+  MERGE SPLIT
   INSERT_BROLL INSERT_REACTION INSERT_TEXT INSERT_ZOOM INSERT_SOUND INSERT_FLASHBACK
   SPEED_UP SLOW_DOWN FREEZE_FRAME
   CROSS_VIDEO_MATCH_CUT   (transition between two source videos on matching action/audio/emotion)
@@ -201,13 +217,15 @@ Never output prose. Output ONLY this JSON:
   "editing_plan": [
     {
       "op_index": 1,
-      "operation": "CUT|TRIM|MOVE|MERGE|SPLIT|INSERT_BROLL|INSERT_REACTION|INSERT_TEXT|INSERT_ZOOM|INSERT_SOUND|INSERT_FLASHBACK|SPEED_UP|SLOW_DOWN|FREEZE_FRAME|CROSS_VIDEO_MATCH_CUT|CROSS_VIDEO_BRIDGE",
+      "operation": "CUT|TRIM|MOVE|SWAP|REORDER|MERGE|SPLIT|INSERT_BROLL|INSERT_REACTION|INSERT_TEXT|INSERT_ZOOM|INSERT_SOUND|INSERT_FLASHBACK|SPEED_UP|SLOW_DOWN|FREEZE_FRAME|CROSS_VIDEO_MATCH_CUT|CROSS_VIDEO_BRIDGE",
       "target_event_ids": ["E?"],
       "params": {
-        "// CUT":       "removes the whole event",
+        "// CUT":       "removes the whole event — HIGHLIGHT_CUT mode only",
         "// TRIM":      "in_s, out_s (source-relative seconds inside event window)",
         "// MOVE":      "to_position (1-indexed slot in final_sequence)",
-        "// MERGE":     "with_event_ids",
+        "// SWAP":      "swap_with_event_id — exchange positions of two events",
+        "// REORDER":   "new_sequence: ['event_id_1','event_id_2',...] — explicit reorder of a group",
+        "// MERGE":     "with_event_ids — combine adjacent events into one clip",
         "// SPLIT":     "at_s (source-relative)",
         "// INSERT_BROLL":     "content_hint, duration_s, over_event_id, start_offset_s",
         "// INSERT_REACTION":  "reactor_person, expression, duration_s, over_event_id, start_offset_s",
@@ -251,20 +269,113 @@ Never output prose. Output ONLY this JSON:
       "rationale": "..."
     }
   ],
+  "edit_mode": "FULL_VIDEO_REORDER|HIGHLIGHT_CUT|NARRATIVE_EDIT",
   "chief_editor_note": "1-2 sentence summary of the creative call."
 }
 
 Rules:
+- ALWAYS output `edit_mode` field — classify the user intent before planning.
+- In FULL_VIDEO_REORDER: every event from every source video appears in `final_sequence`. Use MOVE/SWAP/REORDER ops only. No CUT unless user explicitly says "remove X". `target_duration_s` = sum of all event durations.
+- In HIGHLIGHT_CUT: `final_sequence` sums to within ±5% of `target_duration_s`.
 - Reference events by their exact `event_id` from the input context.
-- `final_sequence` sums to within ±5% of `target_duration_s` (accounting for TRIM/SPEED_UP/inserts).
 - Every op has confidence + all four reasons + expected_impact. No exceptions.
-- If context is thin for the target duration, honestly shorten and flag in risks_flagged.
 - Preserve every setup→payoff pair. If a payoff is kept, its setup must be kept OR replaced by an INSERT_TEXT/INSERT_FLASHBACK that supplies the context."""
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  Retrieval + LLM plumbing
 # ═════════════════════════════════════════════════════════════════════════════
+
+def detect_edit_mode(prompt: str) -> str:
+    lower = prompt.lower()
+    full_words = ["complete","full video","entire","whole","reorder","play video",
+                  "put first","comes first","then play","play all"]
+    highlight_words = ["best moments","short","reel","60s","45s","30s","highlight",
+                       "clip","viral","top","funniest","viral"]
+    if any(w in lower for w in full_words):
+        return "FULL_VIDEO_REORDER"
+    if any(w in lower for w in highlight_words):
+        return "HIGHLIGHT_CUT"
+    return "NARRATIVE_EDIT"
+
+
+def build_executor_timeline(plan: dict, events: list[dict]) -> list[dict]:
+    """
+    Resolve final_sequence event_ids → flat executor segments with real timestamps.
+    Frontend / ffmpeg consumes this directly — no further lookup needed.
+    """
+    event_map = {e["event_id"]: e for e in events if e.get("event_id")}
+
+    # Build trim override map from editing_plan
+    trim_map: dict[str, dict] = {}
+    insert_map: dict[str, list] = {}  # event_id → list of INSERT ops
+    for op in plan.get("editing_plan", []):
+        operation = op.get("operation","")
+        params    = op.get("params", {}) or {}
+        for eid in op.get("target_event_ids", []):
+            if operation == "TRIM":
+                trim_map[eid] = {
+                    "in_s":  float(params.get("in_s", 0)),
+                    "out_s": params.get("out_s"),
+                }
+            if operation.startswith("INSERT_"):
+                insert_map.setdefault(eid, []).append({
+                    "op": operation,
+                    **{k: v for k, v in params.items() if not k.startswith("//")},
+                })
+
+    timeline = []
+    output_cursor = 0.0
+
+    for entry in plan.get("final_sequence", []):
+        if isinstance(entry, str):
+            eid, vid = entry, None
+            in_s = out_s = role = None
+        else:
+            eid  = entry.get("event_id", "")
+            vid  = entry.get("video_id")
+            in_s = entry.get("in_s")
+            out_s= entry.get("out_s")
+            role = entry.get("role")
+
+        ev = event_map.get(eid, {})
+        src_start = float(ev.get("start_s") or 0)
+        src_end   = float(ev.get("end_s")   or src_start)
+
+        # Apply TRIM override
+        if eid in trim_map:
+            t = trim_map[eid]
+            src_start = src_start + float(t.get("in_s") or 0)
+            if t.get("out_s") is not None:
+                src_end = float(ev.get("start_s") or 0) + float(t["out_s"])
+        elif in_s is not None:
+            src_start = float(ev.get("start_s") or 0) + float(in_s)
+            if out_s is not None:
+                src_end = float(ev.get("start_s") or 0) + float(out_s)
+
+        duration = max(0.0, src_end - src_start)
+        out_start = output_cursor
+        out_end   = output_cursor + duration
+
+        timeline.append({
+            "step":           len(timeline) + 1,
+            "event_id":       eid,
+            "video_id":       vid or ev.get("video_id") or "unknown",
+            "source_start_s": round(src_start, 3),
+            "source_end_s":   round(src_end,   3),
+            "output_start_s": round(out_start,  3),
+            "output_end_s":   round(out_end,    3),
+            "duration_s":     round(duration,   3),
+            "role":           role or "",
+            "transition_in":  entry.get("transition_in","hard_cut") if isinstance(entry, dict) else "hard_cut",
+            "overlays":       insert_map.get(eid, []),
+            "speakers":       ev.get("speakers"),
+            "description":    ev.get("description","")[:120],
+        })
+        output_cursor = out_end
+
+    return timeline
+
 
 def expand_query(prompt: str) -> str:
     lower = prompt.lower()
@@ -470,10 +581,25 @@ def main():
     events_json = json.dumps(events[:60], indent=2, ensure_ascii=False)
     graph_json  = json.dumps(graph, indent=2, ensure_ascii=False)[:9000]
 
-    multi_video_note = ""
+    edit_mode = detect_edit_mode(prompt)
+    print(f"    Detected edit mode: {edit_mode}", flush=True)
+
+    mode_note = f"\n\nDETECTED EDIT MODE: {edit_mode}."
+    if edit_mode == "FULL_VIDEO_REORDER":
+        total_events = sum(per_video_count.values())
+        mode_note += (
+            f" User wants COMPLETE videos reordered — NOT trimmed to a short clip. "
+            f"All {total_events} events must appear in final_sequence. "
+            f"Only use MOVE/SWAP/REORDER ops (plus INSERT_* for enhancements). "
+            f"Do NOT use CUT ops unless user explicitly says to remove something."
+        )
+    elif edit_mode == "HIGHLIGHT_CUT":
+        mode_note += " User wants a highlight reel. Aggressively CUT/TRIM to fit target duration."
+
+    multi_video_note = mode_note
     if len(per_video_count) > 1:
         breakdown = ", ".join(f"{k}={v} events" for k, v in sorted(per_video_count.items()))
-        multi_video_note = (
+        multi_video_note += (
             f"\n\nMULTI-VIDEO EDIT — this edit spans {len(per_video_count)} source videos "
             f"({breakdown}). Prefer match cuts and topical bridges across sources. "
             f"Every op's target_event_ids must keep native video_id. "
@@ -523,6 +649,15 @@ def main():
     )
     plan = call_llm(CHIEF_EDITOR_SYSTEM, chief_user,
                     args.vllm, args.model, 10240, 0.3, "chief_editor")
+
+    # ── Build executor_timeline — flat segment list for frontend/ffmpeg ───────
+    if "__error__" not in plan:
+        try:
+            plan["executor_timeline"] = build_executor_timeline(plan, events)
+            total_dur = sum(s.get("duration_s", 0) for s in plan["executor_timeline"])
+            plan["executor_total_duration_s"] = round(total_dur, 3)
+        except Exception as e:
+            plan["executor_timeline_error"] = str(e)
 
     # ── Summary ──────────────────────────────────────────────────────────────
     print(f"\n{'='*68}")
@@ -579,6 +714,19 @@ def main():
         note = plan.get("chief_editor_note","")
         if note:
             print(f"\n  Chief Editor: {note}")
+        etl = plan.get("executor_timeline", [])
+        if etl:
+            total = plan.get("executor_total_duration_s", 0)
+            print(f"\n  EXECUTOR TIMELINE ({len(etl)} segments, {total:.1f}s total):")
+            print(f"  {'Step':<4} {'video_id':<10} {'src_in':>7} {'src_out':>7} {'dur':>6}  role")
+            print(f"  {'-'*55}")
+            for seg in etl:
+                print(f"  [{seg['step']:<3}] {seg['video_id']:<10} "
+                      f"{seg['source_start_s']:>7.1f} {seg['source_end_s']:>7.1f} "
+                      f"{seg['duration_s']:>6.1f}s  {seg['role']}")
+                if seg.get("overlays"):
+                    for ov in seg["overlays"]:
+                        print(f"        + {ov.get('op','')} \"{ov.get('text',ov.get('content_hint',''))}\"")
     print(f"{'='*68}\n")
 
     # ── Save ─────────────────────────────────────────────────────────────────
