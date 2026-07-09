@@ -106,14 +106,36 @@ class GraphExpander:
     def __init__(self):
         if not HAS_NEO4J:
             raise RuntimeError("pip install neo4j")
-        self.driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+        self.driver = GraphDatabase.driver(
+            NEO4J_URI,
+            auth=(NEO4J_USER, NEO4J_PASSWORD),
+            notifications_min_severity="OFF",  # suppress 01N42 schema warnings
+        )
 
     def close(self):
         self.driver.close()
 
+    @staticmethod
+    def _serialize(val):
+        """Recursively convert Neo4j Node/Relationship/Path to plain Python."""
+        try:
+            from neo4j.graph import Node, Relationship
+        except ImportError:
+            return val
+        if isinstance(val, Node):
+            return {"_labels": list(val.labels), **dict(val)}
+        if isinstance(val, Relationship):
+            return {"_type": val.type, **dict(val)}
+        if isinstance(val, (list, tuple)):
+            return [GraphExpander._serialize(v) for v in val]
+        return val
+
     def _run(self, cypher: str, params: dict = None) -> list:
         with self.driver.session() as session:
-            return [dict(r) for r in session.run(cypher, params or {})]
+            return [
+                {k: self._serialize(v) for k, v in dict(r).items()}
+                for r in session.run(cypher, params or {})
+            ]
 
     def expand_events(self, event_ids: list[str]) -> dict:
         """Pull rich context around a set of event IDs."""
