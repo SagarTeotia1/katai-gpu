@@ -163,6 +163,17 @@ You are allowed ONLY these primitive editing operations:
   CUT TRIM MOVE MERGE SPLIT
   INSERT_BROLL INSERT_REACTION INSERT_TEXT INSERT_ZOOM INSERT_SOUND INSERT_FLASHBACK
   SPEED_UP SLOW_DOWN FREEZE_FRAME
+  CROSS_VIDEO_MATCH_CUT   (transition between two source videos on matching action/audio/emotion)
+  CROSS_VIDEO_BRIDGE      (transition on tonal/topical continuity between different sources)
+
+MULTI-VIDEO EDITING RULES (when events span 2+ source videos)
+- Every `target_event_ids` entry keeps its native `video_id` — never rewrite timestamps across sources.
+- Prefer MATCH CUTS: same subject action, same word said, same eyeline direction, same color/light.
+- Prefer BRIDGES when subject continues across sources: same person, same topic, escalating emotion.
+- Never intercut two speakers from different videos unless they are answering the same question or reacting to the same event.
+- Balance screen-time across source videos unless prompt says otherwise (e.g. "mostly video1, cameos from video2").
+- Continuity check: clothing / lighting / voice tone / background must not clash unless the edit deliberately calls attention (montage, split-screen).
+- Callbacks CAN span videos — a joke setup in video1 can pay off with a video2 clip if graph/semantics support it.
 
 Never output prose. Output ONLY this JSON:
 
@@ -190,7 +201,7 @@ Never output prose. Output ONLY this JSON:
   "editing_plan": [
     {
       "op_index": 1,
-      "operation": "CUT|TRIM|MOVE|MERGE|SPLIT|INSERT_BROLL|INSERT_REACTION|INSERT_TEXT|INSERT_ZOOM|INSERT_SOUND|INSERT_FLASHBACK|SPEED_UP|SLOW_DOWN|FREEZE_FRAME",
+      "operation": "CUT|TRIM|MOVE|MERGE|SPLIT|INSERT_BROLL|INSERT_REACTION|INSERT_TEXT|INSERT_ZOOM|INSERT_SOUND|INSERT_FLASHBACK|SPEED_UP|SLOW_DOWN|FREEZE_FRAME|CROSS_VIDEO_MATCH_CUT|CROSS_VIDEO_BRIDGE",
       "target_event_ids": ["E?"],
       "params": {
         "// CUT":       "removes the whole event",
@@ -206,7 +217,9 @@ Never output prose. Output ONLY this JSON:
         "// INSERT_FLASHBACK": "referenced_event_id, treatment(desaturate|grain|blur_edges), duration_s",
         "// SPEED_UP":         "factor, keep_pitch(true|false)",
         "// SLOW_DOWN":        "factor",
-        "// FREEZE_FRAME":     "at_s, hold_duration_s"
+        "// FREEZE_FRAME":     "at_s, hold_duration_s",
+        "// CROSS_VIDEO_MATCH_CUT": "from_event_id, to_event_id, match_type(action|audio|eyeline|color|word), transition(hard|whip|flash|audio_bridge)",
+        "// CROSS_VIDEO_BRIDGE":    "from_event_id, to_event_id, bridge_type(topic|emotion|person|callback), transition(hard|dissolve|l_cut|j_cut)"
       },
       "confidence": 0.0,
       "narrative_reason": "why story needs this",
@@ -215,7 +228,13 @@ Never output prose. Output ONLY this JSON:
       "expected_impact": "measurable claim — +12% retention past 15s, +2 laugh beats, etc."
     }
   ],
-  "final_sequence": ["E?","E?","E?"],
+  "final_sequence": [
+    {"event_id":"E?","video_id":"video1","in_s":0.0,"out_s":3.4,"role":"hook"}
+  ],
+  "source_balance": {"video1": 0.55, "video2": 0.30, "video3": 0.15},
+  "cross_video_moments": [
+    {"from_event":"E?","to_event":"E?","kind":"match_cut|bridge","why":"..."}
+  ],
   "predicted_metrics": {
     "hook_score_0_to_10": 0.0,
     "viral_score_0_to_10": 0.0,
@@ -266,25 +285,54 @@ def expand_query(prompt: str) -> str:
 
 
 def gather_context(searcher: Searcher, expander: GraphExpander | None,
-                   prompt: str, video: str | None, top_k: int) -> tuple[list[dict], dict]:
-    hits = searcher.search(expand_query(prompt), top_k=top_k, namespace=video)
-    graph: dict = {}
+                   prompt: str, videos: list[str] | None,
+                   top_k: int) -> tuple[list[dict], dict]:
+    """Multi-video retrieval — fan out across namespaces, merge + rerank."""
+    query = expand_query(prompt)
+    namespaces = videos if videos else [None]
+
+    # ── Pinecone: one query per namespace (all namespaces if videos is None) ──
+    merged: list[dict] = []
+    per_ns = max(15, top_k // max(len(namespaces), 1))
+    for ns in namespaces:
+        try:
+            hits = searcher.search(query, top_k=per_ns, namespace=ns)
+        except Exception as e:
+            print(f"    [Pinecone ns={ns}] {e}", flush=True)
+            hits = []
+        for h in hits:
+            h.setdefault("metadata", {})["_namespace"] = ns or "default"
+        merged.extend(hits)
+
+    # ── Rerank globally by score, cap ──
+    merged.sort(key=lambda h: h.get("score", 0.0), reverse=True)
+    merged = merged[:top_k]
+
+    # ── Neo4j: expand across all matched events + pull per-video signals ──
+    graph: dict = {"per_video": {}}
     if expander:
         event_ids = [
-            h["id"] for h in hits
+            h["id"] for h in merged
             if h["metadata"].get("entity_type") == "timeline_event"
         ]
         if event_ids:
-            graph = expander.expand_events(event_ids)
-        for fn_name in ("get_clip_candidates","get_interruptions","get_agreements_disagreements"):
-            try:
-                fn = getattr(expander, fn_name)
-                graph[fn_name.replace("get_","")] = (
-                    fn(video_id=video) if fn_name == "get_clip_candidates" else fn(video)
-                )
-            except Exception:
-                graph[fn_name.replace("get_","")] = []
-    return hits, graph
+            graph.update(expander.expand_events(event_ids))
+        for ns in namespaces:
+            per: dict = {}
+            for fn_name in ("get_clip_candidates","get_interruptions","get_agreements_disagreements"):
+                try:
+                    fn  = getattr(expander, fn_name)
+                    key = fn_name.replace("get_","")
+                    per[key] = (
+                        fn(video_id=ns) if fn_name == "get_clip_candidates" else fn(ns)
+                    )
+                except Exception:
+                    per[fn_name.replace("get_","")] = []
+            if ns:
+                graph["per_video"][ns] = per
+            else:
+                graph.update(per)
+    return merged, graph
 
 
 def flatten_events_for_llm(hits: list[dict]) -> list[dict]:
@@ -344,7 +392,10 @@ def main():
     p = argparse.ArgumentParser(description="Chief Editor — multi-layer editing brain")
     p.add_argument("prompt", nargs="?", default=None)
     p.add_argument("-p","--prompt-flag", dest="prompt_flag", default=None)
-    p.add_argument("--video", default=None)
+    p.add_argument("--video", action="append", default=None,
+                   help="Video namespace. Repeat flag for multi-video edit: "
+                        "--video video1 --video video2. Or comma-separated: "
+                        "--video video1,video2. Omit for all namespaces.")
     p.add_argument("--vllm",  default=DEFAULT_VLLM)
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--top-k", type=int, default=TOP_K)
@@ -359,10 +410,17 @@ def main():
         print('ERROR: provide a prompt. Example:\n  make edit PROMPT="45s YouTube Short, max retention"')
         sys.exit(1)
 
+    # Normalize --video list: expand comma-separated entries, dedupe.
+    videos: list[str] = []
+    for v in (args.video or []):
+        videos.extend([x.strip() for x in v.split(",") if x.strip()])
+    videos = list(dict.fromkeys(videos)) or []
+
     print(f"\n{'='*68}")
     print(f"  CHIEF EDITOR — multi-layer editing brain")
-    print(f"  Intent: {prompt}")
-    print(f"  Video:  {args.video or 'all namespaces'}")
+    print(f"  Intent:  {prompt}")
+    print(f"  Videos:  {videos if videos else 'ALL namespaces'}"
+          + (f"  (multi-video edit — {len(videos)} sources)" if len(videos) > 1 else ""))
     print(f"{'='*68}\n")
 
     # ── L3 Knowledge — retrieval ─────────────────────────────────────────────
@@ -374,30 +432,49 @@ def main():
             expander = GraphExpander()
         except Exception as e:
             print(f"    [Neo4j] unavailable ({e}) — continuing Pinecone-only", flush=True)
-    hits, graph = gather_context(searcher, expander, prompt, args.video, args.top_k)
+    hits, graph = gather_context(searcher, expander, prompt, videos, args.top_k)
     events = flatten_events_for_llm(hits)
     if expander:
         expander.close()
     graph_edges = sum(len(v) for v in graph.values() if isinstance(v, list))
+
+    # Per-video breakdown so operator sees source balance before planning
+    per_video_count: dict[str, int] = {}
+    for e in events:
+        vid = e.get("video_id") or "unknown"
+        per_video_count[vid] = per_video_count.get(vid, 0) + 1
     print(f"    {len(hits)} Pinecone hits | {len(events)} events | {graph_edges} graph edges", flush=True)
+    if len(per_video_count) > 1:
+        breakdown = "  ".join(f"{k}={v}" for k, v in sorted(per_video_count.items()))
+        print(f"    Source breakdown: {breakdown}", flush=True)
 
     if not events:
         print("\n  No events retrieved — nothing to edit. Check indexing.")
         sys.exit(2)
 
     # ── L2 Understanding + L4 Scoring — fire in PARALLEL (vLLM continuous batching) ─
-    events_json = json.dumps(events[:40], indent=2, ensure_ascii=False)
-    graph_json  = json.dumps(graph, indent=2, ensure_ascii=False)[:8000]
+    events_json = json.dumps(events[:60], indent=2, ensure_ascii=False)
+    graph_json  = json.dumps(graph, indent=2, ensure_ascii=False)[:9000]
+
+    multi_video_note = ""
+    if len(per_video_count) > 1:
+        breakdown = ", ".join(f"{k}={v} events" for k, v in sorted(per_video_count.items()))
+        multi_video_note = (
+            f"\n\nMULTI-VIDEO EDIT — this edit spans {len(per_video_count)} source videos "
+            f"({breakdown}). Prefer match cuts and topical bridges across sources. "
+            f"Every op's target_event_ids must keep native video_id. "
+            f"Fill `source_balance` and `cross_video_moments` in output."
+        )
 
     understanding_user = (
-        f"USER INTENT: {prompt}\n\n"
-        f"EVENTS (from perception layer):\n{events_json}\n\n"
+        f"USER INTENT: {prompt}{multi_video_note}\n\n"
+        f"EVENTS (from perception layer, may span multiple videos):\n{events_json}\n\n"
         f"KNOWLEDGE GRAPH:\n{graph_json}\n\n"
         f"Return the understanding JSON now."
     )
     scoring_user = (
-        f"USER INTENT: {prompt}\n\n"
-        f"EVENTS:\n{events_json}\n\n"
+        f"USER INTENT: {prompt}{multi_video_note}\n\n"
+        f"EVENTS (may span multiple videos):\n{events_json}\n\n"
         f"Return the scoring JSON now."
     )
 
@@ -421,8 +498,8 @@ def main():
     # ── L5 Chief Editor — planning ───────────────────────────────────────────
     print("  [L5 Chief Editor] Planning primitive ops...", flush=True)
     chief_user = (
-        f"USER INTENT: {prompt}\n\n"
-        f"EVENTS (perception):\n{events_json}\n\n"
+        f"USER INTENT: {prompt}{multi_video_note}\n\n"
+        f"EVENTS (perception, may span multiple videos):\n{events_json}\n\n"
         f"UNDERSTANDING (Story/Humor/Emotion/Conversation):\n"
         f"{json.dumps(understanding, indent=2, ensure_ascii=False)[:9000]}\n\n"
         f"EDITING EXPERT SCORES (Clip/Retention/Hook/Viral/Thumbnail):\n"
@@ -449,6 +526,17 @@ def main():
         print(f"  Logline:   {story.get('logline','')}")
         print(f"  Emotional: {story.get('emotional_curve_summary','')}")
         print(f"  Ops:       {len(ops)}   |   Sequence length: {len(seq)}")
+        sb = plan.get("source_balance", {})
+        if sb:
+            balance = "  ".join(f"{k}={float(v)*100:.0f}%" if isinstance(v,(int,float)) else f"{k}={v}"
+                                for k, v in sb.items())
+            print(f"  Sources:   {balance}")
+        cvm = plan.get("cross_video_moments", [])
+        if cvm:
+            print(f"  Cross-cuts: {len(cvm)}")
+            for m in cvm[:5]:
+                print(f"    ↔ {m.get('from_event','?')} → {m.get('to_event','?')} "
+                      f"({m.get('kind','?')}) — {m.get('why','')[:70]}")
         print(f"  Hook:      {pm.get('hook_score_0_to_10','?')}/10  "
               f"Viral: {pm.get('viral_score_0_to_10','?')}/10  "
               f"Completion: {pm.get('estimated_completion_rate','?')}")
