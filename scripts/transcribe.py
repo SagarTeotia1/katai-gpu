@@ -18,10 +18,12 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
 WHISPER_PORT = 9000
+DEFAULT_WORKERS = 3
 
 
 def call_whisper(video_url: str, whisper_base: str, language: str | None = None) -> dict:
@@ -92,6 +94,8 @@ def main() -> None:
     parser.add_argument("--output", default=None, help="Output JSON path")
     parser.add_argument("--whisper", default=f"http://localhost:{WHISPER_PORT}", help="Whisper service URL")
     parser.add_argument("--language", default=None, help="Force language (e.g. 'en', 'hi') — default: auto-detect")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                        help=f"Parallel whisper workers (default {DEFAULT_WORKERS}). vLLM idle during this stage.")
     args = parser.parse_args()
 
     # Build video list
@@ -127,10 +131,20 @@ def main() -> None:
     t_wall = time.time()
     results = []
 
-    # Sequential — Whisper + vLLM share GPU, sequential avoids OOM
-    for v in videos:
-        result = transcribe_video(v["label"], v["source"], v["url"], args.whisper, args.language)
-        results.append(result)
+    # Parallel — vLLM idle during transcribe stage, safe to stack whisper workers.
+    workers = max(1, min(args.workers, len(videos)))
+    print(f"  Parallel workers: {workers}\n", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(transcribe_video, v["label"], v["source"], v["url"],
+                        args.whisper, args.language): v["label"]
+            for v in videos
+        }
+        for fut in as_completed(futures):
+            results.append(fut.result())
+    # Stable label order for output
+    order = {v["label"]: i for i, v in enumerate(videos)}
+    results.sort(key=lambda r: order.get(r.get("video", ""), 1_000_000))
 
     wall = time.time() - t_wall
     ok = sum(1 for r in results if r["ok"])
