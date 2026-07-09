@@ -180,8 +180,8 @@ transcribe: ## Transcribe videos from cast JSON — usage: make transcribe CAST=
 transcribe-urls: ## Transcribe raw video URLs — usage: make transcribe-urls VIDS="url1 url2"
 	@python3 scripts/transcribe.py --videos $(VIDS) --whisper http://localhost:$(WHISPER_PORT)
 
-WORKERS ?= 8
-CHUNKS  ?= 4
+WORKERS ?= 24
+CHUNKS  ?= 8
 
 analyze-context: ## Full semantic video context — usage: make analyze-context CAST=cast.json CHUNKS=4
 	@python3 scripts/analyze_context.py --cast $(CAST) \
@@ -190,11 +190,13 @@ analyze-context: ## Full semantic video context — usage: make analyze-context 
 		--workers $(WORKERS) \
 		--chunks $(CHUNKS)
 
-pipeline: ## ONE CMD — full pipeline: cast→transcript→context→index — usage: make pipeline CAST=cast.json
+pipeline: ## ONE CMD — full pipeline: cast→transcript→context→index — usage: make pipeline CAST=cast.json [CHUNKS=8] [WORKERS=16]
 	@python3 scripts/pipeline.py $(CAST) \
 		--backend http://localhost:$(BACKEND_PORT) \
 		--vllm http://localhost:$(VLLM_PORT)/v1/chat/completions \
-		--whisper http://localhost:$(WHISPER_PORT)
+		--whisper http://localhost:$(WHISPER_PORT) \
+		--chunks $(CHUNKS) \
+		--workers $(WORKERS)
 
 pipeline-reindex: ## Re-run indexing only (skip all analysis) — usage: make pipeline-reindex CAST=cast.json
 	@python3 scripts/pipeline.py $(CAST) \

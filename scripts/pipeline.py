@@ -208,9 +208,11 @@ def main() -> None:
                         help="Skip transcription. Pass file path or 'auto' to use latest.")
     parser.add_argument("--skip-context",    action="store_true",
                         help="Skip context analysis — use existing output/context_*.json")
-    parser.add_argument("--chunks",   type=int, default=4,
-                        help="Chunks per video for context analysis (default 4). "
+    parser.add_argument("--chunks",   type=int, default=8,
+                        help="Chunks per video for context analysis (default 8). "
                              "Higher = faster but more GPU concurrency.")
+    parser.add_argument("--workers",  type=int, default=24,
+                        help="Max parallel local agents across all chunks (default 24).")
     parser.add_argument("--no-index",    action="store_true", help="Skip Pinecone + Neo4j indexing")
     parser.add_argument("--no-pinecone", action="store_true", help="Index to Neo4j only")
     parser.add_argument("--no-neo4j",    action="store_true", help="Index to Pinecone only")
@@ -402,7 +404,8 @@ def main() -> None:
                "--cast", cast_path,
                "--vllm", args.vllm,
                "--backend", args.backend,
-               "--chunks", str(args.chunks)]
+               "--chunks", str(args.chunks),
+               "--workers", str(args.workers)]
         if cast_analysis_file:
             cmd += ["--cast-analysis", cast_analysis_file]
         if transcript_file:
