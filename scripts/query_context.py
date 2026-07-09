@@ -141,14 +141,13 @@ class GraphExpander:
 
         # Conversation threads — what this event is part of
         threads = self._run("""
-            MATCH (e:Event)-[:ANSWERS|REQUIRES_SETUP|REFERENCES]->(related:Event)
+            MATCH (e:Event)-[r:ANSWERS|REQUIRES_SETUP|REFERENCES]->(related:Event)
             WHERE e.id IN $ids
             RETURN e.id AS event_id,
                    type(r) AS rel_type,
                    related.id AS related_id,
                    related.description AS related_desc,
                    related.start AS related_start
-            MATCH (e)-[r]->(related)
         """, {"ids": event_ids})
 
         # People in these events — full appearance data

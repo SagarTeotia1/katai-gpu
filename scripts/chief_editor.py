@@ -316,7 +316,10 @@ def gather_context(searcher: Searcher, expander: GraphExpander | None,
             if h["metadata"].get("entity_type") == "timeline_event"
         ]
         if event_ids:
-            graph.update(expander.expand_events(event_ids))
+            try:
+                graph.update(expander.expand_events(event_ids))
+            except Exception as e:
+                print(f"    [Neo4j expand_events] {e} — continuing without graph expansion", flush=True)
         for ns in namespaces:
             per: dict = {}
             for fn_name in ("get_clip_candidates","get_interruptions","get_agreements_disagreements"):
