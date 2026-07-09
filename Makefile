@@ -230,6 +230,13 @@ direct: ## Director+Editor brain → EDL JSON — usage: make direct PROMPT="60s
 		$(if $(TOPK),--top-k $(TOPK)) \
 		$(if $(MAX_TOKENS),--max-tokens $(MAX_TOKENS))
 
+edit: ## Chief Editor multi-layer brain → primitive-op edit plan JSON (NO video re-analysis — uses indexed data only) — usage: make edit PROMPT="45s YouTube Short, max retention" [VIDEO=video1] [SAVE_INT=1]
+	@python3 scripts/chief_editor.py "$(PROMPT)" \
+		--vllm http://localhost:$(VLLM_PORT)/v1/chat/completions \
+		$(if $(VIDEO),--video "$(VIDEO)") \
+		$(if $(TOPK),--top-k $(TOPK)) \
+		$(if $(SAVE_INT),--save-intermediate)
+
 neo4j-up: ## Start Neo4j standalone
 	@$(COMPOSE) up -d neo4j
 
