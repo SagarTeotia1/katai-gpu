@@ -403,7 +403,18 @@ def main():
     p.add_argument("--output", default=None)
     p.add_argument("--save-intermediate", action="store_true",
                    help="Also save L2 understanding + L4 scoring JSONs")
+    p.add_argument("--list-videos", action="store_true",
+                   help="List available video namespaces (from Pinecone) and exit")
     args = p.parse_args()
+
+    if args.list_videos:
+        s = Searcher()
+        ns = s.get_all_namespaces()
+        print("\nAvailable video namespaces (usable as --video values):")
+        for n in sorted(ns):
+            print(f"  · {n}")
+        print()
+        sys.exit(0)
 
     prompt = args.prompt or args.prompt_flag
     if not prompt:
