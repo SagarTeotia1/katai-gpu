@@ -223,6 +223,13 @@ index-neo4j: ## Index to Neo4j only (skip Pinecone)
 query: ## Natural language query — usage: make query Q="find all moments where samay laughs"
 	@python3 scripts/query_context.py "$(Q)" --vllm http://localhost:$(VLLM_PORT)/v1/chat/completions
 
+direct: ## Director+Editor brain → EDL JSON — usage: make direct PROMPT="60s YouTube short of funniest moment" [VIDEO=video1]
+	@python3 scripts/director_brain.py "$(PROMPT)" \
+		--vllm http://localhost:$(VLLM_PORT)/v1/chat/completions \
+		$(if $(VIDEO),--video "$(VIDEO)") \
+		$(if $(TOPK),--top-k $(TOPK)) \
+		$(if $(MAX_TOKENS),--max-tokens $(MAX_TOKENS))
+
 neo4j-up: ## Start Neo4j standalone
 	@$(COMPOSE) up -d neo4j
 
