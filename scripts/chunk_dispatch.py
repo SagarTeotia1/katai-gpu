@@ -267,9 +267,14 @@ class WorkStealingQueue:
     """Min-heap work queue that adaptively splits large pending chunks.
 
     Workers call ``get()`` to pop the largest remaining chunk. On completion
-    they call ``done(chunk)``. If the largest pending chunk is still
-    >= 2 * min_split_s, it is bisected and both halves re-queued so freed
-    GPU slots never sit idle during the tail phase.
+    they call ``done(chunk)``. If the largest pending chunk would yield at
+    least ``min_frames`` frames per half at the given ``fps``, it is bisected
+    and both halves re-queued so freed GPU slots never sit idle during the
+    tail phase.
+
+    Split threshold (seconds) = min_frames / fps * 2  (each half must have
+    at least min_frames frames).  At fps=1, min_frames=3 → split only if
+    chunk duration >= 6s.
 
     ``pending`` counts items in-queue + in-flight so ``done()`` can detect
     when everything is finished and wake waiting workers.
@@ -278,7 +283,8 @@ class WorkStealingQueue:
     def __init__(
         self,
         chunks: list[Chunk],
-        min_split_s: float = 8.0,
+        fps: float = 1.0,
+        min_frames: int = 3,
         max_splits: int = 48,
     ) -> None:
         self._cond = asyncio.Condition()
@@ -286,7 +292,11 @@ class WorkStealingQueue:
         self._tiebreak = 0
         self._pending = 0          # in-queue + in-flight
         self._closed = False
-        self._min_split_s = min_split_s
+        # Each half must contain >= min_frames frames → min duration per half = min_frames/fps
+        self._min_half_s = min_frames / max(fps, 0.001)
+        self._min_split_s = self._min_half_s * 2   # chunk must be this long to bisect safely
+        self._fps = fps
+        self._min_frames = min_frames
         self._max_splits = max_splits
         self._splits_done = 0
         self._next_id = max((c.chunk_id for c in chunks), default=-1) + 1
@@ -355,10 +365,13 @@ class WorkStealingQueue:
         self._splits_done += 1
         self._push(c1)
         self._push(c2)
+        frames_each = int(self._min_half_s * self._fps)  # approx frames per half
         logger.info(
-            "adaptive split #%d: chunk %d [%.1f-%.1f]s (%.1fs) → halves at %.1fs",
+            "adaptive split #%d: chunk %d [%.1f-%.1f]s (%.1fs, ~%df@%.1ffps) "
+            "→ halves at %.1fs (~%df each)",
             self._splits_done, c.chunk_id, c.strict_start, c.strict_end,
-            c.strict_duration, mid,
+            c.strict_duration, int(c.strict_duration * self._fps), self._fps,
+            mid, int((c.strict_end - mid) * self._fps),
         )
 
     @property
@@ -520,14 +533,16 @@ class ChunkDispatcher:
         label_fn: Callable[[Chunk], str] | None = None,
         log_fn: Callable[[str, str], None] | None = None,
         shared_sem: asyncio.Semaphore | None = None,
-        min_split_s: float = 8.0,
+        fps: float = 1.0,
+        min_frames: int = 3,
         max_splits: int = 48,
     ) -> list[dict[str, Any]]:
         """Like ``run()`` but uses WorkStealingQueue for adaptive tail splitting.
 
-        When a worker finishes and the largest pending chunk is still
-        >= 2 * min_split_s, that chunk is bisected so the freed GPU slot
-        gets new work immediately instead of draining idle.
+        When a worker finishes, the largest pending chunk is bisected if
+        each half would contain >= ``min_frames`` frames (at ``fps``).
+        At fps=1 and min_frames=3, minimum chunk size to split = 6s.
+        Freed GPU slots get the smaller half-chunks immediately instead of idling.
 
         Results are returned in completion order (not chunk_id order). The
         caller is responsible for sorting by strict_start if needed.
@@ -543,7 +558,7 @@ class ChunkDispatcher:
         _label = label_fn or (lambda c: f"chunk-{c.chunk_id}")
         _log = log_fn or (lambda label, msg: None)
 
-        queue = WorkStealingQueue(chunks, min_split_s=min_split_s, max_splits=max_splits)
+        queue = WorkStealingQueue(chunks, fps=fps, min_frames=min_frames, max_splits=max_splits)
 
         t_map_start = time.monotonic()
         results: list[dict[str, Any]] = []

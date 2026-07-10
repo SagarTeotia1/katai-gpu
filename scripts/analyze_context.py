@@ -1208,8 +1208,9 @@ async def _dispatch_all_async(
             plan["chunks"], plan["build_payload"],
             label_fn=plan["label_fn"], log_fn=_log_with_progress,
             shared_sem=shared_sem,
-            min_split_s=5.0,   # min chunk size; split only if remaining >= 10s
-            max_splits=48,     # cap dynamic splits to avoid runaway tiny chunks
+            fps=MM_FPS,        # must match vLLM --mm-processor-kwargs fps
+            min_frames=3,      # each half must have >= 3 frames → min 3s at fps=1
+            max_splits=64,
         ))
 
     log("dispatch", f"Firing {_planned_chunks} planned chunks across {len(video_plans)} videos "
