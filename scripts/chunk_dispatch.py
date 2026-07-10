@@ -294,6 +294,7 @@ class WorkStealingQueue:
         fps: float = 1.0,
         min_frames: int = 3,
         max_splits: int = 48,
+        max_inflight: int = 32,
     ) -> None:
         self._cond = asyncio.Condition()
         self._heap: list[tuple[float, int, Chunk]] = []
@@ -307,6 +308,7 @@ class WorkStealingQueue:
         self._min_frames = min_frames
         self._max_splits = max_splits
         self._splits_done = 0
+        self._max_inflight = max_inflight
         self._next_id = max((c.chunk_id for c in chunks), default=-1) + 1
         for c in chunks:
             self._push(c)
@@ -326,22 +328,31 @@ class WorkStealingQueue:
                 return chunk
             return None  # closed + empty → worker should exit
 
-    async def done(self, chunk: Chunk) -> bool:
-        """Signal that ``chunk`` finished processing. Returns True if a split occurred."""
+    async def done(self, chunk: Chunk, current_inflight: int = 0) -> int:
+        """Signal that ``chunk`` finished. Returns number of splits performed.
+
+        Splits enough pending chunks to fill ALL idle workers, not just one.
+        idle_workers = max_inflight - current_inflight.
+        At the tail (e.g., 15 idle, 1 in-flight) this aggressively bisects
+        pending chunks so every idle slot gets immediate work.
+        """
         async with self._cond:
             self._pending -= 1
-            did_split = False
-            if (self._heap
-                    and self._splits_done < self._max_splits):
+            idle = max(1, self._max_inflight - current_inflight)
+            splits = 0
+            while idle > 0 and self._heap and self._splits_done < self._max_splits:
                 _, _, largest = self._heap[0]
                 if largest.strict_duration >= self._min_split_s:
                     self._bisect(largest)
-                    did_split = True
-                    self._cond.notify_all()
+                    idle -= 1
+                    splits += 1
+                else:
+                    break
             if self._pending == 0:
                 self._closed = True
+            if splits > 0:
                 self._cond.notify_all()
-            return did_split
+            return splits
 
     def _bisect(self, c: Chunk) -> None:
         """Replace ``c`` (heap root) with two equal halves."""
@@ -610,7 +621,10 @@ class ChunkDispatcher:
         _label = label_fn or (lambda c: f"chunk-{c.chunk_id}")
         _log = log_fn or (lambda label, msg: None)
 
-        queue = WorkStealingQueue(chunks, fps=fps, min_frames=min_frames, max_splits=max_splits)
+        queue = WorkStealingQueue(
+            chunks, fps=fps, min_frames=min_frames,
+            max_splits=max_splits, max_inflight=self.max_inflight,
+        )
 
         t_map_start = time.monotonic()
         results: list[dict[str, Any]] = []
@@ -683,20 +697,21 @@ class ChunkDispatcher:
                         continue  # halves re-queued; skip result append + queue.done
                     async with results_lock:
                         results.append(result)
-                    did_split = await queue.done(chunk)
-                    if did_split:
+                    n_splits = await queue.done(chunk, current_inflight=self._inflight)
+                    if n_splits:
                         _log(label,
-                             f"adaptive split triggered (splits so far: {queue.splits_done})")
+                             f"{n_splits} adaptive split(s) → filled idle workers "
+                             f"(total splits: {queue.splits_done})")
 
-            # Spawn enough workers to fill GPU but keep a reserve in queue for splitting.
-            # If all chunks fire at once the queue is always empty at completion → no splits.
-            # Reserve floor(n/4) chunks (min 2) so done() always finds items to bisect.
+            # Fire ALL chunks immediately — no reserve.
+            # done() now splits to fill idle workers aggressively, so we don't need
+            # upfront reserve. Prose failures also trigger split-and-requeue.
+            # Zero idle workers = maximum GPU utilization from first request.
             n_chunks_init = len(chunks)
-            reserve = max(2, n_chunks_init // 4)
-            n_workers = max(1, min(self.max_inflight, n_chunks_init - reserve))
+            n_workers = min(self.max_inflight, n_chunks_init)
             logger.info(
-                "run_adaptive: %d chunks, %d workers (reserve=%d for adaptive splits)",
-                n_chunks_init, n_workers, reserve,
+                "run_adaptive: %d chunks, %d workers (no reserve — aggressive done-splits fill idle slots)",
+                n_chunks_init, n_workers,
             )
             workers = [asyncio.create_task(_worker()) for _ in range(n_workers)]
             await asyncio.gather(*workers, return_exceptions=True)
