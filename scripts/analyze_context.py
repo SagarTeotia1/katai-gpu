@@ -54,7 +54,7 @@ MODEL_ID    = "Qwen/Qwen3.6-27B"
 MAX_TOKENS  = 32768
 MAX_RETRIES    = 3               # per-chunk retry attempts (single-video path only)
 RETRY_DELAYS   = [5, 15]         # seconds before attempt 2, 3
-TOKEN_BUDGETS  = [4096, 3072, 2048]     # tokens per chunk attempt — lean schema fits easily
+TOKEN_BUDGETS  = [5120, 3584, 2048]     # tokens per chunk: lean events + world_state (~1K tok)
 TIMEOUTS       = [900, 1200, 1500]      # timeout per chunk attempt (s)
 CHUNK_OVERLAP  = 3.0             # seconds of frame overlap each side for visual context
 DEFAULT_CHUNKS = 8               # chunks per video when --chunks not specified
@@ -283,15 +283,7 @@ Return ONLY valid JSON — no prose, no markdown:
   "window_start": {strict_start},
   "window_end": {strict_end},
 
-  "known_people": [
-    {{
-      "person_id": "P001",
-      "display_name": "<name>",
-      "first_seen_s": <float>,
-      "last_seen_s": <float>,
-      "clothing": "<color + type only>"
-    }}
-  ],
+  "active_people": ["P001", "P002"],
 
   "timeline": [
     {{
@@ -304,7 +296,6 @@ Return ONLY valid JSON — no prose, no markdown:
       "speaker": "<person_id or null>",
       "transcript_text": "<exact words or empty>",
       "listener_reactions": [{{"person_id": "P002", "reaction": "<laughing|nodding|surprised|shocked>"}}],
-      "emotion": "<funny|tense|emotional|informative|awkward|excited|calm>",
       "scores": {{"importance": <0-10>, "hook": <0-10>, "clip": <0-10>, "viral": <0-10>, "emotion": <0-10>}},
       "clip_worthy": <true|false>,
       "thumbnail_worthy": <true|false>
@@ -313,7 +304,17 @@ Return ONLY valid JSON — no prose, no markdown:
 
   "audio_events": [
     {{"start": <float>, "end": <float>, "type": "<laughter|music|silence|crosstalk>", "intensity": "<soft|medium|loud>"}}
-  ]
+  ],
+
+  "world_state": {{
+    "story_stage": "<setup|conflict|explanation|punchline|resolution|transition>",
+    "scene_emotion": "<funny|tense|emotional|informative|awkward|excited|calm>",
+    "energy": "<high|medium|low>",
+    "current_topic": "<5 words max>",
+    "open_loops": ["<unresolved question or thread, 8 words max>"],
+    "callbacks": ["<recurring joke or reference, 6 words max>"],
+    "last_moment": "<10 words — what just happened at window end>"
+  }}
 }}"""
 
 
