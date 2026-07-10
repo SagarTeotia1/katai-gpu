@@ -360,8 +360,11 @@ def main() -> None:
     est_trans   = n_videos * 210  # ~210s per video (sequential)
     est_context = n_videos * 900  # ~900s per video (parallel, GPU bound)
     est_index   = 60
-    # Cast → Whisper run sequentially → wall = sum (no parallel overlap).
-    est_cast_trans = (0 if args.skip_cast else est_cast) + (0 if args.skip_transcribe else est_trans)
+    # Cast + Whisper run in PARALLEL → wall = max(cast, whisper), not sum.
+    est_cast_trans = max(
+        (0 if args.skip_cast        else est_cast),
+        (0 if args.skip_transcribe  else est_trans),
+    )
     est_total   = (
         est_cast_trans +
         (0 if args.skip_context    else est_context) +
@@ -378,12 +381,16 @@ def main() -> None:
     print(f"  Context    : --context-mode {args.context_mode}", flush=True)
     print(f"  Summary    : {summary_path}   ← check this anytime for progress", flush=True)
     print(f"{'─'*W}", flush=True)
+    both_parallel = (args.skip_cast is None) and (args.skip_transcribe is None)
     steps_info = [
-        (1, "Cast Appearance Analysis",  args.skip_cast       is not None, est_cast),
-        (2, "Whisper Transcription",     args.skip_transcribe is not None, est_trans),
-        (3, "Semantic Context Analysis", args.skip_context,                 est_context),
-        (4, "Index → Pinecone + Neo4j",  args.no_index,                    est_index),
+        (1, "Cast + Whisper [parallel]" if both_parallel else "Cast Appearance Analysis",
+            args.skip_cast is not None and args.skip_transcribe is not None,
+            est_cast_trans if both_parallel else est_cast),
+        (3, "Semantic Context Analysis", args.skip_context,  est_context),
+        (4, "Index → Pinecone + Neo4j",  args.no_index,      est_index),
     ]
+    if not both_parallel:
+        steps_info.insert(1, (2, "Whisper Transcription", args.skip_transcribe is not None, est_trans))
     for num, name, skipped, est in steps_info:
         tag  = dim("  [SKIP]") if skipped else f"  ~{fmt_time(est)}"
         line = f"  {num}  {name:<30}{tag}"
