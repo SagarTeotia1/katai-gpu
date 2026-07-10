@@ -410,7 +410,7 @@ def main() -> None:
         "semantic": (
             cyan("semantic") + "  ←  signal-weighted variable-length events\n"
             "              Signals: scene_cut(5) speaker(5) topic(5) silence(4) density(3) motion(2)\n"
-            "              Profiles: " + red("HIGH") + f"(4096tok)  " + yellow("MEDIUM") + f"(1500tok)  " + dim("LOW") + "(512tok)\n"
+            "              Profiles: " + red("HIGH") + f"(4096tok)  " + yellow("MEDIUM") + f"(2048tok)  " + dim("LOW") + "(512tok)\n"
             f"              ~{magenta('60%')} fewer tokens vs all-HIGH  |  every event analyzed"
         ),
         "scene":  dim("scene   — PySceneDetect content-aware cut boundaries"),
@@ -562,7 +562,7 @@ def main() -> None:
         if planner == "semantic":
             print(f"  {cyan('Planner:')} SemanticEventBuilder", flush=True)
             print(f"    Signals fuse → variable-length events → tiered VLM budgets", flush=True)
-            print(f"    {red('HIGH')}(4096tok) {yellow('MEDIUM')}(1500tok) {dim('LOW')}(512tok) — every event analyzed", flush=True)
+            print(f"    {red('HIGH')}(4096tok) {yellow('MEDIUM')}(2048tok) {dim('LOW')}(512tok) — every event analyzed", flush=True)
         elif planner == "scene":
             print(f"  {cyan('Planner:')} scene-aligned (PySceneDetect + equal-width)", flush=True)
         else:
