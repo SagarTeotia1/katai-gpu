@@ -54,7 +54,7 @@ MODEL_ID    = "Qwen/Qwen3.6-27B"
 MAX_TOKENS  = 32768
 MAX_RETRIES    = 3               # per-chunk retry attempts (single-video path only)
 RETRY_DELAYS   = [5, 15]         # seconds before attempt 2, 3
-TOKEN_BUDGETS  = [10240, 7168, 4096]    # tokens per chunk attempt (shorter = less truncation)
+TOKEN_BUDGETS  = [4096, 3072, 2048]     # tokens per chunk attempt — lean schema fits easily
 TIMEOUTS       = [900, 1200, 1500]      # timeout per chunk attempt (s)
 CHUNK_OVERLAP  = 3.0             # seconds of frame overlap each side for visual context
 DEFAULT_CHUNKS = 8               # chunks per video when --chunks not specified
@@ -260,38 +260,22 @@ def build_chunk_system_prompt(
 ) -> str:
     return f"""You are a semantic video analysis engine working on ONE CHUNK of a video.
 
-════════════════════════════════════════════
-CHUNK CONTEXT — READ THIS FIRST
-════════════════════════════════════════════
-Video ID: {video_label}
-Total video duration: {total_duration:.2f}s
-This chunk: {chunk_id + 1} of {total_chunks}
-YOUR STRICT TIME WINDOW: {strict_start:.2f}s → {strict_end:.2f}s
+Video: {video_label} | Chunk {chunk_id + 1}/{total_chunks} | Window: {strict_start:.2f}s→{strict_end:.2f}s | Total: {total_duration:.2f}s
 
-You will see frames slightly outside this window for visual continuity.
-OUTPUT ONLY events where start >= {strict_start:.2f} AND end <= {strict_end:.2f}.
-ALL timestamps must be ABSOLUTE from video start (NOT relative to chunk).
-NEVER create an event longer than 8 seconds.
+RULES:
+- Output ONLY events where start >= {strict_start:.2f} AND end <= {strict_end:.2f}
+- All timestamps ABSOLUTE from video start (never relative to chunk)
+- Max event duration: 8 seconds
+- Events per window: {max(2, int((strict_end-strict_start)/6))}-{max(4, int((strict_end-strict_start)/3))} (clip-worthy moments only)
+- Skip filler dialogue, keep: laugh, reaction, punchline, surprise, emotional beat, topic shift
 
-════════════════════════════════════════════
-CRITICAL TIMELINE RULE
-════════════════════════════════════════════
-For a {strict_end - strict_start:.0f}s window: expect {max(3, int((strict_end-strict_start)/4))}-{max(6, int((strict_end-strict_start)/2))} events.
-Only significant moments: speaker change, laugh, clear reaction, topic shift. Skip filler.
-
-════════════════════════════════════════════
-PERSON DATABASE
-════════════════════════════════════════════
+PEOPLE:
 {person_db}
 
-════════════════════════════════════════════
-TRANSCRIPT — your window only
-════════════════════════════════════════════
+TRANSCRIPT:
 {transcript_json}
 
-════════════════════════════════════════════
-OUTPUT — return ONLY valid JSON, no prose
-════════════════════════════════════════════
+Return ONLY valid JSON — no prose, no markdown:
 {{
   "chunk_id": {chunk_id},
   "video_id": "{video_label}",
@@ -304,13 +288,7 @@ OUTPUT — return ONLY valid JSON, no prose
       "display_name": "<name>",
       "first_seen_s": <float>,
       "last_seen_s": <float>,
-      "appearance": {{
-        "clothing": "<exact — color, type, fit>",
-        "hair": "<color, style>",
-        "facial_hair": "<clean-shaven|stubble|beard>",
-        "glasses": <true|false>,
-        "accessories": "<or none>"
-      }}
+      "clothing": "<color + type only>"
     }}
   ],
 
@@ -318,39 +296,21 @@ OUTPUT — return ONLY valid JSON, no prose
     {{
       "id": "E{chunk_id:02d}_{'{:03d}'.format(0)}",
       "start": <float ≥ {strict_start:.2f}>,
-      "end": <float ≤ {strict_end:.2f}, max 8s after start>,
-      "type": "<dialogue|reaction|laugh|interruption|pause|joke|question|answer|transition>",
-      "description": "<15 words max — what exactly happens>",
+      "end": <float ≤ {strict_end:.2f}>,
+      "type": "<dialogue|reaction|laugh|joke|question|answer|transition>",
       "visible_people": ["P001"],
       "speaker": "<person_id or null>",
-      "speaker_confidence": <0.0-1.0>,
-      "transcript_text": "<exact words or empty string>",
-      "topic": "<3 words max>",
-      "listener_reactions": [{{"person_id": "P002", "reaction": "<laughing|nodding|surprised>"}}],
+      "transcript_text": "<exact words or empty>",
+      "listener_reactions": [{{"person_id": "P002", "reaction": "<laughing|nodding|surprised|shocked>"}}],
       "emotion": "<funny|tense|emotional|informative|awkward|excited|calm>",
-      "scores": {{
-        "importance": <0-10>, "hook": <0-10>, "clip": <0-10>,
-        "viral": <0-10>, "emotion": <0-10>
-      }},
+      "scores": {{"importance": <0-10>, "hook": <0-10>, "clip": <0-10>, "viral": <0-10>, "emotion": <0-10>}},
       "clip_worthy": <true|false>,
       "thumbnail_worthy": <true|false>
     }}
   ],
 
-  "shot_boundaries": [
-    {{"shot_id": "SH{chunk_id:02d}_001", "start": <float>, "end": <float>,
-      "shot_type": "<wide|medium|close-up>", "primary_subject": "<person_id or object>"}}
-  ],
-
   "audio_events": [
-    {{"start": <float>, "end": <float>,
-      "type": "<laughter|music|silence|crosstalk|ambient>",
-      "intensity": "<soft|medium|loud>", "description": "<what you hear>"}}
-  ],
-
-  "speaker_timeline": [
-    {{"start": <float>, "end": <float>, "person_id": "<P001>",
-      "text": "<spoken words>", "confidence": <0.0-1.0>}}
+    {{"start": <float>, "end": <float>, "type": "<laughter|music|silence|crosstalk>", "intensity": "<soft|medium|loud>"}}
   ]
 }}"""
 
