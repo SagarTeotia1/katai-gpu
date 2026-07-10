@@ -56,17 +56,41 @@ OVERALL IMPRESSION:
 One sentence — if you saw this person walking in a crowd, what would you notice first."""
 
 
+RETRY_DELAYS = [4, 12]  # seconds before attempt 2, 3
+RETRIABLE_HTTP = {408, 425, 429, 500, 502, 503, 504}
+
+
 def analyze_image(image_url: str, backend: str) -> str:
-    """Call /api/vision/analyze, return description string."""
+    """Call /api/vision/analyze with retry on transient failures.
+
+    Retries connect errors, read timeouts, and 5xx/429/408 up to 3 attempts
+    with exponential backoff. Non-retriable 4xx (400/401/403/404/415/422)
+    surface immediately — those are payload errors and retry burns GPU time.
+    """
     payload = json.dumps({"image_url": image_url, "prompt": APPEARANCE_PROMPT}).encode()
-    req = urllib.request.Request(
-        f"{backend}/api/vision/analyze",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-    )
-    resp = urllib.request.urlopen(req, timeout=360)
-    data = json.loads(resp.read())
-    return data["description"]
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                f"{backend}/api/vision/analyze",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = urllib.request.urlopen(req, timeout=360)
+            data = json.loads(resp.read())
+            return data["description"]
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code not in RETRIABLE_HTTP or attempt == 2:
+                raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            last_err = e
+            if attempt == 2:
+                raise
+        time.sleep(RETRY_DELAYS[attempt])
+    if last_err:
+        raise last_err
+    raise RuntimeError("analyze_image: exhausted retries with no error captured")
 
 
 def analyze_video_crop(
