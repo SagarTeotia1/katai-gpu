@@ -229,8 +229,25 @@ index-pinecone: ## Index to Pinecone only (skip Neo4j)
 index-neo4j: ## Index to Neo4j only (skip Pinecone)
 	@python3 scripts/index_context.py --no-pinecone $(FILES)
 
-query: ## Natural language query — usage: make query Q="find all moments where samay laughs"
+query: ## Natural language Q&A over indexed video — usage: make query Q="who laughed hardest and when"
 	@python3 scripts/query_context.py "$(Q)" --vllm http://localhost:$(VLLM_PORT)/v1/chat/completions
+
+retrieve: ## RAG — retrieve ranked editable events (no LLM synthesis) — usage: make retrieve Q="best hook moment" [VIDEO=vid1] [TOPK=15] [MIN_SCORE=0.3]
+	@python3 scripts/retriever.py \
+		--query "$(Q)" \
+		--vllm http://localhost:$(VLLM_PORT)/v1/chat/completions \
+		$(if $(VIDEO),--video "$(VIDEO)") \
+		$(if $(TOPK),--top-k $(TOPK)) \
+		$(if $(MIN_SCORE),--min-score $(MIN_SCORE)) \
+		$(if $(OUT),--out "$(OUT)")
+
+edit2: ## Lightweight Director+Editor pipeline → compact Edit DSL JSON — usage: make edit2 PROMPT="60s energetic Short" [VIDEO=vid1] [TOPK=20]
+	@python3 scripts/editor.py \
+		--prompt "$(PROMPT)" \
+		--vllm http://localhost:$(VLLM_PORT)/v1/chat/completions \
+		$(if $(VIDEO),--video "$(VIDEO)") \
+		$(if $(TOPK),--top-k $(TOPK)) \
+		$(if $(OUT),--out "$(OUT)")
 
 direct: ## Director+Editor brain → EDL JSON — usage: make direct PROMPT="60s YouTube short of funniest moment" [VIDEO=video1]
 	@python3 scripts/director_brain.py "$(PROMPT)" \
@@ -239,7 +256,7 @@ direct: ## Director+Editor brain → EDL JSON — usage: make direct PROMPT="60s
 		$(if $(TOPK),--top-k $(TOPK)) \
 		$(if $(MAX_TOKENS),--max-tokens $(MAX_TOKENS))
 
-edit: ## Chief Editor multi-layer brain → primitive-op edit plan JSON (indexed-data only, no re-analysis) — usage: make edit PROMPT="45s Short" [VIDEO=video1] or multi: [VIDEO="video1,video2,video3"] [SAVE_INT=1]
+edit: ## Chief Editor (best) — 3-layer pipeline → primitive-op edit plan — usage: make edit PROMPT="45s Short" [VIDEO=video1] [SAVE_INT=1]
 	@python3 scripts/chief_editor.py "$(PROMPT)" \
 		--vllm http://localhost:$(VLLM_PORT)/v1/chat/completions \
 		$(if $(VIDEO),--video "$(VIDEO)") \

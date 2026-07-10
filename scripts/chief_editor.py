@@ -415,8 +415,19 @@ def gather_context(searcher: Searcher, expander: GraphExpander | None,
             h.setdefault("metadata", {})["_namespace"] = ns or "default"
         merged.extend(hits)
 
-    # ── Rerank globally by score, cap ──
-    merged.sort(key=lambda h: h.get("score", 0.0), reverse=True)
+    # ── Rerank globally by composite editing score, cap ──
+    def _editing_score(h: dict) -> float:
+        meta = h.get("metadata") or {}
+        vsim = float(h.get("score") or 0)
+        return (
+            0.35 * vsim
+            + 0.25 * float(meta.get("hook_score")       or 0) / 10.0
+            + 0.20 * float(meta.get("clip_score")       or 0) / 10.0
+            + 0.10 * float(meta.get("viral_score")      or 0) / 10.0
+            + 0.10 * float(meta.get("importance_score") or 0) / 10.0
+        )
+
+    merged.sort(key=_editing_score, reverse=True)
     merged = merged[:top_k]
 
     # ── Neo4j: expand across all matched events + pull per-video signals ──
