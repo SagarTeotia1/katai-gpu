@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -112,6 +113,60 @@ def run_step(
     metrics["time_s"]    = round(time.time() - t0, 1)
     metrics["exit_code"] = proc.returncode
     return proc.returncode == 0, metrics, lines
+
+
+def run_step_parallel(
+    cmd_a: list[str], parse_a, tag_a: str,
+    cmd_b: list[str], parse_b, tag_b: str,
+    indent: str = "    ",
+) -> tuple[tuple[bool, dict, list[str]], tuple[bool, dict, list[str]]]:
+    """Run two subprocess commands concurrently; stream stdout tagged by prefix.
+
+    Both must be safe to run in parallel (no shared file writes, separate output paths).
+    Returns two (success, metrics, lines) tuples in the order (a, b).
+    """
+    print(f"\n{dim(indent + '[A] $ ' + ' '.join(str(x) for x in cmd_a))}", flush=True)
+    print(f"{dim(indent + '[B] $ ' + ' '.join(str(x) for x in cmd_b))}\n", flush=True)
+
+    print_lock = threading.Lock()
+    results: dict[str, tuple[bool, dict, list[str]]] = {}
+
+    def _worker(cmd: list[str], parse_fn, tag: str, key: str) -> None:
+        metrics: dict = {}
+        lines: list = []
+        t0 = time.time()
+        proc = subprocess.Popen(
+            [str(x) for x in cmd],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        try:
+            assert proc.stdout
+            for line in proc.stdout:
+                line = line.rstrip()
+                lines.append(line)
+                with print_lock:
+                    print(f"{indent}[{tag}] {line}", flush=True)
+                if parse_fn:
+                    parse_fn(line, metrics)
+        except KeyboardInterrupt:
+            proc.terminate()
+            raise
+        proc.wait()
+        metrics["time_s"] = round(time.time() - t0, 1)
+        metrics["exit_code"] = proc.returncode
+        results[key] = (proc.returncode == 0, metrics, lines)
+
+    t_a = threading.Thread(target=_worker, args=(cmd_a, parse_a, tag_a, "a"), daemon=True)
+    t_b = threading.Thread(target=_worker, args=(cmd_b, parse_b, tag_b, "b"), daemon=True)
+    t_a.start()
+    t_b.start()
+    t_a.join()
+    t_b.join()
+
+    return results["a"], results["b"]
 
 
 # ── Per-script output parsers ─────────────────────────────────────────────────
@@ -217,6 +272,16 @@ def main() -> None:
                         help="Parallel whisper transcription workers. 0 = auto "
                              "(dynamic based on video durations, via ffprobe). "
                              "vLLM idle during this stage so safe to stack.")
+    parser.add_argument("--no-scene-align", action="store_true",
+                        help="Disable scene-aligned LPT chunk planning for context step "
+                             "(default: enabled). Use if PySceneDetect broken or debugging.")
+    parser.add_argument("--chunk-bench", action="store_true",
+                        help="Add Step 5 — run scripts/chunk_analysis.py per video "
+                             "(async LPT scene-aligned dispatcher). Produces "
+                             "output/chunk_Nx_<label>_<ts>.json alongside context files.")
+    parser.add_argument("--chunk-bench-inflight", type=int, default=16,
+                        help="Max in-flight vLLM requests for chunk-bench (default 16, "
+                             "matches --max-num-seqs).")
     parser.add_argument("--no-index",    action="store_true", help="Skip Pinecone + Neo4j indexing")
     parser.add_argument("--no-pinecone", action="store_true", help="Index to Neo4j only")
     parser.add_argument("--no-neo4j",    action="store_true", help="Index to Pinecone only")
@@ -256,6 +321,7 @@ def main() -> None:
             "transcription":    {"status": "pending"},
             "context_analysis": {"status": "pending"},
             "indexing":         {"status": "pending"},
+            "chunk_bench":      {"status": "pending"},
         },
     }
     write_summary(summary, summary_path)
@@ -265,9 +331,13 @@ def main() -> None:
     est_trans   = n_videos * 210  # ~210s per video (sequential)
     est_context = n_videos * 900  # ~900s per video (parallel, GPU bound)
     est_index   = 60
+    # Cast + Transcribe run in parallel when neither is skipped → wall = max, not sum.
+    if args.skip_cast is None and args.skip_transcribe is None:
+        est_cast_trans = max(est_cast, est_trans)
+    else:
+        est_cast_trans = (0 if args.skip_cast else est_cast) + (0 if args.skip_transcribe else est_trans)
     est_total   = (
-        (0 if args.skip_cast       else est_cast) +
-        (0 if args.skip_transcribe else est_trans) +
+        est_cast_trans +
         (0 if args.skip_context    else est_context) +
         (0 if args.no_index        else est_index)
     )
@@ -299,92 +369,103 @@ def main() -> None:
     t_pipeline = time.time()
 
     # ─────────────────────────────────────────────────────────────────────────
-    # STEP 1 — Cast Appearance Analysis
+    # STEP 1 + STEP 2 — Cast Appearance + Whisper Transcription
+    # Run in parallel when neither is skipped. Cast → vLLM (vision), Transcribe
+    # → Whisper. Different models sharing GPU; VRAM fits both (Qwen 51GB +
+    # Whisper 3GB on 96GB). Wall = max(cast, trans) instead of sum.
+    # Falls back to sequential when either is skipped/pre-supplied.
     # ─────────────────────────────────────────────────────────────────────────
     cast_analysis_file: str | None = None
+    transcript_file: str | None = None
 
-    if args.skip_cast is not None:
-        f = (
-            latest_file("output/cast_analysis_*.json")
-            if args.skip_cast == "auto"
-            else Path(args.skip_cast)
-        )
-        if f and f.exists():
-            cast_analysis_file = str(f)
-        section(1, 4, "Cast Appearance Analysis", "SKIP")
-        print(f"  Using: {cast_analysis_file or 'NOT FOUND'}", flush=True)
-        summary["steps"]["cast_analysis"] = {"status": "skipped", "output_file": cast_analysis_file}
-    else:
-        section(1, 4, "Cast Appearance Analysis", "RUNNING")
-        t0 = time.time()
-        ok, metrics, _ = run_step(
-            [PYTHON, SCRIPTS / "cast_analysis.py", cast_path, "--backend", args.backend],
-            parse_cast,
-        )
+    def _resolve_skip(flag: str, glob_pat: str) -> str | None:
+        f = latest_file(glob_pat) if flag == "auto" else Path(flag)
+        return str(f) if f and f.exists() else None
+
+    def _record_cast(ok: bool, metrics: dict, since: float) -> None:
+        nonlocal cast_analysis_file
         if ok:
-            found = new_files_since("output/cast_analysis_*.json", t0)
+            found = new_files_since("output/cast_analysis_*.json", since)
             cast_analysis_file = str(found[-1]) if found else metrics.get("output_file")
             summary["steps"]["cast_analysis"] = {
-                "status":           "done",
-                "output_file":       cast_analysis_file,
-                "time_s":            metrics["time_s"],
+                "status": "done",
+                "output_file": cast_analysis_file,
+                "time_s": metrics["time_s"],
                 "persons_described": metrics.get("described", "?"),
-                "persons_total":     metrics.get("total", n_persons),
+                "persons_total": metrics.get("total", n_persons),
             }
             section_result("Cast Analysis", metrics,
                            f"{metrics.get('described','?')}/{metrics.get('total', n_persons)} persons  →  {cast_analysis_file}")
         else:
             summary["steps"]["cast_analysis"] = {"status": "failed", "time_s": metrics["time_s"]}
-            print(red(f"\n  FAILED — exit {metrics['exit_code']}"), flush=True)
+            print(red(f"\n  Cast FAILED — exit {metrics['exit_code']}"), flush=True)
             summary["status"] = "failed"
             write_summary(summary, summary_path)
             print(red(f"\n  Pipeline aborted. Summary: {summary_path}"), flush=True)
             sys.exit(1)
 
-    write_summary(summary, summary_path)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # STEP 2 — Whisper Transcription
-    # ─────────────────────────────────────────────────────────────────────────
-    transcript_file: str | None = None
-
-    if args.skip_transcribe is not None:
-        f = (
-            latest_file("output/transcripts_*.json")
-            if args.skip_transcribe == "auto"
-            else Path(args.skip_transcribe)
-        )
-        if f and f.exists():
-            transcript_file = str(f)
-        section(2, 4, "Whisper Transcription", "SKIP")
-        print(f"  Using: {transcript_file or 'NOT FOUND'}", flush=True)
-        summary["steps"]["transcription"] = {"status": "skipped", "output_file": transcript_file}
-    else:
-        section(2, 4, "Whisper Transcription", "RUNNING")
-        t0 = time.time()
-        ok, metrics, _ = run_step(
-            [PYTHON, SCRIPTS / "transcribe.py", "--cast", cast_path,
-             "--whisper", args.whisper, "--backend", args.backend,
-             "--workers", str(args.whisper_workers)],
-            parse_transcribe,
-        )
-        found = new_files_since("output/transcripts_*.json", t0)
+    def _record_trans(ok: bool, metrics: dict, since: float) -> None:
+        nonlocal transcript_file
+        found = new_files_since("output/transcripts_*.json", since)
         transcript_file = str(found[-1]) if found else metrics.get("output_file")
         if ok:
             summary["steps"]["transcription"] = {
-                "status":             "done",
-                "output_file":        transcript_file,
-                "time_s":             metrics["time_s"],
+                "status": "done",
+                "output_file": transcript_file,
+                "time_s": metrics["time_s"],
                 "videos_transcribed": metrics.get("transcribed", "?"),
-                "videos_total":       metrics.get("total", n_videos),
+                "videos_total": metrics.get("total", n_videos),
             }
             section_result("Transcription", metrics,
                            f"{metrics.get('transcribed','?')}/{metrics.get('total', n_videos)} videos  →  {transcript_file}")
         else:
-            # Non-fatal — context can still run without transcript (will miss audio)
             summary["steps"]["transcription"] = {"status": "failed", "time_s": metrics["time_s"]}
             print(yellow(f"\n  [WARN] Transcription failed (exit {metrics['exit_code']})"), flush=True)
             print(yellow("  Context analysis will continue without transcript data."), flush=True)
+
+    run_cast = args.skip_cast is None
+    run_trans = args.skip_transcribe is None
+
+    cast_cmd = [PYTHON, SCRIPTS / "cast_analysis.py", cast_path, "--backend", args.backend]
+    trans_cmd = [PYTHON, SCRIPTS / "transcribe.py", "--cast", cast_path,
+                 "--whisper", args.whisper, "--backend", args.backend,
+                 "--workers", str(args.whisper_workers)]
+
+    if run_cast and run_trans:
+        section(1, 4, "Cast Appearance + Whisper Transcription (PARALLEL)", "RUNNING")
+        t0 = time.time()
+        (ok_c, m_c, _), (ok_t, m_t, _) = run_step_parallel(
+            cast_cmd, parse_cast, "CAST",
+            trans_cmd, parse_transcribe, "TRANS",
+        )
+        _record_cast(ok_c, m_c, t0)
+        _record_trans(ok_t, m_t, t0)
+    else:
+        # Step 1 sequential
+        if not run_cast:
+            cast_analysis_file = _resolve_skip(args.skip_cast, "output/cast_analysis_*.json")
+            section(1, 4, "Cast Appearance Analysis", "SKIP")
+            print(f"  Using: {cast_analysis_file or 'NOT FOUND'}", flush=True)
+            summary["steps"]["cast_analysis"] = {"status": "skipped", "output_file": cast_analysis_file}
+        else:
+            section(1, 4, "Cast Appearance Analysis", "RUNNING")
+            t0 = time.time()
+            ok, metrics, _ = run_step(cast_cmd, parse_cast)
+            _record_cast(ok, metrics, t0)
+
+        write_summary(summary, summary_path)
+
+        # Step 2 sequential
+        if not run_trans:
+            transcript_file = _resolve_skip(args.skip_transcribe, "output/transcripts_*.json")
+            section(2, 4, "Whisper Transcription", "SKIP")
+            print(f"  Using: {transcript_file or 'NOT FOUND'}", flush=True)
+            summary["steps"]["transcription"] = {"status": "skipped", "output_file": transcript_file}
+        else:
+            section(2, 4, "Whisper Transcription", "RUNNING")
+            t0 = time.time()
+            ok, metrics, _ = run_step(trans_cmd, parse_transcribe)
+            _record_trans(ok, metrics, t0)
 
     write_summary(summary, summary_path)
 
@@ -412,6 +493,8 @@ def main() -> None:
                "--backend", args.backend,
                "--chunks", str(args.chunks),
                "--workers", str(args.workers)]
+        if not args.no_scene_align:
+            cmd.append("--scene-align")
         if cast_analysis_file:
             cmd += ["--cast-analysis", cast_analysis_file]
         if transcript_file:
@@ -489,6 +572,54 @@ def main() -> None:
             print(yellow("  Pipeline completed but indexing failed. Re-run: make index-context"), flush=True)
 
     write_summary(summary, summary_path)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 5 (opt-in) — Chunk Bench: scripts/chunk_analysis.py per video
+    # Async LPT scene-aligned dispatcher. Produces chunk_Nx_<label>_<ts>.json
+    # alongside context files. Runs videos SEQUENTIALLY (each video already
+    # saturates vLLM inflight cap internally).
+    # ─────────────────────────────────────────────────────────────────────────
+    summary["steps"]["chunk_bench"] = {"status": "skipped", "reason": "flag off"}
+    if args.chunk_bench:
+        section_num_total = 5
+        print(f"\n{'─'*W}", flush=True)
+        print(bold(f"  Step 5/5: Chunk Bench (async LPT per video)") + "  " + yellow("[RUNNING]"), flush=True)
+        print(f"{'─'*W}\n", flush=True)
+
+        bench_results: list[dict] = []
+        bench_fail_count = 0
+        t_bench = time.time()
+        for v in cast_data.get("videos", []):
+            label = v.get("label", "video")
+            url = v.get("url")
+            if not url:
+                print(yellow(f"  [skip] {label}: no url"), flush=True)
+                continue
+            print(cyan(f"\n  → chunk-bench: {label}"), flush=True)
+            t0 = time.time()
+            cmd = [PYTHON, SCRIPTS / "chunk_analysis.py",
+                   "--vid", url,
+                   "--backend", args.backend,
+                   "--max-inflight", str(args.chunk_bench_inflight),
+                   "--out", "output"]
+            ok, metrics, _ = run_step(cmd, None)
+            bench_results.append({
+                "label": label,
+                "ok": ok,
+                "time_s": metrics.get("time_s", round(time.time() - t0, 1)),
+                "exit_code": metrics.get("exit_code", -1),
+            })
+            if not ok:
+                bench_fail_count += 1
+
+        bench_wall = round(time.time() - t_bench, 1)
+        summary["steps"]["chunk_bench"] = {
+            "status": "done" if bench_fail_count == 0 else ("partial" if bench_fail_count < len(bench_results) else "failed"),
+            "time_s": bench_wall,
+            "videos": bench_results,
+        }
+        print(f"\n  Chunk bench wall: {bench_wall}s  ({len(bench_results) - bench_fail_count}/{len(bench_results)} ok)", flush=True)
+        write_summary(summary, summary_path)
 
     # ─────────────────────────────────────────────────────────────────────────
     # FINAL SUMMARY

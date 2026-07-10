@@ -28,11 +28,17 @@ services:
       --tensor-parallel-size 1
       --max-model-len ${MAX_MODEL_LEN:-131072}
       --dtype bfloat16
-      --gpu-memory-utilization ${GPU_MEM_UTIL:-0.90}
-      --max-num-seqs 512
+      --gpu-memory-utilization ${GPU_MEM_UTIL:-0.92}
+      --max-num-seqs 16
+      --enable-chunked-prefill
+      --kv-cache-dtype fp8
+      --limit-mm-per-prompt video=1
+      --mm-processor-kwargs '{"max_pixels":602112,"fps":1}'
       --reasoning-parser qwen3
       --enable-auto-tool-choice
       --tool-call-parser qwen3_coder
+      # NOTE: raise --max-num-seqs to 24-32 if switching to FP8 weights (KV budget grows).
+      # 16 is sized for BF16 weights + FP8 KV cache with 10-25K-token multimodal seqs.
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 15s

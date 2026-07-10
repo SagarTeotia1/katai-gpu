@@ -42,7 +42,7 @@ MODEL_ID    = "Qwen/Qwen3.6-27B"
 MAX_TOKENS  = 32768
 MAX_WORKERS    = 8               # max parallel agents across ALL chunks of ALL videos
 MAX_RETRIES    = 3               # per-chunk retry attempts
-RETRY_DELAYS   = [30, 90]        # seconds before attempt 2, 3
+RETRY_DELAYS   = [5, 15]         # seconds before attempt 2, 3 (was [30, 90] — over-cautious)
 TOKEN_BUDGETS  = [20480, 14336, 8192]   # tokens per chunk attempt (shorter = less truncation)
 TIMEOUTS       = [900, 1200, 1500]      # timeout per chunk attempt (s)
 CHUNK_OVERLAP  = 3.0             # seconds of frame overlap each side for visual context
@@ -197,9 +197,8 @@ def allocate_chunks(durations: dict[str, float], total_budget: int) -> dict[str,
 
 def plan_chunks(duration: float, n: int) -> list[dict]:
     """
-    Split [0, duration] into n chunks with CHUNK_OVERLAP frames on each side
-    for visual context. Each chunk has a strict window (for event output) and
-    a padded window (for frame sampling).
+    Equal-width fallback splitter — retained for --scene-align=off compatibility.
+    Splits [0, duration] into n chunks with CHUNK_OVERLAP on each side.
     """
     seg = duration / n
     chunks = []
@@ -215,6 +214,79 @@ def plan_chunks(duration: float, n: int) -> list[dict]:
             "pad_start":    pad_start,
             "pad_end":      pad_end,
         })
+    return chunks
+
+
+def plan_chunks_scene_aligned(
+    video_url: str,
+    duration: float,
+    n_hint: int,
+    min_s: float = 10.0,
+    max_s: float = 30.0,
+) -> list[dict]:
+    """Scene-aligned splitter. Returns chunks sorted by strict duration DESC (LPT).
+
+    - Uses PySceneDetect ContentDetector via scripts/scene_detect.py.
+    - Merges tiny scenes (<MIN_S), splits long scenes (>MAX_S) into equal parts.
+    - LPT sort so long chunks dispatch first, small ones fill straggler tail.
+    - chunk_id retains stable 0..N-1 order for merge indexing.
+    - Falls back to equal-width plan_chunks if detection fails or yields 0 cuts.
+    """
+    try:
+        from scene_detect import detect_scene_cuts  # local import to avoid hard dep
+    except ImportError:
+        return plan_chunks(duration, n_hint)
+
+    cuts = detect_scene_cuts(video_url, duration)
+    if len(cuts) < 2:
+        return plan_chunks(duration, n_hint)
+
+    # Step 1: merge tiny scenes forward
+    merged: list[tuple[float, float]] = []
+    i = 0
+    while i < len(cuts) - 1:
+        seg_start = cuts[i]
+        j = i + 1
+        while j < len(cuts) and cuts[j] - seg_start < min_s and j < len(cuts) - 1:
+            j += 1
+        merged.append((seg_start, cuts[j]))
+        i = j
+    if len(merged) >= 2 and (merged[-1][1] - merged[-1][0]) < min_s:
+        prev_s, _ = merged[-2]
+        _, last_e = merged[-1]
+        merged[-2] = (prev_s, last_e)
+        merged.pop()
+
+    # Step 2: split long scenes into equal parts <=max_s
+    import math
+    strict_windows: list[tuple[float, float]] = []
+    for s, e in merged:
+        seg_len = e - s
+        if seg_len <= max_s:
+            strict_windows.append((s, e))
+            continue
+        n_parts = max(2, math.ceil(seg_len / max_s))
+        part_len = seg_len / n_parts
+        for p in range(n_parts):
+            strict_windows.append((s + p * part_len, s + (p + 1) * part_len))
+
+    # Fallback if planner yielded nothing
+    if not strict_windows:
+        return plan_chunks(duration, n_hint)
+
+    # Build chunk dicts with pad on each side (frame-context, does NOT change strict window)
+    chunks: list[dict] = []
+    for cid, (ss, se) in enumerate(strict_windows):
+        chunks.append({
+            "chunk_id":     cid,
+            "strict_start": round(ss, 2),
+            "strict_end":   round(se, 2),
+            "pad_start":    round(max(0.0, ss - CHUNK_OVERLAP), 2),
+            "pad_end":      round(min(duration, se + CHUNK_OVERLAP), 2),
+        })
+
+    # LPT: sort by strict duration DESC. chunk_id stays as-assigned (position-based).
+    chunks.sort(key=lambda c: c["strict_end"] - c["strict_start"], reverse=True)
     return chunks
 
 
@@ -1387,10 +1459,14 @@ def analyze_video_chunked(
     global_progress: dict,
     global_lock: threading.Lock,
     agent_base: int = 0,
+    scene_align: bool = False,
 ) -> dict:
     """
     Split one video into n_chunks, fire all in parallel, merge, synthesize.
     Returns same shape as analyze_video().
+
+    scene_align=True: use PySceneDetect ContentDetector for chunk boundaries;
+    chunks sorted by strict duration DESC (LPT) so long chunks dispatch first.
     """
     t0       = time.time()
     safe_url = urllib.parse.quote(video_url, safe=":/?=&%#@!")
@@ -1398,7 +1474,14 @@ def analyze_video_chunked(
         log(video_label, f"URL encoded: {safe_url}")
 
     person_db = build_person_database(cast_analysis, video_label)
-    chunks    = plan_chunks(total_duration, n_chunks)
+    if scene_align:
+        chunks = plan_chunks_scene_aligned(video_url, total_duration, n_chunks)
+        log(video_label,
+            f"Scene-aligned: {len(chunks)} chunks "
+            f"(strict durations: {[round(c['strict_end']-c['strict_start'],1) for c in chunks]})")
+        n_chunks = len(chunks)
+    else:
+        chunks = plan_chunks(total_duration, n_chunks)
 
     log(video_label,
         f"Splitting into {n_chunks} chunks "
@@ -1532,6 +1615,10 @@ def main() -> None:
                         help=f"Chunks per video (default {DEFAULT_CHUNKS}). "
                              f"1 = single full-video pass (slow). "
                              f"4 = 4x faster. Total agents = videos × chunks.")
+    parser.add_argument("--scene-align", action="store_true",
+                        help="Use PySceneDetect ContentDetector for chunk boundaries; "
+                             "chunks sorted LPT (long-first) to shorten straggler tail. "
+                             "Adds ~5-15s CPU pass per video (cached).")
     args = parser.parse_args()
 
     vllm_url    = args.vllm
@@ -1668,6 +1755,7 @@ def main() -> None:
                     vllm_url, model_id, backend_url,
                     progress, progress_lock,
                     agent_bases[v["label"]],  # unique base so agent IDs never overlap
+                    args.scene_align,
                 ): v["label"]
                 for i, v in enumerate(videos)
             }
