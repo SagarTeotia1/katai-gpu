@@ -19,6 +19,8 @@ OUTPUT ONLY VALID JSON. No markdown. No explanation. No fences.
 ROOT STRUCTURE (fill every field for your window):
 {{
   "chunk_id": {chunk_id},
+  "prev_chunk_id": {chunk_id - 1 if chunk_id > 0 else "null"},
+  "next_chunk_id": {chunk_id + 1 if chunk_id + 1 < total_chunks else "null"},
   "chunk_start": {start:.2f},
   "chunk_end": {end:.2f},
   "metadata": {{

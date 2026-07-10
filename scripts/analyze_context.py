@@ -600,6 +600,79 @@ def synthesize_merged(
     return merged
 
 
+def continuity_pass(merged: dict, vllm_url: str, model_id: str) -> dict:
+    """
+    Post-merge dedup pass (text-only, ~20-40s).
+    Single LLM call: merges duplicate people across chunk boundaries,
+    applies stable IDs back to the timeline.
+    """
+    video_label = merged["video_id"]
+    people = merged.get("known_people", [])
+    if not people:
+        return merged
+
+    people_json = json.dumps(people[:80], ensure_ascii=False)
+
+    system = f"""You are a video analysis post-processor for "{video_label}".
+
+A parallel chunked video analysis produced the known_people list below.
+Different chunks may have assigned different IDs or descriptions to the same person.
+
+YOUR TASK:
+1. Read the known_people list. Identify duplicates (same person, different person_id or name).
+2. Merge each duplicate group into ONE canonical entry. Keep the most detailed description.
+3. Assign clean IDs: P001, P002, P003, ...
+4. Return a remapping: every old_id that changed → its canonical_id.
+
+OUTPUT ONLY VALID JSON — no markdown, no explanation:
+{{
+  "known_people": [{{...merged, deduplicated list...}}],
+  "id_remapping": {{"old_id": "canonical_id", ...}}
+}}"""
+
+    payload = {
+        "model": model_id,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"known_people:\n{people_json}"},
+        ],
+        "max_tokens": 8192,
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+    }
+
+    log(video_label, "Continuity pass — dedup people across chunk boundaries...")
+    try:
+        raw_resp = post_vllm(payload, vllm_url, timeout=120)
+        msg  = raw_resp["choices"][0]["message"]
+        raw  = msg.get("content") or msg.get("reasoning") or ""
+        if not raw:
+            log(video_label, "Continuity pass empty — skipping")
+            return merged
+
+        result    = parse_robust(raw, f"{video_label}_continuity")
+        remapping = result.get("id_remapping", {})
+
+        if result.get("known_people"):
+            merged["known_people"] = result["known_people"]
+
+        if remapping:
+            for ev in merged.get("timeline", []):
+                if "person_ids" in ev:
+                    remapped = [remapping.get(pid, pid) for pid in ev["person_ids"]]
+                    ev["person_ids"] = list(dict.fromkeys(remapped))
+                if ev.get("speaker") in remapping:
+                    ev["speaker"] = remapping[ev["speaker"]]
+            log(video_label,
+                f"Continuity done: {len(result['known_people'])} unique people, "
+                f"{len(remapping)} ID remappings applied")
+    except Exception as e:
+        log(video_label, f"Continuity pass failed ({e}) — continuing without dedup")
+
+    return merged
+
+
 def _scenes_from_timeline(events: list[dict]) -> list[dict]:
     """Heuristic: group consecutive events into scenes (max 30s, breaks on transition type)."""
     if not events:
@@ -1072,6 +1145,7 @@ def _finalize_video(
     global_lock: threading.Lock,
     vllm_url: str,
     model_id: str,
+    context_mode: str = "parallel",
 ) -> dict:
     """Parse + stub + merge + synthesize + save for one video (sync)."""
     t0             = plan["t0"]
@@ -1147,6 +1221,11 @@ def _finalize_video(
 
     chunk_results.sort(key=lambda r: (int(r.get("scene_id", 0)), int(r.get("part_idx", 0))))
 
+    # Link prev/next chunk IDs for downstream traversal
+    for i, cr in enumerate(chunk_results):
+        cr["prev_chunk_id"] = chunk_results[i - 1]["chunk_id"] if i > 0 else None
+        cr["next_chunk_id"] = chunk_results[i + 1]["chunk_id"] if i < len(chunk_results) - 1 else None
+
     # ── MERGE ─────────────────────────────────────────────────────────────────
     try:
         merged = merge_chunks(chunk_results, video_label, video_url, total_duration)
@@ -1165,6 +1244,17 @@ def _finalize_video(
         synth_wall_s = time.time() - t_synth
         log(video_label,
             f"Synthesis failed ({e}) — saving merged timeline without editorial")
+
+    # ── CONTINUITY PASS (optional) ────────────────────────────────────────────
+    if context_mode == "continuity":
+        t_cont = time.time()
+        try:
+            merged = continuity_pass(merged, vllm_url, model_id)
+            log(video_label, f"Continuity pass done in {time.time() - t_cont:.1f}s")
+        except Exception as e:
+            log(video_label, f"Continuity pass crashed ({e}) — skipping")
+    elif context_mode == "sequential":
+        log(video_label, "sequential context mode not yet implemented — using parallel result")
 
     # ── SAVE ──────────────────────────────────────────────────────────────────
     slug     = video_label.replace(" ", "_")
@@ -1621,6 +1711,11 @@ def analyze_video_chunked(
     # Merge order: sort by (scene_id, part_idx) so timeline reassembles left-to-right.
     chunk_results.sort(key=lambda r: (int(r.get("scene_id", 0)), int(r.get("part_idx", 0))))
 
+    # Link prev/next chunk IDs for downstream traversal
+    for i, cr in enumerate(chunk_results):
+        cr["prev_chunk_id"] = chunk_results[i - 1]["chunk_id"] if i > 0 else None
+        cr["next_chunk_id"] = chunk_results[i + 1]["chunk_id"] if i < len(chunk_results) - 1 else None
+
     # ── MERGE ─────────────────────────────────────────────────────────────────
     try:
         merged = merge_chunks(chunk_results, video_label, video_url, total_duration)
@@ -1706,6 +1801,12 @@ def main() -> None:
                         help="Use PySceneDetect ContentDetector for chunk boundaries; "
                              "chunks sorted LPT (long-first) to shorten straggler tail. "
                              "Adds ~5-15s CPU pass per video (cached).")
+    parser.add_argument("--context-mode",
+                        choices=["parallel", "continuity", "sequential"],
+                        default="parallel",
+                        help="parallel=fastest (default, pure parallel chunks); "
+                             "continuity=+single LLM dedup pass post-merge (recommended for quality); "
+                             "sequential=future (not yet implemented).")
     args = parser.parse_args()
 
     vllm_url    = args.vllm
@@ -1864,6 +1965,7 @@ def main() -> None:
                         transcripts, out_dir, ts,
                         progress, progress_lock,
                         vllm_url, model_id,
+                        context_mode=args.context_mode,
                     )
                 except Exception as exc:
                     results[label] = {"ok": False, "error": str(exc)}
