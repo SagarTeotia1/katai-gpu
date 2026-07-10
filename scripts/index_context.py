@@ -164,8 +164,13 @@ class PineconeIndexer:
 
     def index_context(self, ctx: dict) -> int:
         video_id   = ctx.get("video_id", "unknown")
-        known_people = ctx.get("known_people", [])
-        person_map = {p["person_id"]: p.get("display_name", p["person_id"]) for p in known_people if "person_id" in p}
+        # known_people is a list of dicts in the synthesised context JSON.
+        # Guard against schema migration artefacts where entries are plain strings.
+        known_people = [
+            p for p in ctx.get("known_people", [])
+            if isinstance(p, dict) and "person_id" in p
+        ]
+        person_map = {p["person_id"]: p.get("display_name", p["person_id"]) for p in known_people}
         # Fallback: build person_map from cast_analysis-style people list if known_people is empty
         if not person_map and "people" in ctx:
             for p in ctx.get("people", []):
@@ -309,10 +314,14 @@ class Neo4jGraphBuilder:
             "CREATE CONSTRAINT IF NOT EXISTS FOR (c:Clip)   REQUIRE c.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Topic)  REQUIRE t.name IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (em:Emotion) REQUIRE em.name IS UNIQUE",
+            # WorldState: composite uniqueness on (video_id, start) prevents duplicate
+            # nodes when the same context file is re-indexed.
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (ws:WorldState) REQUIRE (ws.video_id, ws.start) IS NODE KEY",
             "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.start)",
             "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.clip_worthy)",
             "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.clip_score)",
             "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.video_id)",
+            "CREATE INDEX IF NOT EXISTS FOR (ws:WorldState) ON (ws.video_id)",
         ]
         for s in stmts:
             try:
@@ -323,8 +332,13 @@ class Neo4jGraphBuilder:
     def index_context(self, ctx: dict) -> int:
         video_id     = ctx.get("video_id", "unknown")
         meta         = ctx.get("video_metadata") or {}
-        known_people = ctx.get("known_people", [])
-        person_map   = {p["person_id"]: p.get("display_name", p["person_id"]) for p in known_people if "person_id" in p}
+        # known_people is a list of dicts in the synthesised context JSON.
+        # Guard against schema migration artefacts where entries are plain strings.
+        known_people = [
+            p for p in ctx.get("known_people", [])
+            if isinstance(p, dict) and "person_id" in p
+        ]
+        person_map   = {p["person_id"]: p.get("display_name", p["person_id"]) for p in known_people}
         # Fallback: build person_map from cast_analysis-style people list if known_people is empty
         if not person_map and "people" in ctx:
             for p in ctx.get("people", []):
@@ -345,8 +359,9 @@ class Neo4jGraphBuilder:
               "ctx": meta.get("overall_context","")})
         count += 1
 
-        # Person nodes
-        for p in ctx.get("known_people", []):
+        # Person nodes — iterate only dict entries (guard against plain-string IDs
+        # that chunks emit in active_people before synthesis).
+        for p in known_people:
             app = p.get("appearance") or {}
             self._run("""
                 MERGE (p:Person {id:$id})
@@ -504,11 +519,14 @@ class Neo4jGraphBuilder:
 
         for cb in conv.get("callbacks", []):
             ref = f"{video_id}_{cb.get('references_event','')}"
+            # Avoid cartesian product: anchor tgt first, then find src independently.
             self._run("""
-                MATCH (src:Event),(tgt:Event {id:$ref})
-                WHERE src.video_id=$vid
-                  AND src.start >= $at - 3 AND src.start <= $at + 3
-                WITH src,tgt LIMIT 1
+                MATCH (tgt:Event {id:$ref})
+                WITH tgt
+                MATCH (src:Event {video_id:$vid})
+                WHERE src.start >= $at - 3 AND src.start <= $at + 3
+                  AND src.id <> tgt.id
+                WITH src, tgt LIMIT 1
                 MERGE (src)-[r:REFERENCES]->(tgt)
                 SET r.description=$desc
             """, {"ref": ref, "vid": video_id,
@@ -585,13 +603,16 @@ class Neo4jGraphBuilder:
                     MERGE (c)-[:REQUIRES_CONTEXT]->(e)
                 """, {"cid": cid, "eid": f"{video_id}_{ev_ref}"})
 
-        # WorldState nodes from world_state_timeline
+        # WorldState nodes from world_state_timeline — linked to their Video node.
         for ws in ctx.get("world_state_timeline", []):
             self._run("""
                 MERGE (ws:WorldState {video_id: $vid, start: $start})
                 SET ws.end=$end, ws.story_stage=$stage, ws.scene_emotion=$emotion,
                     ws.energy=$energy, ws.current_topic=$topic,
                     ws.open_loops=$loops, ws.callbacks=$callbacks
+                WITH ws
+                MATCH (v:Video {id: $vid})
+                MERGE (ws)-[:PART_OF]->(v)
             """, {
                 "vid":      video_id,
                 "start":    float(ws.get("start", 0)),
@@ -645,7 +666,12 @@ def main():
         try:
             pc_idx = PineconeIndexer()
             stats  = pc_idx.index.describe_index_stats()
-            print(f"  [Pinecone] Connected ✓ — {stats.get('total_vector_count', 0)} vectors existing", flush=True)
+            # Pinecone v5 returns a typed DescribeIndexStatsResponse object,
+            # not a plain dict — use attribute access with a safe fallback.
+            total_vc = getattr(stats, "total_vector_count", None)
+            if total_vc is None:
+                total_vc = stats.get("total_vector_count", 0) if hasattr(stats, "get") else 0
+            print(f"  [Pinecone] Connected ✓ — {total_vc} vectors existing", flush=True)
         except Exception as e:
             print(f"  [Pinecone] FAILED: {e}", flush=True)
 
