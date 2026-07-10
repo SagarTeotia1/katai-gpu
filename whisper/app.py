@@ -11,31 +11,35 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel, BatchedInferencePipeline
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 MODEL_SIZE = "large-v3"
+BATCH_SIZE = 16  # VAD-split audio pieces batched on GPU per forward pass
 _model: Optional[WhisperModel] = None
+_batched: Optional[BatchedInferencePipeline] = None
 
 
-def _load_model() -> WhisperModel:
+def _load_model() -> tuple[WhisperModel, BatchedInferencePipeline]:
     """Blocking model load — called in thread pool from lifespan."""
     logger.info("Loading Whisper %s on CUDA float16...", MODEL_SIZE)
     m = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
-    logger.info("Whisper model ready.")
-    return m
+    b = BatchedInferencePipeline(model=m)
+    logger.info("Whisper model + batched pipeline ready (batch_size=%d).", BATCH_SIZE)
+    return m, b
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _model
+    global _model, _batched
     # Run blocking model load in thread pool — keeps event loop alive
     loop = asyncio.get_running_loop()
-    _model = await loop.run_in_executor(None, _load_model)
+    _model, _batched = await loop.run_in_executor(None, _load_model)
     yield
     _model = None
+    _batched = None
 
 
 app = FastAPI(title="Whisper Transcription Service", lifespan=lifespan)
@@ -44,9 +48,9 @@ app = FastAPI(title="Whisper Transcription Service", lifespan=lifespan)
 class TranscribeRequest(BaseModel):
     video_url: str = Field(..., description="Public video URL (mp4, mov, etc.)")
     language: Optional[str] = Field(None, description="ISO 639-1 code — None = auto-detect")
-    beam_size: int = Field(5, ge=1, le=10)
+    beam_size: int = Field(1, ge=1, le=10)
     vad_filter: bool = Field(True, description="Skip silence segments")
-    word_timestamps: bool = Field(True, description="Include word-level timestamps")
+    word_timestamps: bool = Field(False, description="Include word-level timestamps (slower)")
 
 
 class WordResult(BaseModel):
@@ -77,7 +81,7 @@ class TranscribeResponse(BaseModel):
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "model": MODEL_SIZE, "ready": _model is not None}
+    return {"status": "ok", "model": MODEL_SIZE, "ready": _model is not None and _batched is not None}
 
 
 @app.post("/transcribe", response_model=TranscribeResponse)
@@ -115,14 +119,19 @@ async def transcribe(req: TranscribeRequest) -> TranscribeResponse:
 
 
 def _transcribe_sync(audio_path: str, req: TranscribeRequest) -> TranscribeResponse:
-    """Runs Whisper synchronously — always called from thread pool, never on event loop."""
-    segments_iter, info = _model.transcribe(
+    """Runs Whisper synchronously — always called from thread pool, never on event loop.
+
+    Uses BatchedInferencePipeline: VAD splits audio into segments, then transcribes
+    them in GPU batches of BATCH_SIZE. 3-5x faster than sequential decoding.
+    """
+    segments_iter, info = _batched.transcribe(
         audio_path,
         language=req.language,
         beam_size=req.beam_size,
         word_timestamps=req.word_timestamps,
         vad_filter=req.vad_filter,
         vad_parameters={"min_silence_duration_ms": 500},
+        batch_size=BATCH_SIZE,
     )
 
     segments: list[SegmentResult] = []
