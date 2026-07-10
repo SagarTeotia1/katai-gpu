@@ -11,35 +11,30 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from faster_whisper import WhisperModel, BatchedInferencePipeline
+from faster_whisper import WhisperModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 MODEL_SIZE = "large-v3"
-BATCH_SIZE = 16  # VAD-split audio pieces batched on GPU per forward pass
 _model: Optional[WhisperModel] = None
-_batched: Optional[BatchedInferencePipeline] = None
 
 
-def _load_model() -> tuple[WhisperModel, BatchedInferencePipeline]:
+def _load_model() -> WhisperModel:
     """Blocking model load — called in thread pool from lifespan."""
     logger.info("Loading Whisper %s on CUDA float16...", MODEL_SIZE)
     m = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
-    b = BatchedInferencePipeline(model=m)
-    logger.info("Whisper model + batched pipeline ready (batch_size=%d).", BATCH_SIZE)
-    return m, b
+    logger.info("Whisper model ready.")
+    return m
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _model, _batched
-    # Run blocking model load in thread pool — keeps event loop alive
+    global _model
     loop = asyncio.get_running_loop()
-    _model, _batched = await loop.run_in_executor(None, _load_model)
+    _model = await loop.run_in_executor(None, _load_model)
     yield
     _model = None
-    _batched = None
 
 
 app = FastAPI(title="Whisper Transcription Service", lifespan=lifespan)
@@ -81,7 +76,7 @@ class TranscribeResponse(BaseModel):
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "model": MODEL_SIZE, "ready": _model is not None and _batched is not None}
+    return {"status": "ok", "model": MODEL_SIZE, "ready": _model is not None}
 
 
 @app.post("/transcribe", response_model=TranscribeResponse)
@@ -121,17 +116,17 @@ async def transcribe(req: TranscribeRequest) -> TranscribeResponse:
 def _transcribe_sync(audio_path: str, req: TranscribeRequest) -> TranscribeResponse:
     """Runs Whisper synchronously — always called from thread pool, never on event loop.
 
-    Uses BatchedInferencePipeline: VAD splits audio into segments, then transcribes
-    them in GPU batches of BATCH_SIZE. 3-5x faster than sequential decoding.
+    Uses standard WhisperModel.transcribe() (sequential decoding). BatchedInferencePipeline
+    was 3-5x faster but silently dropped segments at batch boundaries — up to 30% content loss
+    on real-world mixed-language/music videos. Correctness > speed.
     """
-    segments_iter, info = _batched.transcribe(
+    segments_iter, info = _model.transcribe(
         audio_path,
         language=req.language,
         beam_size=req.beam_size,
         word_timestamps=req.word_timestamps,
         vad_filter=req.vad_filter,
         vad_parameters={"min_silence_duration_ms": 500},
-        batch_size=BATCH_SIZE,
     )
 
     segments: list[SegmentResult] = []
