@@ -75,7 +75,7 @@ def call_whisper(video_url: str, whisper_base: str, language: str | None = None)
         data=payload,
         headers={"Content-Type": "application/json"},
     )
-    resp = urllib.request.urlopen(req, timeout=600)
+    resp = urllib.request.urlopen(req, timeout=1200)
     return json.loads(resp.read())
 
 

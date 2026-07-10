@@ -105,7 +105,7 @@ async def transcribe(req: TranscribeRequest) -> TranscribeResponse:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=900)
         if proc.returncode != 0:
             raise HTTPException(502, f"ffmpeg failed: {stderr.decode()[:400]}")
 
