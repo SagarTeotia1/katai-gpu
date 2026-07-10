@@ -75,29 +75,54 @@ class Searcher:
             inputs=[text],
             parameters={"input_type": "query", "truncate": "END"},
         )
-        return result.data[0]["values"]
+        emb = result.data[0]
+        return emb["values"] if isinstance(emb, dict) else emb.values
+
+    def get_all_namespaces(self) -> list[str]:
+        stats = self.index.describe_index_stats()
+        # Pinecone v5 returns typed DescribeIndexStatsResponse — use getattr
+        ns = getattr(stats, "namespaces", None)
+        if ns is None and hasattr(stats, "get"):
+            ns = stats.get("namespaces", {})
+        return list(ns.keys()) if ns else []
 
     def search(self, query: str, top_k: int = TOP_K,
                namespace: str = None, filter: dict = None) -> list[dict]:
         vec = self.embed_query(query)
-        kwargs = {
-            "vector": vec,
-            "top_k": top_k,
-            "include_metadata": True,
-        }
         if namespace:
-            kwargs["namespace"] = namespace
-        if filter:
-            kwargs["filter"] = filter
-        resp = self.index.query(**kwargs)
-        return [
-            {"score": m.score, "id": m.id, "metadata": m.metadata}
-            for m in resp.matches
-        ]
-
-    def get_all_namespaces(self) -> list[str]:
-        stats = self.index.describe_index_stats()
-        return list(stats.get("namespaces", {}).keys())
+            # Targeted search in one video namespace
+            kwargs = {"vector": vec, "top_k": top_k, "include_metadata": True,
+                      "namespace": namespace}
+            if filter:
+                kwargs["filter"] = filter
+            resp = self.index.query(**kwargs)
+            return [{"score": m.score, "id": m.id, "metadata": dict(m.metadata or {})}
+                    for m in resp.matches]
+        else:
+            # Fan-out across all video namespaces and merge — data is per-video namespaced
+            namespaces = self.get_all_namespaces()
+            if not namespaces:
+                # Fallback: search default namespace
+                resp = self.index.query(vector=vec, top_k=top_k, include_metadata=True)
+                return [{"score": m.score, "id": m.id, "metadata": dict(m.metadata or {})}
+                        for m in resp.matches]
+            all_hits: dict[str, dict] = {}
+            for ns in namespaces:
+                try:
+                    kwargs = {"vector": vec, "top_k": top_k, "include_metadata": True,
+                              "namespace": ns}
+                    if filter:
+                        kwargs["filter"] = filter
+                    resp = self.index.query(**kwargs)
+                    for m in resp.matches:
+                        mid = m.id
+                        hit = {"score": m.score, "id": mid,
+                               "metadata": dict(m.metadata or {})}
+                        if mid not in all_hits or m.score > all_hits[mid]["score"]:
+                            all_hits[mid] = hit
+                except Exception:
+                    pass
+            return sorted(all_hits.values(), key=lambda x: x["score"], reverse=True)[:top_k]
 
 
 # ── Neo4j graph expansion ─────────────────────────────────────────────────────
@@ -245,7 +270,9 @@ class GraphExpander:
 
 # ── LLM synthesis ─────────────────────────────────────────────────────────────
 
-SYNTHESIS_PROMPT = """You are a precise video editing assistant. You have been given semantic search results and knowledge graph data for a video.
+SYNTHESIS_PROMPT = """RESPOND WITH RAW JSON ONLY. YOUR ENTIRE RESPONSE MUST START WITH { AND END WITH }. NO MARKDOWN, NO EXPLANATION, NO <think> BLOCKS.
+
+You are a precise video editing assistant. You have been given semantic search results and knowledge graph data for a video.
 
 USER QUERY: {query}
 
@@ -309,9 +336,9 @@ def synthesize(query: str, search_hits: list[dict], graph_ctx: dict,
         "model": model_id,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 4096,
-        "temperature": 0.1,
+        "temperature": 0.0,
         "response_format": {"type": "json_object"},
-        "chat_template_kwargs": {"enable_thinking": False},
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
     }
 
     raw = post_vllm(payload, vllm_url, timeout=120)

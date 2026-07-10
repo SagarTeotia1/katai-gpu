@@ -148,7 +148,7 @@ class PineconeIndexer:
             inputs=texts,
             parameters={"input_type": "passage", "truncate": "END"},
         )
-        return [r["values"] for r in result.data]
+        return [r["values"] if isinstance(r, dict) else r.values for r in result.data]
 
     def upsert(self, records: list[dict], namespace: str) -> None:
         """records: [{id, text, metadata}]"""

@@ -359,7 +359,9 @@ def build_synthesis_prompt(
         if callbacks:
             world_state_str += f"  Callbacks/recurring: {'; '.join(set(callbacks))}\n"
 
-    return f"""You are a senior video editor analyzing a complete merged timeline from parallel chunk analysis.
+    return f"""RESPOND WITH RAW JSON ONLY. YOUR ENTIRE RESPONSE MUST START WITH {{ AND END WITH }}. NO MARKDOWN. NO EXPLANATION. NO <think> BLOCKS. JUST THE JSON OBJECT.
+
+You are a senior video editor analyzing a complete merged timeline from parallel chunk analysis.
 
 Video ID: {video_label}
 Total duration: {total_duration:.1f}s
@@ -581,14 +583,14 @@ def synthesize_merged(
             {"role": "user", "content":
              "Generate the complete editorial intelligence layer for this video."},
         ],
-        "max_tokens": 16384,
-        "temperature": 0.1,
+        "max_tokens": 20480,
+        "temperature": 0.0,
         "response_format": {"type": "json_object"},
         "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
     }
 
     log(video_label, "Synthesis pass — text-only LLM call for conversation/story/editorial...")
-    raw_resp = post_vllm(payload, vllm_url, timeout=300)
+    raw_resp = post_vllm(payload, vllm_url, timeout=360)
     usage = raw_resp.get("usage", {})
     merged["_synth_tokens_in"]  = usage.get("prompt_tokens", 0)
     merged["_synth_tokens_out"] = usage.get("completion_tokens", 0)
@@ -596,13 +598,18 @@ def synthesize_merged(
     msg = raw_resp["choices"][0]["message"]
     raw = msg.get("content") or msg.get("reasoning") or ""
     if not raw:
-        log(video_label, "Synthesis returned empty — skipping (timeline still saved)")
+        log(video_label, "Synthesis returned EMPTY content — check model reasoning leak")
         return merged
+
+    # Show first 200 chars for debugging
+    preview = raw[:200].replace("\n", " ")
+    log(video_label, f"Synthesis raw preview: {preview!r}")
 
     try:
         synth = parse_robust(raw, f"{video_label}_synthesis")
     except Exception as e:
-        log(video_label, f"Synthesis parse failed ({e}) — timeline still saved")
+        log(video_label, f"Synthesis parse FAILED: {e}")
+        log(video_label, f"Synthesis raw (first 500): {raw[:500]!r}")
         return merged
 
     # Merge synthesis fields into the combined dict
@@ -1104,6 +1111,7 @@ def _plan_video_chunks(
         "safe_url":       safe_url,
         "video_url":      video_url,
         "total_duration": total_duration,
+        "cast_analysis":  cast_analysis,
         "t0":             t0,
     }
 
@@ -1259,6 +1267,7 @@ def _finalize_video(
     total_duration = plan["total_duration"]
     video_url      = plan["video_url"]
     label_fn       = plan["label_fn"]
+    cast_analysis  = plan.get("cast_analysis")
     map_wall       = dispatcher.metrics.get("total_wall_s", 0.0)
 
     if isinstance(raw_results, Exception):
@@ -1332,7 +1341,8 @@ def _finalize_video(
 
     # ── MERGE ─────────────────────────────────────────────────────────────────
     try:
-        merged = merge_chunks(chunk_results, video_label, video_url, total_duration)
+        merged = merge_chunks(chunk_results, video_label, video_url, total_duration,
+                              cast_analysis=cast_analysis)
     except Exception as e:
         log(video_label, f"merge_chunks CRASHED — {e}")
         return {"ok": False, "error": f"merge failed: {e}",
