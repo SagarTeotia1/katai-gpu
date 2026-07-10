@@ -2074,24 +2074,36 @@ def main() -> None:
                 f"All-video map done in {time.time() - t_map_all:.1f}s "
                 f"({sum(p['n_planned'] for p in video_plans.values())} chunks total)")
 
-            # Phase 3: Finalize per-video (parse/stub/merge/synth/save) — sequential,
-            # no GPU contention; synthesis uses one serial vLLM text-only call per video.
-            for v in videos:
-                label = v["label"]
-                if label not in video_plans:
-                    continue
-                raw_results, dispatcher = all_dispatch[label]
+            # Phase 3: Finalize ALL videos in parallel via ThreadPoolExecutor.
+            # Each thread runs: parse→merge→synthesize_merged→continuity_pass→save.
+            # Synthesis calls are text-only vLLM requests; running N at once is fine —
+            # vLLM batches them like any other requests and they carry no video frames.
+            finalize_labels = [v["label"] for v in videos if v["label"] in video_plans]
+
+            def _finalize_one(label: str) -> tuple[str, dict]:
+                raw_r, disp = all_dispatch[label]
                 try:
-                    results[label] = _finalize_video(
-                        label, video_plans[label], raw_results, dispatcher,
+                    r = _finalize_video(
+                        label, video_plans[label], raw_r, disp,
                         transcripts, out_dir, ts,
                         progress, progress_lock,
                         vllm_url, model_id,
                         context_mode=args.context_mode,
                     )
+                    return label, r
                 except Exception as exc:
-                    results[label] = {"ok": False, "error": str(exc)}
                     log(label, f"Finalize CRASHED — {exc}")
+                    return label, {"ok": False, "error": str(exc)}
+
+            t_fin = time.time()
+            log("finalize", f"Running synthesis for {len(finalize_labels)} videos in parallel...")
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=len(finalize_labels) or 1) as pool:
+                futs = {pool.submit(_finalize_one, lbl): lbl for lbl in finalize_labels}
+                for fut in as_completed(futs):
+                    lbl, r = fut.result()
+                    results[lbl] = r
+            log("finalize", f"All synthesis done in {time.time() - t_fin:.1f}s")
 
     wall = time.time() - t_wall
     ok   = sum(1 for r in results.values() if r.get("ok"))
