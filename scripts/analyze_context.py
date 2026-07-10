@@ -268,6 +268,7 @@ RULES:
 - Max event duration: 8 seconds
 - Events per window: {max(2, int((strict_end-strict_start)/6))}-{max(4, int((strict_end-strict_start)/3))} (clip-worthy moments only)
 - Skip filler dialogue, keep: laugh, reaction, punchline, surprise, emotional beat, topic shift
+- "moment" field: 8 words max, describe the VISUAL action (what you SEE, not what's said)
 
 PEOPLE:
 {person_db}
@@ -298,6 +299,7 @@ Return ONLY valid JSON — no prose, no markdown:
       "start": <float ≥ {strict_start:.2f}>,
       "end": <float ≤ {strict_end:.2f}>,
       "type": "<dialogue|reaction|laugh|joke|question|answer|transition>",
+      "moment": "<8 words max — what visually happens>",
       "visible_people": ["P001"],
       "speaker": "<person_id or null>",
       "transcript_text": "<exact words or empty>",
