@@ -29,7 +29,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -960,7 +959,9 @@ def _build_payload(
         "extra_body": {
             "top_k": 20,
             "chat_template_kwargs": {"enable_thinking": False},
-            "mm_processor_kwargs": {"fps": 2.0, "do_sample_frames": True},
+            # fps MUST match MM_FPS / VLLM_MM_FPS env so the budget assert
+            # (assert_chunks_fit_budget) reflects the actual encoder token cost.
+            "mm_processor_kwargs": {"fps": MM_FPS},
         },
     }
 

@@ -21,12 +21,57 @@ from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Import shared merge logic from chunk_analysis
 sys.path.insert(0, str(Path(__file__).parent))
-from chunk_analysis import (
-    probe, plan_chunks, split_transcript, merge,
-    post,
-)
+# merge from chunk_analysis handles _scene_id/_part_idx gracefully via .get(..., 0)
+from chunk_analysis import merge  # type: ignore
+
+
+# ── Local helpers (probe / plan / split_transcript / post) ────────────────────
+# Self-contained: fast_chunk_analysis uses dict-based chunks {chunk_id, start, end}
+# which differ from the Chunk dataclass in chunk_dispatch.
+
+
+def probe(video_url: str, backend: str, hint: float) -> float:
+    """Return video duration in seconds via ffprobe backend endpoint."""
+    if hint and hint > 0:
+        return hint
+    data = json.dumps({"video_url": video_url}).encode()
+    req = urllib.request.Request(
+        f"{backend.rstrip('/')}/api/video/probe",
+        data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return float(json.loads(resp.read()).get("duration_seconds", 0))
+
+
+def plan_chunks(duration: float, n: int) -> list[dict]:
+    """Equal-width dict-based chunk plan (chunk_id, start, end)."""
+    if n <= 0 or duration <= 0:
+        return []
+    seg = duration / n
+    return [{"chunk_id": i, "start": round(i * seg, 2), "end": round(min(duration, (i + 1) * seg), 2)}
+            for i in range(n)]
+
+
+def post(url: str, payload: dict, timeout: int = 900) -> dict:
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def split_transcript(transcript: str, chunks: list[dict], duration: float) -> dict[int, str]:
+    """Proportional transcript split for dict-based chunks."""
+    if not transcript or duration <= 0:
+        return {c["chunk_id"]: "" for c in chunks}
+    lines = transcript.strip().split("\n")
+    out: dict[int, str] = {}
+    for c in chunks:
+        s = int((c["start"] / duration) * len(lines))
+        e = int((c["end"] / duration) * len(lines))
+        out[c["chunk_id"]] = "\n".join(lines[s:e])
+    return out
 
 
 def analyze_chunk_fast(video_url: str, chunk: dict, duration: float, total: int,

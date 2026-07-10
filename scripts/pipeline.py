@@ -194,17 +194,17 @@ def parse_transcribe(line: str, m: dict) -> None:
 
 
 def parse_context(line: str, m: dict) -> None:
-    # "  [video1] Done — 820.1s | 67 events | ... → output/context_video1_<ts>.json"
-    g = re.search(r'\[(\w+)\] Done.*?→ (output/context_\S+\.json)', line)
+    # "  [label] ✓ COMPLETE 820.1s | 4/5 chunks | 67 events | ... → output/context_label_<ts>.json"
+    g = re.search(r'\[(\S+)\].*?→ (output/context_[^\s]+\.json)', line)
     if g:
         m.setdefault("done_videos", []).append(g.group(1))
         m.setdefault("output_files", []).append(g.group(2))
-    # "  2/2 videos analyzed | wall: 820.1s"
-    g2 = re.search(r'(\d+)/(\d+) videos analyzed', line)
+    # "  2/3 videos done | wall: 1200.1s | ..."
+    g2 = re.search(r'(\d+)/(\d+) videos done', line)
     if g2:
         m["done"]  = int(g2.group(1))
         m["total"] = int(g2.group(2))
-    # Fallback: any context_ path in the output
+    # Fallback: any context_ path anywhere in the line
     g3 = re.search(r'(output/context_[^\s]+\.json)', line)
     if g3:
         p = g3.group(1)
