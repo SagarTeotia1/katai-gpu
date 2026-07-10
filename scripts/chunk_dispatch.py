@@ -326,7 +326,7 @@ class WorkStealingQueue:
             if (self._heap
                     and self._splits_done < self._max_splits):
                 _, _, largest = self._heap[0]
-                if largest.strict_duration >= self._min_split_s * 2:
+                if largest.strict_duration >= self._min_split_s:
                     self._bisect(largest)
                     did_split = True
                     self._cond.notify_all()
