@@ -54,7 +54,7 @@ MODEL_ID    = "Qwen/Qwen3.6-27B"
 MAX_TOKENS  = 32768
 MAX_RETRIES    = 3               # per-chunk retry attempts (single-video path only)
 RETRY_DELAYS   = [5, 15]         # seconds before attempt 2, 3
-TOKEN_BUDGETS  = [20480, 14336, 8192]   # tokens per chunk attempt (shorter = less truncation)
+TOKEN_BUDGETS  = [10240, 7168, 4096]    # tokens per chunk attempt (shorter = less truncation)
 TIMEOUTS       = [900, 1200, 1500]      # timeout per chunk attempt (s)
 CHUNK_OVERLAP  = 3.0             # seconds of frame overlap each side for visual context
 DEFAULT_CHUNKS = 8               # chunks per video when --chunks not specified
@@ -276,8 +276,8 @@ NEVER create an event longer than 8 seconds.
 ════════════════════════════════════════════
 CRITICAL TIMELINE RULE
 ════════════════════════════════════════════
-For a {strict_end - strict_start:.0f}s window: expect {max(5, int((strict_end-strict_start)/2))}-{max(10, int((strict_end-strict_start)/1))} events.
-Every speaker change, laugh, reaction, pause >1s, interruption = separate event.
+For a {strict_end - strict_start:.0f}s window: expect {max(3, int((strict_end-strict_start)/4))}-{max(6, int((strict_end-strict_start)/2))} events.
+Only significant moments: speaker change, laugh, clear reaction, topic shift. Skip filler.
 
 ════════════════════════════════════════════
 PERSON DATABASE
@@ -320,33 +320,17 @@ OUTPUT — return ONLY valid JSON, no prose
       "start": <float ≥ {strict_start:.2f}>,
       "end": <float ≤ {strict_end:.2f}, max 8s after start>,
       "type": "<dialogue|reaction|laugh|interruption|pause|joke|question|answer|transition>",
-      "description": "<specific — what exactly happens>",
+      "description": "<15 words max — what exactly happens>",
       "visible_people": ["P001"],
       "speaker": "<person_id or null>",
       "speaker_confidence": <0.0-1.0>,
       "transcript_text": "<exact words or empty string>",
-      "topic": "<micro-topic>",
+      "topic": "<3 words max>",
       "listener_reactions": [{{"person_id": "P002", "reaction": "<laughing|nodding|surprised>"}}],
-      "body_language": {{
-        "P001": {{"pose": "<>", "gesture": "<>", "head": "<>", "facial": "<>", "energy": "<high|medium|low>"}}
-      }},
-      "camera": {{
-        "shot_type": "<wide|medium|close-up|over-shoulder|two-shot>",
-        "movement": "<static|zoom-in|zoom-out|pan-left|cut>"
-      }},
-      "audio": {{
-        "type": "<speech|laughter|silence|music|overlap>",
-        "notable": "<any notable audio event>"
-      }},
       "emotion": "<funny|tense|emotional|informative|awkward|excited|calm>",
       "scores": {{
         "importance": <0-10>, "hook": <0-10>, "clip": <0-10>,
         "viral": <0-10>, "emotion": <0-10>
-      }},
-      "editing_reasoning": {{
-        "should_keep": <true|false>,
-        "why": "<one sentence>",
-        "hook": "<what grabs attention>"
       }},
       "clip_worthy": <true|false>,
       "thumbnail_worthy": <true|false>
