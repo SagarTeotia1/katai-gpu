@@ -275,6 +275,12 @@ def main() -> None:
     parser.add_argument("--no-scene-align", action="store_true",
                         help="Disable scene-aligned LPT chunk planning for context step "
                              "(default: enabled). Use if PySceneDetect broken or debugging.")
+    parser.add_argument("--context-mode",
+                        choices=["parallel", "continuity", "sequential"],
+                        default="parallel",
+                        help="parallel=fastest (default); "
+                             "continuity=+single LLM dedup pass post-merge (~30s extra, cleaner people IDs); "
+                             "sequential=not yet implemented.")
     parser.add_argument("--chunk-bench", action="store_true",
                         help="Add Step 5 — run scripts/chunk_analysis.py per video "
                              "(async LPT scene-aligned dispatcher). Produces "
@@ -307,15 +313,16 @@ def main() -> None:
     summary_path = Path("output") / f"pipeline_{run_id}.json"
 
     summary: dict = {
-        "run_id":       run_id,
-        "cast_file":    str(cast_path),
-        "started_at":   started_at,
-        "completed_at": None,
-        "status":       "running",
-        "total_time_s": None,
-        "persons":      n_persons,
-        "videos":       n_videos,
-        "summary_file": str(summary_path),
+        "run_id":        run_id,
+        "cast_file":     str(cast_path),
+        "started_at":    started_at,
+        "completed_at":  None,
+        "status":        "running",
+        "total_time_s":  None,
+        "persons":       n_persons,
+        "videos":        n_videos,
+        "context_mode":  args.context_mode,
+        "summary_file":  str(summary_path),
         "steps": {
             "cast_analysis":    {"status": "pending"},
             "transcription":    {"status": "pending"},
@@ -349,6 +356,7 @@ def main() -> None:
     print(f"  Cast file  : {cast_path}", flush=True)
     print(f"  Persons    : {n_persons}  |  Crops: {n_crops}  |  Videos: {n_videos}", flush=True)
     print(f"  Run ID     : {run_id}", flush=True)
+    print(f"  Context    : --context-mode {args.context_mode}", flush=True)
     print(f"  Summary    : {summary_path}   ← check this anytime for progress", flush=True)
     print(f"{'─'*W}", flush=True)
     steps_info = [
@@ -492,7 +500,8 @@ def main() -> None:
                "--vllm", args.vllm,
                "--backend", args.backend,
                "--chunks", str(args.chunks),
-               "--workers", str(args.workers)]
+               "--workers", str(args.workers),
+               "--context-mode", args.context_mode]
         if not args.no_scene_align:
             cmd.append("--scene-align")
         if cast_analysis_file:
