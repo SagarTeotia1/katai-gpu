@@ -32,7 +32,7 @@ services:
       --max-num-seqs 16
       --enable-chunked-prefill
       --kv-cache-dtype fp8
-      --limit-mm-per-prompt video=1
+      --limit-mm-per-prompt '{"video":1}'
       --mm-processor-kwargs '{"max_pixels":602112,"fps":1}'
       --reasoning-parser qwen3
       --enable-auto-tool-choice
