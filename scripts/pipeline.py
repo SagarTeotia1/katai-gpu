@@ -358,7 +358,7 @@ def main() -> None:
     # ── Estimate wall time ────────────────────────────────────────────────────
     est_cast    = n_crops  * 55   # ~55s per crop (parallel across crops)
     est_trans   = n_videos * 210  # ~210s per video (sequential)
-    est_context = n_videos * 150  # ~150s: 26chunks × 2500tok natural / 334tok/s + tail + synthesis
+    est_context = n_videos * 180  # ~180s/video: 8chunks×2 videos=16 total × 2500tok/334tok/s + synthesis
     est_index   = 60
     # Cast + Whisper run in PARALLEL → wall = max(cast, whisper), not sum.
     est_cast_trans = max(

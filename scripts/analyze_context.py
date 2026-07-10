@@ -57,7 +57,7 @@ RETRY_DELAYS   = [5, 15]         # seconds before attempt 2, 3
 TOKEN_BUDGETS  = [6144, 4096, 2048]     # lean schema finishes ~2-3K naturally; 6144 ceiling = no truncation
 TIMEOUTS       = [900, 1200, 1500]      # timeout per chunk attempt (s)
 CHUNK_OVERLAP  = 3.0             # seconds of frame overlap each side for visual context
-DEFAULT_CHUNKS = 16              # chunks per video when --chunks not specified
+DEFAULT_CHUNKS = 8               # chunks per video when --chunks not specified
 # Hard ceiling on per-chunk duration.
 # Token math: ceil(chunk_s * fps / 2) * ceil(max_pixels / 196)
 # At fps=1, max_pixels=602112: ceil(18/2) * 3072 = 27648  (< 27852 safe budget = 0.85 × 32768)
@@ -279,9 +279,9 @@ RULES:
 - Output ONLY events where start >= {strict_start:.2f} AND end <= {strict_end:.2f}
 - All timestamps ABSOLUTE from video start (never relative to chunk)
 - Max event duration: 8 seconds
-- Events per window: {max(2, int((strict_end-strict_start)/6))}-{max(4, int((strict_end-strict_start)/3))} (clip-worthy moments only)
-- Skip filler dialogue, keep: laugh, reaction, punchline, surprise, emotional beat, topic shift
-- "moment" field: 8 words max, describe the VISUAL action (what you SEE, not what's said)
+- Events per window: {max(3, int((strict_end-strict_start)/6))}-{max(6, int((strict_end-strict_start)/3))} (keep all clear dialogue exchanges, reactions, topic shifts)
+- Keep ALL spoken exchanges with clear transcript text. Skip only truly silent gaps with no action or speech.
+- "moment" field: 8 words max — what happens visually or verbally (key visual OR key line said)
 
 PEOPLE:
 {person_db}
