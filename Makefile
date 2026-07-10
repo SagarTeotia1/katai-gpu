@@ -205,6 +205,15 @@ pipeline: ## ONE CMD — full pipeline: cast→transcript→context→index — 
 		--workers $(WORKERS) \
 		--whisper-workers $(WHISPER_WORKERS)
 
+pipeline-context: ## Skip cast+transcribe, run context+index only — usage: make pipeline-context CAST=cast.json
+	@python3 scripts/pipeline.py $(CAST) \
+		--skip-cast auto --skip-transcribe auto \
+		--backend http://localhost:$(BACKEND_PORT) \
+		--vllm http://localhost:$(VLLM_PORT)/v1/chat/completions \
+		--whisper http://localhost:$(WHISPER_PORT) \
+		--chunks $(CHUNKS) \
+		--planner $(PLANNER)
+
 pipeline-reindex: ## Re-run indexing only (skip all analysis) — usage: make pipeline-reindex CAST=cast.json
 	@python3 scripts/pipeline.py $(CAST) \
 		--skip-cast auto --skip-transcribe auto --skip-context \
