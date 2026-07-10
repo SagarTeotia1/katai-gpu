@@ -514,9 +514,11 @@ def main() -> None:
     else:
         section(3, 4, "Semantic Context Analysis", "RUNNING")
         print(f"  {yellow('Note:')} This step is GPU-bound (~{fmt_time(est_context)} estimated).", flush=True)
-        print(f"  Live chunk progress  →  {bold('output/progress_live.json')}", flush=True)
+        live_path = Path("output/progress_live.json").resolve()
+        print(f"  Live chunk progress  →  {bold(str(live_path))}", flush=True)
         print(f"  Pipeline summary     →  {summary_path}", flush=True)
-        print(f"  Watch live: {dim('watch -n 2 python3 -m json.tool output/progress_live.json')}\n", flush=True)
+        print(f"  Watch live (new terminal): {dim(f'watch -n 2 cat {live_path}')}", flush=True)
+        print(f"  Or one-shot:               {dim(f'cat {live_path}')}\n", flush=True)
 
         cmd = [PYTHON, SCRIPTS / "analyze_context.py",
                "--cast", cast_path,

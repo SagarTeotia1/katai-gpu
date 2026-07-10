@@ -9,7 +9,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -51,15 +53,32 @@ def detect_scene_cuts(
         return [0.0, float(duration)]
 
     t0 = time.time()
+    _tmp_path = None
     try:
-        video = open_video(video_url)
+        if video_url.startswith(("http://", "https://")):
+            suffix = Path(video_url.split("?")[0]).suffix or ".mp4"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+                _tmp_path = f.name
+            logger.info("scene_detect: downloading to %s", _tmp_path)
+            urllib.request.urlretrieve(video_url, _tmp_path)
+            src = _tmp_path
+        else:
+            src = video_url
+
+        video = open_video(src)
         sm = SceneManager()
         sm.add_detector(ContentDetector(threshold=threshold))
-        sm.detect_scenes(video, show_progress=False, frame_skip=1)
+        sm.detect_scenes(video, show_progress=False)
         scene_list = sm.get_scene_list()
     except Exception as exc:
         logger.warning("scene_detect: detection failed (%s) — falling back to [0, duration]", exc)
         return [0.0, float(duration)]
+    finally:
+        if _tmp_path:
+            try:
+                Path(_tmp_path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     cuts: set[float] = {0.0, float(duration)}
     for start, end in scene_list:

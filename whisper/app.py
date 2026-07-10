@@ -45,13 +45,13 @@ def _load_model() -> WhisperModel:
             cpu_threads=n_threads,
         )
     else:
-        n_threads = os.cpu_count() or 4
-        logger.info("Loading Whisper %s on CPU int8 (%d threads)...", MODEL_SIZE, n_threads)
+        n_threads = (os.cpu_count() or 4) // 2 or 2
+        logger.info("Loading Whisper %s on CPU int8_float32 (%d threads per worker)...", MODEL_SIZE, n_threads)
         m = WhisperModel(
             MODEL_SIZE,
             device="cpu",
-            compute_type="int8",
-            num_workers=1,
+            compute_type="int8_float32",
+            num_workers=2,
             cpu_threads=n_threads,
         )
     logger.info("Whisper model ready.")
@@ -61,7 +61,7 @@ def _load_model() -> WhisperModel:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _model, _transcribe_sem
-    _transcribe_sem = asyncio.Semaphore(1)  # one transcription at a time (cpu_threads already uses all cores)
+    _transcribe_sem = asyncio.Semaphore(2)  # 2 parallel transcriptions; each worker gets cpu_count//2 threads
     loop = asyncio.get_running_loop()
     _model = await loop.run_in_executor(None, _load_model)
     yield
@@ -75,7 +75,7 @@ app = FastAPI(title="Whisper Transcription Service", lifespan=lifespan)
 class TranscribeRequest(BaseModel):
     video_url: str = Field(..., description="Public video URL (mp4, mov, etc.)")
     language: Optional[str] = Field(None, description="ISO 639-1 code — None = auto-detect")
-    beam_size: int = Field(1, ge=1, le=10)
+    beam_size: int = Field(5, ge=1, le=10)
     vad_filter: bool = Field(True, description="Skip silence segments")
     word_timestamps: bool = Field(False, description="Include word-level timestamps (slower)")
 
