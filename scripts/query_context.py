@@ -223,8 +223,34 @@ class GraphExpander:
             "containing_clips": clips,
         }
 
+    def get_video_summary(self, video_id: str) -> list[dict]:
+        """Pull full video context node for summary queries."""
+        return self._run("""
+            MATCH (v:Video {id:$vid})
+            OPTIONAL MATCH (p:Person)-[:APPEARS_IN]->(v)
+            RETURN v.id AS video_id, v.url AS url, v.duration_s AS duration_s,
+                   v.format AS format, v.language AS language,
+                   v.context AS overall_context,
+                   collect(DISTINCT {id: p.id, name: p.name, role: p.role,
+                                     screen_time: p.screen_time_s}) AS cast
+        """, {"vid": video_id})
+
+    def get_all_clips(self, video_id: str = None) -> list[dict]:
+        """Pull all clips from all videos (or one video) regardless of score."""
+        where = "WHERE v.id = $vid" if video_id else ""
+        params = {"vid": video_id} if video_id else {}
+        return self._run(f"""
+            MATCH (c:Clip)-[:CLIP_OF]->(v:Video)
+            {where}
+            RETURN c.id AS id, c.title AS title, c.start AS start, c.end AS end,
+                   c.duration_s AS duration_s, c.platform AS platform,
+                   c.clip_score AS clip_score, c.viral_score AS viral_score,
+                   c.hook AS hook, c.why AS why_complete, v.id AS video_id
+            ORDER BY c.clip_score DESC LIMIT 20
+        """, params)
+
     def get_clip_candidates(self, video_id: str = None,
-                            min_clip_score: float = 7.0,
+                            min_clip_score: float = 4.0,
                             platform: str = None) -> list[dict]:
         filters = ["c.clip_score >= $min_score"]
         params  = {"min_score": min_clip_score}
@@ -270,23 +296,25 @@ class GraphExpander:
 
 # ── LLM synthesis ─────────────────────────────────────────────────────────────
 
-SYNTHESIS_PROMPT = """RESPOND WITH RAW JSON ONLY. YOUR ENTIRE RESPONSE MUST START WITH { AND END WITH }. NO MARKDOWN, NO EXPLANATION, NO <think> BLOCKS.
+SYNTHESIS_PROMPT = """RESPOND WITH RAW JSON ONLY. YOUR ENTIRE RESPONSE MUST START WITH {{ AND END WITH }}. NO MARKDOWN, NO EXPLANATION, NO <think> BLOCKS.
 
-You are a precise video editing assistant. You have been given semantic search results and knowledge graph data for a video.
+You are a precise video editing assistant with full knowledge of the indexed video content.
 
 USER QUERY: {query}
 
-SEMANTIC SEARCH RESULTS (ranked by relevance):
+SEMANTIC SEARCH RESULTS (ranked by relevance — entity types: timeline_event, clip, highlight, scene, conversation_turn, video_summary, person, world_state, story_arc):
 {search_results}
 
 GRAPH CONTEXT (relationships, dependencies, people):
 {graph_context}
 
-Synthesize this into a precise, actionable answer. Return ONLY valid JSON in this exact format:
+Use ALL the context above to give a precise, complete answer. For questions about the video content, use video_summary and editorial data. For specific moments, use timeline_events. For best clips, use clip/highlight entities.
+
+Return ONLY valid JSON:
 
 {{
   "query": "{query}",
-  "answer_summary": "1-3 sentence direct answer to the query",
+  "answer_summary": "2-4 sentence direct answer using actual content from search results",
   "results": [
     {{
       "rank": 1,
@@ -295,20 +323,20 @@ Synthesize this into a precise, actionable answer. Return ONLY valid JSON in thi
       "end": 18.3,
       "duration_s": 5.8,
       "title": "short descriptive title",
-      "why_relevant": "why this matches the query",
+      "why_relevant": "specific reason this matches the query",
       "speakers": ["person name"],
       "transcript": "what was said",
       "clip_score": 8.5,
-      "depends_on": ["event_id_1"],
-      "depends_on_descriptions": ["what must be included before this for context"],
-      "entity_type": "timeline_event|clip|scene|highlight"
+      "entity_type": "timeline_event|clip|scene|highlight|video_summary|person|world_state",
+      "depends_on": [],
+      "depends_on_descriptions": []
     }}
   ],
   "editing_notes": "practical advice for using these results in editing",
   "total_matches": 5
 }}
 
-Order results by relevance to the query. Include dependency info only if depends_on is non-empty."""
+Order by relevance. If query asks about the whole video, lead with video_summary result. If about a person, lead with person entity then their timeline events."""
 
 
 def post_vllm(payload: dict, vllm_url: str, timeout: int = 120) -> str:
@@ -411,16 +439,25 @@ def main():
             expander = GraphExpander()
             graph_ctx = expander.expand_events(event_ids)
 
-            # Pull relationship summaries for non-event queries
             q_lower = query.lower()
+
+            # Always pull video summary from Neo4j — anchors all queries in video context
+            video_ids_in_hits = list({
+                h["metadata"].get("video_id") for h in hits if h["metadata"].get("video_id")
+            })
+            for vid in video_ids_in_hits[:3]:
+                summary = expander.get_video_summary(vid)
+                if summary:
+                    graph_ctx.setdefault("video_summaries", []).extend(summary)
+
+            # Relationship-specific expansions
             if any(w in q_lower for w in ["interrupt", "interruption"]):
                 graph_ctx["interruptions"] = expander.get_interruptions(args.video)
             if any(w in q_lower for w in ["agree", "disagree", "argument", "debate"]):
                 graph_ctx["agreements_disagreements"] = expander.get_agreements_disagreements(args.video)
-            if any(w in q_lower for w in ["clip", "reel", "short", "youtube", "instagram"]):
-                graph_ctx["clip_candidates"] = expander.get_clip_candidates(
-                    video_id=args.video
-                )
+            if any(w in q_lower for w in ["clip", "reel", "short", "youtube", "instagram",
+                                           "edit", "cut", "best", "highlight", "funny"]):
+                graph_ctx["clip_candidates"] = expander.get_all_clips(video_id=args.video)
 
             expander.close()
             node_count = sum(len(v) for v in graph_ctx.values() if isinstance(v, list))

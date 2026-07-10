@@ -128,6 +128,78 @@ def build_turn_text(turn: dict, video_id: str, person_map: dict) -> str:
     ).strip()
 
 
+def build_video_summary_text(ctx: dict, video_id: str) -> str:
+    meta = ctx.get("video_metadata") or {}
+    ed   = ctx.get("editorial_summary") or {}
+    story = ctx.get("story") or {}
+    topics = ", ".join(ed.get("main_topics") or [])
+    key_moments = " | ".join(
+        f"{km.get('timestamp_s',0):.1f}s: {km.get('description','')}"
+        for km in (ed.get("key_moments") or [])[:5]
+    )
+    hook = (story.get("hook") or {}).get("description", "")
+    ending = (story.get("ending") or {}).get("description", "")
+    return (
+        f"Video:{video_id} FULL SUMMARY\n"
+        f"What this video is: {meta.get('overall_context','')}\n"
+        f"Format:{meta.get('format','')} Language:{meta.get('language','')} "
+        f"Duration:{meta.get('duration_s',0):.1f}s Setting:{meta.get('setting','')}\n"
+        f"Main topics: {topics}\n"
+        f"Overall summary: {ed.get('overall_summary','')}\n"
+        f"Emotional arc: {ed.get('emotional_arc','')}\n"
+        f"Hook: {hook}\n"
+        f"Key moments: {key_moments}\n"
+        f"Ending: {ending}\n"
+        f"Viral potential: {ed.get('viral_potential','')} "
+        f"Best clip: {(ed.get('best_clip') or {}).get('reason','')}\n"
+        f"Suggested title: {ed.get('suggested_title','')}"
+    ).strip()
+
+
+def build_person_text(person: dict, video_id: str) -> str:
+    app = person.get("appearance") or {}
+    return (
+        f"Video:{video_id} Person:{person.get('display_name', person.get('person_id',''))}\n"
+        f"ID:{person.get('person_id','')} Role:{person.get('role_in_video','')}\n"
+        f"Appearance: {app.get('clothing','')} | hair:{app.get('hair','')} "
+        f"| facial_hair:{app.get('facial_hair','')} | accessories:{app.get('accessories','')}\n"
+        f"Screen time:{person.get('screen_time_s',0):.1f}s "
+        f"Speaking time:{person.get('speaking_time_s',0):.1f}s\n"
+        f"Mood arc: {person.get('mood_arc','')}\n"
+        f"Voice: {person.get('voice_characteristics','')}"
+    ).strip()
+
+
+def build_world_state_text(ws: dict, video_id: str) -> str:
+    loops = ws.get("open_loops") or []
+    cbs   = ws.get("callbacks") or []
+    if isinstance(loops, str):
+        loops = [loops]
+    if isinstance(cbs, str):
+        cbs = [cbs]
+    return (
+        f"Video:{video_id} World State Time:{ws.get('start',0):.1f}s-{ws.get('end',0):.1f}s\n"
+        f"Story stage:{ws.get('story_stage','')} Emotion:{ws.get('scene_emotion','')} "
+        f"Energy:{ws.get('energy','')} Topic:{ws.get('current_topic','')}\n"
+        f"Open loops: {'; '.join(loops)}\n"
+        f"Callbacks/recurring: {'; '.join(cbs)}"
+    ).strip()
+
+
+def build_story_text(story: dict, video_id: str) -> str:
+    parts = []
+    for key in ("hook", "setup", "conflict", "escalation", "resolution", "ending"):
+        sec = story.get(key) or {}
+        if isinstance(sec, dict) and (sec.get("description") or sec.get("present")):
+            start = sec.get("start", sec.get("timestamp_s", 0))
+            end   = sec.get("end", 0)
+            desc  = sec.get("description", "")
+            parts.append(f"{key.upper()} [{start:.1f}s-{end:.1f}s]: {desc}")
+    return (
+        f"Video:{video_id} Story Arc\n" + "\n".join(parts)
+    ).strip()
+
+
 # ── Pinecone indexer ──────────────────────────────────────────────────────────
 
 class PineconeIndexer:
@@ -283,6 +355,79 @@ class PineconeIndexer:
                     "start":         float(turn.get("start", 0)),
                     "end":           float(turn.get("end", 0)),
                     "text":          _safe_str(turn.get("text"), 500),
+                },
+            })
+
+        # Video summary (1 vector — answers "what is this video about")
+        meta = ctx.get("video_metadata") or {}
+        ed   = ctx.get("editorial_summary") or {}
+        if meta or ed:
+            records.append({
+                "id": f"{video_id}_summary",
+                "text": build_video_summary_text(ctx, video_id),
+                "metadata": {
+                    "video_id":       video_id,
+                    "entity_type":    "video_summary",
+                    "start":          0.0,
+                    "end":            float(meta.get("duration_s", 0)),
+                    "title":          _safe_str(ed.get("suggested_title") or meta.get("overall_context"), 200),
+                    "description":    _safe_str(ed.get("overall_summary"), 500),
+                    "format":         _safe_str(meta.get("format")),
+                    "language":       _safe_str(meta.get("language")),
+                    "viral_potential": _safe_str(ed.get("viral_potential")),
+                    "emotional_arc":  _safe_str(ed.get("emotional_arc"), 300),
+                    "main_topics":    json.dumps(ed.get("main_topics") or []),
+                },
+            })
+
+        # Person descriptions (1 vector per person — answers "who is X")
+        for p in known_people:
+            if p.get("display_name") or p.get("role_in_video") or p.get("appearance"):
+                pid = p["person_id"]
+                records.append({
+                    "id": f"{video_id}_person_{pid}",
+                    "text": build_person_text(p, video_id),
+                    "metadata": {
+                        "video_id":       video_id,
+                        "entity_type":    "person",
+                        "person_id":      _safe_str(pid),
+                        "person_name":    _safe_str(p.get("display_name", pid)),
+                        "role":           _safe_str(p.get("role_in_video"), 200),
+                        "screen_time_s":  float(p.get("screen_time_s") or 0),
+                        "speaking_time_s": float(p.get("speaking_time_s") or 0),
+                    },
+                })
+
+        # World state entries (answer "when was energy high", "what was discussed at X")
+        for i, ws in enumerate(ctx.get("world_state_timeline") or []):
+            records.append({
+                "id": f"{video_id}_ws_{i:04d}",
+                "text": build_world_state_text(ws, video_id),
+                "metadata": {
+                    "video_id":     video_id,
+                    "entity_type":  "world_state",
+                    "start":        float(ws.get("start", 0)),
+                    "end":          float(ws.get("end", 0)),
+                    "story_stage":  _safe_str(ws.get("story_stage")),
+                    "emotion":      _safe_str(ws.get("scene_emotion")),
+                    "energy":       _safe_str(ws.get("energy")),
+                    "topic":        _safe_str(ws.get("current_topic"), 200),
+                },
+            })
+
+        # Story arc (answer "what was the hook", "how did it end")
+        story = ctx.get("story") or {}
+        if any(story.get(k) for k in ("hook", "setup", "resolution", "ending")):
+            records.append({
+                "id": f"{video_id}_story",
+                "text": build_story_text(story, video_id),
+                "metadata": {
+                    "video_id":    video_id,
+                    "entity_type": "story_arc",
+                    "start":       0.0,
+                    "end":         float(meta.get("duration_s", 0)),
+                    "title":       "Story Arc",
+                    "description": _safe_str(build_story_text(story, video_id), 500),
                 },
             })
 
