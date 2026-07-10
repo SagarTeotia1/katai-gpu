@@ -532,7 +532,6 @@ def main() -> None:
                "--vllm", args.vllm,
                "--backend", args.backend,
                "--chunks", str(args.chunks),
-               "--workers", str(args.workers),
                "--context-mode", args.context_mode,
                "--output", "output"]
         if not args.no_scene_align:
