@@ -47,6 +47,11 @@ TOKEN_BUDGETS  = [20480, 14336, 8192]   # tokens per chunk attempt (shorter = le
 TIMEOUTS       = [900, 1200, 1500]      # timeout per chunk attempt (s)
 CHUNK_OVERLAP  = 3.0             # seconds of frame overlap each side for visual context
 DEFAULT_CHUNKS = 4               # chunks per video when --chunks not specified
+# Hard ceiling on per-chunk duration. At fps=1, max_pixels=602112 (Qwen2.5-VL 14x14 patches,
+# temporal_patch_size=2): tokens/chunk ~= chunk_s * 384. 20s -> ~7680 embed tokens, fits
+# even the default vLLM encoder cache (8192). Prevents encoder-cache overflow regardless
+# of --max-num-batched-tokens on the server.
+MAX_CHUNK_S    = 20.0
 FRACTURE_SPLIT = 2               # sub-chunks to split into when attempt 1 times out/fails
 
 _THINK_RE   = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -199,7 +204,12 @@ def plan_chunks(duration: float, n: int) -> list[dict]:
     """
     Equal-width fallback splitter — retained for --scene-align=off compatibility.
     Splits [0, duration] into n chunks with CHUNK_OVERLAP on each side.
+    Auto-bumps n so per-chunk strict window <= MAX_CHUNK_S (encoder-cache safety).
     """
+    import math
+    min_n_for_cap = max(1, math.ceil(duration / MAX_CHUNK_S))
+    if n < min_n_for_cap:
+        n = min_n_for_cap
     seg = duration / n
     chunks = []
     for i in range(n):
@@ -221,8 +231,8 @@ def plan_chunks_scene_aligned(
     video_url: str,
     duration: float,
     n_hint: int,
-    min_s: float = 10.0,
-    max_s: float = 30.0,
+    min_s: float = 8.0,
+    max_s: float = MAX_CHUNK_S,
 ) -> list[dict]:
     """Scene-aligned splitter. Returns chunks sorted by strict duration DESC (LPT).
 

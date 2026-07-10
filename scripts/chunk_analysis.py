@@ -632,8 +632,8 @@ def main() -> None:
     parser.add_argument("--transcript", default="", help="Path to transcript .txt file")
     parser.add_argument("--backend", default="http://localhost:8080")
     parser.add_argument("--out", default="output")
-    parser.add_argument("--min-s", type=float, default=10.0)
-    parser.add_argument("--max-s", type=float, default=30.0)
+    parser.add_argument("--min-s", type=float, default=8.0)
+    parser.add_argument("--max-s", type=float, default=20.0)
     parser.add_argument("--overlap-s", type=float, default=2.0)
     args = parser.parse_args()
 
