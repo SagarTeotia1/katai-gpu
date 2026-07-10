@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     # Chunk analysis — shorter per-chunk budget; json-repair handles truncation
     video_chunk_max_tokens: int = 8192
     # 1 fps = 1 frame/s; fewer prompt tokens → faster prefill + generation start
-    video_fps: float = 1.0
+    video_fps: float = 0.5
 
     # Server
     host: str = "0.0.0.0"
