@@ -90,6 +90,10 @@ def _fmt_dur(s: float) -> str:
 # ── JSON helpers ──────────────────────────────────────────────────────────────
 
 def parse_robust(raw: str, ctx: str = "") -> dict:
+    """Parse model output as JSON. Tries direct parse, then json-repair on truncated output.
+
+    Prints a warning if repaired JSON contains 0 timeline events (severe truncation).
+    """
     raw = _THINK_RE.sub("", raw).strip()
     try:
         return json.loads(raw)
@@ -103,6 +107,13 @@ def parse_robust(raw: str, ctx: str = "") -> dict:
         repaired = repair_json(fragment, return_objects=True)
         if isinstance(repaired, dict) and repaired:
             print(f"  [{ctx}] JSON was truncated — repaired successfully", flush=True)
+            event_count = len(repaired.get("timeline", []))
+            if event_count == 0:
+                print(
+                    f"  [{ctx}] WARN: 0 events after repair — chunk was severely truncated, "
+                    f"quality degraded",
+                    flush=True,
+                )
             return repaired
     raise ValueError(f"{ctx}: JSON parse failed. Preview: {fragment[:300]}")
 
@@ -262,7 +273,7 @@ def build_chunk_system_prompt(
 
 You are a semantic video analysis engine. ONE CHUNK of a video.
 
-Video: {video_label} | Chunk {chunk_id + 1}/{total_chunks} | Window: {strict_start:.2f}s→{strict_end:.2f}s | Total: {total_duration:.2f}s
+Video: {video_label} | Window: {strict_start:.2f}s→{strict_end:.2f}s of {total_duration:.2f}s total
 
 RULES:
 - Output ONLY events where start >= {strict_start:.2f} AND end <= {strict_end:.2f}
@@ -1985,10 +1996,7 @@ def main() -> None:
 
     total_agents = sum(chunk_alloc.values()) if n_chunks > 1 else n
     # Sequential video processing — chunk-level parallelism (MAX_INFLIGHT) saturates GPU.
-    # args.workers is retained only as a deprecated no-op flag.
-    if args.workers:
-        print(f"  [warn] --workers={args.workers} is deprecated; ignored. "
-              f"MAX_INFLIGHT={MAX_INFLIGHT} bounds chunk concurrency.", flush=True)
+    # args.workers is retained only as a deprecated no-op flag; silently ignored.
 
     # ── Header ────────────────────────────────────────────────────────────────
     print(f"\n{'='*62}")

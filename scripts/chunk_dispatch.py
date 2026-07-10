@@ -656,6 +656,18 @@ class ChunkDispatcher:
         }
         return results
 
+    @staticmethod
+    def _validate_response(response: dict) -> None:
+        """Raise ValueError if response content is prose instead of JSON."""
+        msg = response.get("choices", [{}])[0].get("message", {})
+        content = msg.get("content") or msg.get("reasoning") or ""
+        stripped = content.strip()
+        if not stripped:
+            raise ValueError("empty response content")
+        if not stripped.startswith("{"):
+            preview = stripped[:120].replace("\n", " ")
+            raise ValueError(f"model output prose, no JSON found. Preview: {preview}")
+
     async def _request_with_retry(
         self,
         client: httpx.AsyncClient,
@@ -677,9 +689,11 @@ class ChunkDispatcher:
                         request=r.request, response=r,
                     )
                 r.raise_for_status()
-                return r.json()
+                response = r.json()
+                self._validate_response(response)
+                return response
             except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout,
-                    httpx.PoolTimeout, httpx.HTTPStatusError) as exc:
+                    httpx.PoolTimeout, httpx.HTTPStatusError, ValueError) as exc:
                 last_exc = exc
                 if attempt >= self.retries:
                     break
