@@ -99,12 +99,23 @@ def run_step(
     )
     try:
         assert proc.stdout
+        _last_progress = False
         for line in proc.stdout:
             line = line.rstrip()
             lines.append(line)
-            print(f"{indent}{line}", flush=True)
+            is_prog = "[progress]" in line
+            if is_prog:
+                print(f"\r{indent}{line}   ", end="", flush=True)
+                _last_progress = True
+            else:
+                if _last_progress:
+                    print()   # finish the progress line before next normal line
+                    _last_progress = False
+                print(f"{indent}{line}", flush=True)
             if parse_fn:
                 parse_fn(line, metrics)
+        if _last_progress:
+            print()
     except KeyboardInterrupt:
         proc.terminate()
         raise
@@ -204,6 +215,11 @@ def parse_context(line: str, m: dict) -> None:
     if g2:
         m["done"]  = int(g2.group(1))
         m["total"] = int(g2.group(2))
+    # "[progress] [████░░] 8/26 chunks | video1:6/18 ..."
+    g4 = re.search(r'\[progress\].*?(\d+)/(\d+) chunks', line)
+    if g4:
+        m["chunks_done"]  = int(g4.group(1))
+        m["chunks_total"] = int(g4.group(2))
     # Fallback: any context_ path anywhere in the line
     g3 = re.search(r'(output/context_[^\s]+\.json)', line)
     if g3:

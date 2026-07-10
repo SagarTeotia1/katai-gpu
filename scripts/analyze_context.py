@@ -80,6 +80,13 @@ def log(label: str, msg: str, flush: bool = True) -> None:
         print(f"  [{label}] {msg}", flush=flush)
 
 
+def _fmt_dur(s: float) -> str:
+    s = int(s)
+    if s < 60:   return f"{s}s"
+    if s < 3600: return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60}m"
+
+
 # ── JSON helpers ──────────────────────────────────────────────────────────────
 
 def parse_robust(raw: str, ctx: str = "") -> dict:
@@ -1090,6 +1097,7 @@ def _plan_video_chunks(
 async def _dispatch_all_async(
     video_plans: dict,
     vllm_url: str,
+    progress_path: "Path | None" = None,
 ) -> dict:
     """Dispatch ALL videos' chunks concurrently under ONE shared Semaphore(MAX_INFLIGHT).
 
@@ -1100,6 +1108,60 @@ async def _dispatch_all_async(
     Returns {label: (raw_results_list, dispatcher)} for each video.
     """
     shared_sem = asyncio.Semaphore(MAX_INFLIGHT)
+    total_chunks = sum(p["n_planned"] for p in video_plans.values())
+    t0_dispatch   = time.time()
+
+    # Per-video progress counters (updated inside log_fn which runs in threads)
+    _prog_lock = threading.Lock()
+    _prog: dict = {
+        lbl: {"done": 0, "failed": 0, "total": plan["n_planned"]}
+        for lbl, plan in video_plans.items()
+    }
+    _total_done = [0]  # mutable via list
+
+    def _log_with_progress(label: str, msg: str) -> None:
+        _log_thread_safe(label, msg)
+        is_ok    = msg.startswith("OK ")
+        is_stub  = msg.startswith("stubbed")
+        if not (is_ok or is_stub):
+            return
+        video_lbl = label.split("/")[0] if "/" in label else label
+        with _prog_lock:
+            if video_lbl in _prog:
+                _prog[video_lbl]["done"] += 1
+                if is_stub:
+                    _prog[video_lbl]["failed"] += 1
+            _total_done[0] += 1
+            done = _total_done[0]
+            snap = {lbl: dict(v) for lbl, v in _prog.items()}
+
+        elapsed = time.time() - t0_dispatch
+        rate    = done / max(elapsed, 1)
+        eta     = (total_chunks - done) / max(rate, 0.001)
+        bar_w   = 24
+        filled  = int(bar_w * done / total_chunks)
+        bar_str = "█" * filled + "░" * (bar_w - filled)
+        vid_str = "  ".join(f"{lbl}:{v['done']}/{v['total']}" for lbl, v in snap.items())
+
+        log("progress",
+            f"[{bar_str}] {done}/{total_chunks} chunks | {vid_str} | "
+            f"elapsed {_fmt_dur(elapsed)} | ETA ~{_fmt_dur(eta)}")
+
+        if progress_path:
+            try:
+                live = {
+                    "total_chunks":  total_chunks,
+                    "chunks_done":   done,
+                    "chunks_failed": sum(v["failed"] for v in snap.values()),
+                    "pct":           round(100 * done / total_chunks, 1),
+                    "elapsed_s":     round(elapsed, 1),
+                    "eta_s":         round(eta, 1),
+                    "videos": snap,
+                    "updated_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                progress_path.write_text(json.dumps(live, indent=2), encoding="utf-8")
+            except Exception:
+                pass
 
     dispatchers: dict = {}
     label_order: list[str] = []
@@ -1117,11 +1179,10 @@ async def _dispatch_all_async(
         label_order.append(label)
         coros.append(disp.run(
             plan["chunks"], plan["build_payload"],
-            label_fn=plan["label_fn"], log_fn=_log_thread_safe,
+            label_fn=plan["label_fn"], log_fn=_log_with_progress,
             shared_sem=shared_sem,
         ))
 
-    total_chunks = sum(p["n_planned"] for p in video_plans.values())
     log("dispatch", f"Firing {total_chunks} chunks across {len(video_plans)} videos "
         f"(shared Semaphore={MAX_INFLIGHT})")
 
@@ -1947,7 +2008,9 @@ def main() -> None:
         # from ANY other video → GPU stays at max_inflight at all times.
         if video_plans:
             t_map_all = time.time()
-            all_dispatch = asyncio.run(_dispatch_all_async(video_plans, vllm_url))
+            progress_live = out_dir / "progress_live.json"
+            all_dispatch = asyncio.run(_dispatch_all_async(video_plans, vllm_url,
+                                                           progress_path=progress_live))
             log("dispatch",
                 f"All-video map done in {time.time() - t_map_all:.1f}s "
                 f"({sum(p['n_planned'] for p in video_plans.values())} chunks total)")
