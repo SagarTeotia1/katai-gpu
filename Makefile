@@ -185,7 +185,7 @@ transcribe-urls: ## Transcribe raw video URLs — usage: make transcribe-urls VI
 	@python3 scripts/transcribe.py --videos $(VIDS) --whisper http://localhost:$(WHISPER_PORT)
 
 WORKERS ?= 24
-CHUNKS  ?= 8
+CHUNKS  ?= 16
 
 analyze-context: ## Full semantic video context — usage: make analyze-context CAST=cast.json CHUNKS=4
 	@python3 scripts/analyze_context.py --cast $(CAST) \

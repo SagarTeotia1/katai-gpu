@@ -285,8 +285,8 @@ def main() -> None:
                         help="Skip transcription. Pass file path or 'auto' to use latest.")
     parser.add_argument("--skip-context",    action="store_true",
                         help="Skip context analysis — use existing output/context_*.json")
-    parser.add_argument("--chunks",   type=int, default=8,
-                        help="Chunks per video for context analysis (default 8). "
+    parser.add_argument("--chunks",   type=int, default=16,
+                        help="Chunks per video for context analysis (default 16). "
                              "Higher = faster but more GPU concurrency.")
     parser.add_argument("--workers",  type=int, default=24,
                         help="Max parallel local agents across all chunks (default 24).")

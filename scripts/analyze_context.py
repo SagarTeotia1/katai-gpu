@@ -57,7 +57,7 @@ RETRY_DELAYS   = [5, 15]         # seconds before attempt 2, 3
 TOKEN_BUDGETS  = [20480, 14336, 8192]   # tokens per chunk attempt (shorter = less truncation)
 TIMEOUTS       = [900, 1200, 1500]      # timeout per chunk attempt (s)
 CHUNK_OVERLAP  = 3.0             # seconds of frame overlap each side for visual context
-DEFAULT_CHUNKS = 4               # chunks per video when --chunks not specified
+DEFAULT_CHUNKS = 8               # chunks per video when --chunks not specified
 # Hard ceiling on per-chunk duration.
 # Token math: ceil(chunk_s * fps / 2) * ceil(max_pixels / 196)
 # At fps=1, max_pixels=602112: ceil(18/2) * 3072 = 27648  (< 27852 safe budget = 0.85 × 32768)
@@ -1134,7 +1134,8 @@ async def _dispatch_all_async(
         is_ok    = msg.startswith("OK ")
         is_stub  = msg.startswith("stubbed")
         is_split = "adaptive split" in msg
-        if not (is_ok or is_stub or is_split):
+        is_fail  = msg.startswith("FAIL ")
+        if not (is_ok or is_stub or is_split or is_fail):
             return
         video_lbl = label.split("/")[0] if "/" in label else label
         import re as _re
@@ -1147,12 +1148,17 @@ async def _dispatch_all_async(
                 if video_lbl in _prog:
                     _prog[video_lbl]["total"] += 1
                 return
-            if video_lbl in _prog:
-                _prog[video_lbl]["done"] += 1
-                if is_stub:
+            if is_fail:
+                if video_lbl in _prog:
+                    _prog[video_lbl]["done"]   += 1
                     _prog[video_lbl]["failed"] += 1
-            if _pf: _tokens_prefill[0] += int(_pf.group(1))
-            if _dc: _tokens_decode[0]  += int(_dc.group(1))
+            else:
+                if video_lbl in _prog:
+                    _prog[video_lbl]["done"] += 1
+                    if is_stub:
+                        _prog[video_lbl]["failed"] += 1
+                if _pf: _tokens_prefill[0] += int(_pf.group(1))
+                if _dc: _tokens_decode[0]  += int(_dc.group(1))
             _total_done[0] += 1
             done  = _total_done[0]
             total = _total_seen[0]
