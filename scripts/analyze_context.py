@@ -967,7 +967,7 @@ def _plan_video_chunks(
     if scene_align:
         chunks = plan_chunks_scene_aligned(
             video_url, total_duration,
-            min_s=8.0, max_s=MAX_CHUNK_S, overlap_s=CHUNK_OVERLAP,
+            min_s=5.0, max_s=MAX_CHUNK_S, overlap_s=CHUNK_OVERLAP,
         )
         log(video_label,
             f"Scene-aligned: {len(chunks)} chunks "
@@ -1501,7 +1501,7 @@ def analyze_video_chunked(
     if scene_align:
         chunks = plan_chunks_scene_aligned(
             video_url, total_duration,
-            min_s=8.0, max_s=MAX_CHUNK_S, overlap_s=CHUNK_OVERLAP,
+            min_s=5.0, max_s=MAX_CHUNK_S, overlap_s=CHUNK_OVERLAP,
         )
         log(video_label,
             f"Scene-aligned: {len(chunks)} chunks "
