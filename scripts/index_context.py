@@ -128,22 +128,31 @@ def build_turn_text(turn: dict, video_id: str, person_map: dict) -> str:
     ).strip()
 
 
+def _f(v) -> float:
+    """Safe float conversion — returns 0.0 for None/empty/non-numeric."""
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def build_video_summary_text(ctx: dict, video_id: str) -> str:
-    meta = ctx.get("video_metadata") or {}
-    ed   = ctx.get("editorial_summary") or {}
+    meta  = ctx.get("video_metadata") or {}
+    ed    = ctx.get("editorial_summary") or {}
     story = ctx.get("story") or {}
-    topics = ", ".join(ed.get("main_topics") or [])
+    topics = ", ".join(t for t in (ed.get("main_topics") or []) if isinstance(t, str))
     key_moments = " | ".join(
-        f"{km.get('timestamp_s',0):.1f}s: {km.get('description','')}"
+        f"{_f(km.get('timestamp_s')):.1f}s: {km.get('description','')}"
         for km in (ed.get("key_moments") or [])[:5]
+        if isinstance(km, dict)
     )
-    hook = (story.get("hook") or {}).get("description", "")
-    ending = (story.get("ending") or {}).get("description", "")
+    hook   = (story.get("hook") or {}).get("description", "") if isinstance(story.get("hook"), dict) else ""
+    ending = (story.get("ending") or {}).get("description", "") if isinstance(story.get("ending"), dict) else ""
     return (
         f"Video:{video_id} FULL SUMMARY\n"
         f"What this video is: {meta.get('overall_context','')}\n"
         f"Format:{meta.get('format','')} Language:{meta.get('language','')} "
-        f"Duration:{meta.get('duration_s',0):.1f}s Setting:{meta.get('setting','')}\n"
+        f"Duration:{_f(meta.get('duration_s')):.1f}s Setting:{meta.get('setting','')}\n"
         f"Main topics: {topics}\n"
         f"Overall summary: {ed.get('overall_summary','')}\n"
         f"Emotional arc: {ed.get('emotional_arc','')}\n"
@@ -151,20 +160,22 @@ def build_video_summary_text(ctx: dict, video_id: str) -> str:
         f"Key moments: {key_moments}\n"
         f"Ending: {ending}\n"
         f"Viral potential: {ed.get('viral_potential','')} "
-        f"Best clip: {(ed.get('best_clip') or {}).get('reason','')}\n"
+        f"Best clip: {(ed.get('best_clip') or {}).get('reason','') if isinstance(ed.get('best_clip'), dict) else ''}\n"
         f"Suggested title: {ed.get('suggested_title','')}"
     ).strip()
 
 
 def build_person_text(person: dict, video_id: str) -> str:
     app = person.get("appearance") or {}
+    if not isinstance(app, dict):
+        app = {}
     return (
         f"Video:{video_id} Person:{person.get('display_name', person.get('person_id',''))}\n"
         f"ID:{person.get('person_id','')} Role:{person.get('role_in_video','')}\n"
         f"Appearance: {app.get('clothing','')} | hair:{app.get('hair','')} "
         f"| facial_hair:{app.get('facial_hair','')} | accessories:{app.get('accessories','')}\n"
-        f"Screen time:{person.get('screen_time_s',0):.1f}s "
-        f"Speaking time:{person.get('speaking_time_s',0):.1f}s\n"
+        f"Screen time:{_f(person.get('screen_time_s')):.1f}s "
+        f"Speaking time:{_f(person.get('speaking_time_s')):.1f}s\n"
         f"Mood arc: {person.get('mood_arc','')}\n"
         f"Voice: {person.get('voice_characteristics','')}"
     ).strip()
@@ -173,16 +184,23 @@ def build_person_text(person: dict, video_id: str) -> str:
 def build_world_state_text(ws: dict, video_id: str) -> str:
     loops = ws.get("open_loops") or []
     cbs   = ws.get("callbacks") or []
+    # stored as json.dumps string in Neo4j; raw list in context JSON
     if isinstance(loops, str):
-        loops = [loops]
+        try:
+            loops = json.loads(loops)
+        except Exception:
+            loops = [loops] if loops else []
     if isinstance(cbs, str):
-        cbs = [cbs]
+        try:
+            cbs = json.loads(cbs)
+        except Exception:
+            cbs = [cbs] if cbs else []
     return (
-        f"Video:{video_id} World State Time:{ws.get('start',0):.1f}s-{ws.get('end',0):.1f}s\n"
+        f"Video:{video_id} World State Time:{_f(ws.get('start')):.1f}s-{_f(ws.get('end')):.1f}s\n"
         f"Story stage:{ws.get('story_stage','')} Emotion:{ws.get('scene_emotion','')} "
         f"Energy:{ws.get('energy','')} Topic:{ws.get('current_topic','')}\n"
-        f"Open loops: {'; '.join(loops)}\n"
-        f"Callbacks/recurring: {'; '.join(cbs)}"
+        f"Open loops: {'; '.join(str(l) for l in loops)}\n"
+        f"Callbacks/recurring: {'; '.join(str(c) for c in cbs)}"
     ).strip()
 
 
@@ -190,11 +208,14 @@ def build_story_text(story: dict, video_id: str) -> str:
     parts = []
     for key in ("hook", "setup", "conflict", "escalation", "resolution", "ending"):
         sec = story.get(key) or {}
-        if isinstance(sec, dict) and (sec.get("description") or sec.get("present")):
-            start = sec.get("start", sec.get("timestamp_s", 0))
-            end   = sec.get("end", 0)
-            desc  = sec.get("description", "")
-            parts.append(f"{key.upper()} [{start:.1f}s-{end:.1f}s]: {desc}")
+        if not isinstance(sec, dict):
+            continue
+        if not (sec.get("description") or sec.get("present")):
+            continue
+        start = _f(sec.get("start") or sec.get("timestamp_s") or 0)
+        end   = _f(sec.get("end") or 0)
+        desc  = sec.get("description", "")
+        parts.append(f"{key.upper()} [{start:.1f}s-{end:.1f}s]: {desc}")
     return (
         f"Video:{video_id} Story Arc\n" + "\n".join(parts)
     ).strip()
@@ -263,8 +284,8 @@ class PineconeIndexer:
                     "video_id":         video_id,
                     "entity_type":      "timeline_event",
                     "event_id":         _safe_str(ev.get("id")),
-                    "start":            float(ev.get("start", 0)),
-                    "end":              float(ev.get("end", 0)),
+                    "start":            _f(ev.get("start")),
+                    "end":              _f(ev.get("end")),
                     "type":             _safe_str(ev.get("type")),
                     "speaker":          _safe_str(ev.get("speaker")),
                     "speaker_name":     _safe_str(person_map.get(ev.get("speaker",""), "")),
@@ -274,11 +295,11 @@ class PineconeIndexer:
                     "thumbnail_worthy": bool(ev.get("thumbnail_worthy", False)),
                     "transcript":       _safe_str(ev.get("transcript_text"), 500),
                     "description":      _safe_str(ev.get("description"), 500),
-                    "clip_score":       float(s.get("clip", 0)),
-                    "viral_score":      float(s.get("viral", 0)),
-                    "hook_score":       float(s.get("hook", 0)),
-                    "emotion_score":    float(s.get("emotion", 0)),
-                    "importance_score": float(s.get("importance", 0)),
+                    "clip_score":       _f(s.get("clip")),
+                    "viral_score":      _f(s.get("viral")),
+                    "hook_score":       _f(s.get("hook")),
+                    "emotion_score":    _f(s.get("emotion")),
+                    "importance_score": _f(s.get("importance")),
                     "should_keep":      bool(er.get("should_keep", True) if isinstance(er, dict) else True),
                     "depends_on":       json.dumps(ev.get("depends_on", [])),
                 },
@@ -293,8 +314,8 @@ class PineconeIndexer:
                     "video_id":    video_id,
                     "entity_type": "scene",
                     "scene_id":    _safe_str(sc.get("scene_id")),
-                    "start":       float(sc.get("start", 0)),
-                    "end":         float(sc.get("end", 0)),
+                    "start":       _f(sc.get("start")),
+                    "end":         _f(sc.get("end")),
                     "title":       _safe_str(sc.get("title")),
                     "emotion":     _safe_str(sc.get("dominant_emotion")),
                     "purpose":     _safe_str(sc.get("narrative_purpose"), 300),
@@ -311,13 +332,13 @@ class PineconeIndexer:
                     "video_id":          video_id,
                     "entity_type":       "clip",
                     "clip_id":           _safe_str(cl.get("id")),
-                    "start":             float(cl.get("start", 0)),
-                    "end":               float(cl.get("end", 0)),
-                    "duration_s":        float(cl.get("duration_s", 0)),
+                    "start":             _f(cl.get("start")),
+                    "end":               _f(cl.get("end")),
+                    "duration_s":        _f(cl.get("duration_s")),
                     "title":             _safe_str(cl.get("title")),
                     "platform":          _safe_str(cl.get("platform")),
-                    "clip_score":        float(s.get("clip", 0)),
-                    "viral_score":       float(s.get("viral", 0)),
+                    "clip_score":        _f(s.get("clip")),
+                    "viral_score":       _f(s.get("viral")),
                     "hook":              _safe_str(cl.get("hook"), 300),
                     "depends_on_events": json.dumps(cl.get("depends_on_events", [])),
                 },
@@ -332,11 +353,11 @@ class PineconeIndexer:
                     "video_id":    video_id,
                     "entity_type": "highlight",
                     "highlight_id": _safe_str(h.get("id")),
-                    "start":       float(h.get("start", 0)),
-                    "end":         float(h.get("end", 0)),
+                    "start":       _f(h.get("start")),
+                    "end":         _f(h.get("end")),
                     "title":       _safe_str(h.get("title")),
                     "type":        _safe_str(h.get("type")),
-                    "score":       float(h.get("score", 0)),
+                    "score":       _f(h.get("score")),
                     "reason":      _safe_str(h.get("reason"), 300),
                 },
             })
@@ -352,8 +373,8 @@ class PineconeIndexer:
                     "entity_type":   "conversation_turn",
                     "speaker":       _safe_str(turn.get("speaker")),
                     "speaker_name":  _safe_str(person_map.get(turn.get("speaker",""), "")),
-                    "start":         float(turn.get("start", 0)),
-                    "end":           float(turn.get("end", 0)),
+                    "start":         _f(turn.get("start")),
+                    "end":           _f(turn.get("end")),
                     "text":          _safe_str(turn.get("text"), 500),
                 },
             })
@@ -369,7 +390,7 @@ class PineconeIndexer:
                     "video_id":       video_id,
                     "entity_type":    "video_summary",
                     "start":          0.0,
-                    "end":            float(meta.get("duration_s", 0)),
+                    "end":            _f(meta.get("duration_s")),
                     "title":          _safe_str(ed.get("suggested_title") or meta.get("overall_context"), 200),
                     "description":    _safe_str(ed.get("overall_summary"), 500),
                     "format":         _safe_str(meta.get("format")),
@@ -406,8 +427,8 @@ class PineconeIndexer:
                 "metadata": {
                     "video_id":     video_id,
                     "entity_type":  "world_state",
-                    "start":        float(ws.get("start", 0)),
-                    "end":          float(ws.get("end", 0)),
+                    "start":        _f(ws.get("start")),
+                    "end":          _f(ws.get("end")),
                     "story_stage":  _safe_str(ws.get("story_stage")),
                     "emotion":      _safe_str(ws.get("scene_emotion")),
                     "energy":       _safe_str(ws.get("energy")),
@@ -425,7 +446,7 @@ class PineconeIndexer:
                     "video_id":    video_id,
                     "entity_type": "story_arc",
                     "start":       0.0,
-                    "end":         float(meta.get("duration_s", 0)),
+                    "end":         _f(meta.get("duration_s")),
                     "title":       "Story Arc",
                     "description": _safe_str(build_story_text(story, video_id), 500),
                 },
@@ -499,7 +520,7 @@ class Neo4jGraphBuilder:
             SET v.label=$id, v.url=$url, v.duration_s=$dur,
                 v.format=$fmt, v.language=$lang, v.context=$ctx
         """, {"id": video_id, "url": ctx.get("video_url",""),
-              "dur": float(meta.get("duration_s",0)),
+              "dur": _f(meta.get("duration_s")),
               "fmt": meta.get("format",""), "lang": meta.get("language",""),
               "ctx": meta.get("overall_context","")})
         count += 1
@@ -542,14 +563,14 @@ class Neo4jGraphBuilder:
                 WITH s MATCH (v:Video {id:$vid})
                 MERGE (s)-[:PART_OF]->(v)
             """, {"id": sid, "title": sc.get("title",""),
-                  "start": float(sc.get("start",0)), "end": float(sc.get("end",0)),
+                  "start": _f(sc.get("start")), "end": _f(sc.get("end")),
                   "desc": sc.get("description",""), "emotion": sc.get("dominant_emotion",""),
                   "purpose": sc.get("narrative_purpose",""), "vid": video_id})
             count += 1
 
         # Event nodes — one Cypher call per event for clarity
         scene_intervals = [
-            (f"{video_id}_{sc.get('scene_id','')}", float(sc.get("start",0)), float(sc.get("end",0)))
+            (f"{video_id}_{sc.get('scene_id','')}", _f(sc.get("start")), _f(sc.get("end")))
             for sc in ctx.get("scenes", [])
         ]
 
@@ -559,7 +580,7 @@ class Neo4jGraphBuilder:
             er     = ev.get("editing_reasoning") or {}
             cam    = ev.get("camera") or {}
             aud    = ev.get("audio") or {}
-            ev_start = float(ev.get("start", 0))
+            ev_start = _f(ev.get("start"))
 
             self._run("""
                 MERGE (e:Event {id:$id})
@@ -576,13 +597,13 @@ class Neo4jGraphBuilder:
                 MERGE (e)-[:PART_OF]->(v)
             """, {
                 "id": eid, "eid": ev.get("id",""), "vid": video_id,
-                "start": ev_start, "end": float(ev.get("end",0)),
+                "start": ev_start, "end": _f(ev.get("end")),
                 "type": ev.get("type",""), "desc": _safe_str(ev.get("description"), 500),
                 "tr": _safe_str(ev.get("transcript_text"), 500),
                 "topic": _safe_str(ev.get("topic"), 200), "emotion": _safe_str(ev.get("emotion")),
                 "cw": bool(ev.get("clip_worthy",False)), "tw": bool(ev.get("thumbnail_worthy",False)),
-                "cs": float(s.get("clip",0)), "vs": float(s.get("viral",0)),
-                "hs": float(s.get("hook",0)), "imp": float(s.get("importance",0)),
+                "cs": _f(s.get("clip")), "vs": _f(s.get("viral")),
+                "hs": _f(s.get("hook")), "imp": _f(s.get("importance")),
                 "shot": _safe_str(cam.get("shot_type") if isinstance(cam,dict) else ""),
                 "aud": _safe_str(aud.get("type") if isinstance(aud,dict) else ""),
                 "why": _safe_str(er.get("why") if isinstance(er,dict) else ""),
@@ -659,7 +680,7 @@ class Neo4jGraphBuilder:
                 MERGE (a)-[r:INTERRUPTS]->(b)
                 SET r.at_s=$at, r.context=$ctx, r.video_id=$vid
             """, {"by": intr.get("by",""), "intr": intr.get("interrupted",""),
-                  "at": float(intr.get("at_s",0)),
+                  "at": _f(intr.get("at_s")),
                   "ctx": intr.get("context",""), "vid": video_id})
 
         for cb in conv.get("callbacks", []):
@@ -675,7 +696,7 @@ class Neo4jGraphBuilder:
                 MERGE (src)-[r:REFERENCES]->(tgt)
                 SET r.description=$desc
             """, {"ref": ref, "vid": video_id,
-                  "at": float(cb.get("at_s",0)), "desc": cb.get("description","")})
+                  "at": _f(cb.get("at_s")), "desc": cb.get("description","")})
 
         for joke in conv.get("jokes", []):
             self._run("""
@@ -705,7 +726,7 @@ class Neo4jGraphBuilder:
                     MERGE (a)-[r:AGREES_WITH]->(b)
                     SET r.about=$about, r.at_s=$at, r.video_id=$vid
                 """, {"a": people[0], "b": people[1],
-                      "about": agr.get("about",""), "at": float(agr.get("at_s",0)),
+                      "about": agr.get("about",""), "at": _f(agr.get("at_s")),
                       "vid": video_id})
 
         for dis in conv.get("disagreements", []):
@@ -719,7 +740,7 @@ class Neo4jGraphBuilder:
                 """, {"a": people[0], "b": people[1],
                       "about": dis.get("about",""),
                       "intensity": dis.get("intensity",""),
-                      "at": float(dis.get("at_s",0)), "vid": video_id})
+                      "at": _f(dis.get("at_s")), "vid": video_id})
 
         # Clip candidate nodes
         for cl in ctx.get("clip_candidates", []):
@@ -734,11 +755,11 @@ class Neo4jGraphBuilder:
                 WITH c MATCH (v:Video {id:$vid})
                 MERGE (c)-[:CLIP_OF]->(v)
             """, {"id": cid, "vid": video_id, "title": cl.get("title",""),
-                  "start": float(cl.get("start",0)), "end": float(cl.get("end",0)),
-                  "dur": float(cl.get("duration_s",0)), "platform": cl.get("platform",""),
+                  "start": _f(cl.get("start")), "end": _f(cl.get("end")),
+                  "dur": _f(cl.get("duration_s")), "platform": cl.get("platform",""),
                   "hook": _safe_str(cl.get("hook"),300),
                   "why": _safe_str(cl.get("why_complete"),300),
-                  "cs": float(s.get("clip",0)), "vs": float(s.get("viral",0))})
+                  "cs": _f(s.get("clip")), "vs": _f(s.get("viral"))})
             count += 1
 
             # Clip depends on events
@@ -760,8 +781,8 @@ class Neo4jGraphBuilder:
                 MERGE (ws)-[:PART_OF]->(v)
             """, {
                 "vid":      video_id,
-                "start":    float(ws.get("start", 0)),
-                "end":      float(ws.get("end", 0)),
+                "start":    _f(ws.get("start")),
+                "end":      _f(ws.get("end")),
                 "stage":    ws.get("story_stage", ""),
                 "emotion":  ws.get("scene_emotion", ""),
                 "energy":   ws.get("energy", ""),
