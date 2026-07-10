@@ -23,7 +23,14 @@ _model: Optional[WhisperModel] = None
 def _load_model() -> WhisperModel:
     """Blocking model load — called in thread pool from lifespan."""
     logger.info("Loading Whisper %s on CUDA float16...", MODEL_SIZE)
-    m = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
+    m = WhisperModel(
+        MODEL_SIZE,
+        device="cuda",
+        device_index=0,        # explicit — prevents ctranslate2 parallel_for from probing invalid device indices
+        compute_type="float16",
+        num_workers=1,         # single model replica; >1 spawns threads that lose CUDA context → InvalidDevice
+        cpu_threads=4,
+    )
     logger.info("Whisper model ready.")
     return m
 

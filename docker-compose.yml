@@ -96,6 +96,7 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CUDA_VISIBLE_DEVICES=0
       # Model cached alongside HF models
       - HF_HOME=/root/.cache/huggingface
     volumes:
