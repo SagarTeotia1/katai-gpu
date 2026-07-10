@@ -396,13 +396,10 @@ def main() -> None:
     t_pipeline = time.time()
 
     # ─────────────────────────────────────────────────────────────────────────
-    # STEP 1 + STEP 2 — Cast Appearance → then Whisper Transcription (SEQUENTIAL)
-    # Cast → vLLM (vision). Whisper → GPU directly.
-    # Run sequentially: vLLM pre-allocates GPU_MEM_UTIL of VRAM and never
-    # releases it. When cast analysis (vLLM) and whisper run simultaneously,
-    # whisper encoder OOMs on long audio because only ~7.7GB remains after vLLM
-    # pre-alloc. Sequential: whisper runs after vLLM KV cache is idle — still
-    # holds pre-alloc but no active KV blocks contend for bandwidth.
+    # STEP 1 + STEP 2 — Cast Appearance Analysis || Whisper Transcription
+    # Cast  → vLLM (GPU vision). Whisper → CPU int8 (CUDA_VISIBLE_DEVICES=).
+    # These use completely separate hardware — run in parallel for free speedup.
+    # Wall time = max(cast_time, whisper_time) instead of sum.
     # ─────────────────────────────────────────────────────────────────────────
     cast_analysis_file: str | None = None
     transcript_file: str | None = None
@@ -452,39 +449,52 @@ def main() -> None:
             print(yellow(f"\n  [WARN] Transcription failed (exit {metrics['exit_code']})"), flush=True)
             print(yellow("  Context analysis will continue without transcript data."), flush=True)
 
-    run_cast = args.skip_cast is None
+    run_cast  = args.skip_cast is None
     run_trans = args.skip_transcribe is None
 
-    cast_cmd = [PYTHON, SCRIPTS / "cast_analysis.py", cast_path, "--backend", args.backend]
+    cast_cmd  = [PYTHON, SCRIPTS / "cast_analysis.py", cast_path, "--backend", args.backend]
     trans_cmd = [PYTHON, SCRIPTS / "transcribe.py", "--cast", cast_path,
                  "--whisper", args.whisper, "--backend", args.backend,
                  "--workers", str(args.whisper_workers)]
 
-    # Step 1 — Cast Appearance Analysis
-    if not run_cast:
-        cast_analysis_file = _resolve_skip(args.skip_cast, "output/cast_analysis_*.json")
-        section(1, 4, "Cast Appearance Analysis", "SKIP")
-        print(f"  Using: {cast_analysis_file or 'NOT FOUND'}", flush=True)
-        summary["steps"]["cast_analysis"] = {"status": "skipped", "output_file": cast_analysis_file}
-    else:
-        section(1, 4, "Cast Appearance Analysis", "RUNNING")
-        t0 = time.time()
-        ok, metrics, _ = run_step(cast_cmd, parse_cast)
-        _record_cast(ok, metrics, t0)
+    t0_both = time.time()
 
-    write_summary(summary, summary_path)
+    if run_cast and run_trans:
+        # Both enabled — run in parallel: GPU (cast/vLLM) + CPU (whisper) simultaneously.
+        section(1, 4, "Cast Analysis + Whisper Transcription", "RUNNING")
+        print(f"  {cyan('[parallel]')} Cast on GPU, Whisper on CPU — wall = max(cast, whisper)\n", flush=True)
+        (cast_ok, cast_m, _), (trans_ok, trans_m, _) = run_step_parallel(
+            cast_cmd,  parse_cast,       "cast",
+            trans_cmd, parse_transcribe, "whisper",
+        )
+        _record_cast(cast_ok,   cast_m,  t0_both)
+        _record_trans(trans_ok, trans_m, t0_both)
 
-    # Step 2 — Whisper Transcription (after cast, so vLLM KV cache is idle)
-    if not run_trans:
-        transcript_file = _resolve_skip(args.skip_transcribe, "output/transcripts_*.json")
-        section(2, 4, "Whisper Transcription", "SKIP")
-        print(f"  Using: {transcript_file or 'NOT FOUND'}", flush=True)
-        summary["steps"]["transcription"] = {"status": "skipped", "output_file": transcript_file}
     else:
-        section(2, 4, "Whisper Transcription", "RUNNING")
-        t0 = time.time()
-        ok, metrics, _ = run_step(trans_cmd, parse_transcribe)
-        _record_trans(ok, metrics, t0)
+        # One or both skipped — run whatever is needed sequentially.
+        if not run_cast:
+            cast_analysis_file = _resolve_skip(args.skip_cast, "output/cast_analysis_*.json")
+            section(1, 4, "Cast Appearance Analysis", "SKIP")
+            print(f"  Using: {cast_analysis_file or 'NOT FOUND'}", flush=True)
+            summary["steps"]["cast_analysis"] = {"status": "skipped", "output_file": cast_analysis_file}
+        else:
+            section(1, 4, "Cast Appearance Analysis", "RUNNING")
+            t0 = time.time()
+            ok, metrics, _ = run_step(cast_cmd, parse_cast)
+            _record_cast(ok, metrics, t0)
+
+        write_summary(summary, summary_path)
+
+        if not run_trans:
+            transcript_file = _resolve_skip(args.skip_transcribe, "output/transcripts_*.json")
+            section(2, 4, "Whisper Transcription", "SKIP")
+            print(f"  Using: {transcript_file or 'NOT FOUND'}", flush=True)
+            summary["steps"]["transcription"] = {"status": "skipped", "output_file": transcript_file}
+        else:
+            section(2, 4, "Whisper Transcription", "RUNNING")
+            t0 = time.time()
+            ok, metrics, _ = run_step(trans_cmd, parse_transcribe)
+            _record_trans(ok, metrics, t0)
 
     write_summary(summary, summary_path)
 
