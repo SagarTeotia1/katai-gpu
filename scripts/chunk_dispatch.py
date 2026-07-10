@@ -14,6 +14,7 @@ Consumed by:
 from __future__ import annotations
 
 import asyncio
+import heapq
 import logging
 import math
 import os
@@ -262,6 +263,109 @@ def assert_chunks_fit_budget(
 # ── DISPATCH ──────────────────────────────────────────────────────────────────
 
 
+class WorkStealingQueue:
+    """Min-heap work queue that adaptively splits large pending chunks.
+
+    Workers call ``get()`` to pop the largest remaining chunk. On completion
+    they call ``done(chunk)``. If the largest pending chunk is still
+    >= 2 * min_split_s, it is bisected and both halves re-queued so freed
+    GPU slots never sit idle during the tail phase.
+
+    ``pending`` counts items in-queue + in-flight so ``done()`` can detect
+    when everything is finished and wake waiting workers.
+    """
+
+    def __init__(
+        self,
+        chunks: list[Chunk],
+        min_split_s: float = 8.0,
+        max_splits: int = 48,
+    ) -> None:
+        self._cond = asyncio.Condition()
+        self._heap: list[tuple[float, int, Chunk]] = []
+        self._tiebreak = 0
+        self._pending = 0          # in-queue + in-flight
+        self._closed = False
+        self._min_split_s = min_split_s
+        self._max_splits = max_splits
+        self._splits_done = 0
+        self._next_id = max((c.chunk_id for c in chunks), default=-1) + 1
+        for c in chunks:
+            self._push(c)
+
+    def _push(self, c: Chunk) -> None:
+        heapq.heappush(self._heap, (-c.strict_duration, self._tiebreak, c))
+        self._tiebreak += 1
+        self._pending += 1
+
+    async def get(self) -> Chunk | None:
+        """Block until a chunk is available or all work is done."""
+        async with self._cond:
+            while not self._heap and not self._closed:
+                await self._cond.wait()
+            if self._heap:
+                _, _, chunk = heapq.heappop(self._heap)
+                return chunk
+            return None  # closed + empty → worker should exit
+
+    async def done(self, chunk: Chunk) -> bool:
+        """Signal that ``chunk`` finished processing. Returns True if a split occurred."""
+        async with self._cond:
+            self._pending -= 1
+            did_split = False
+            if (self._heap
+                    and self._splits_done < self._max_splits):
+                _, _, largest = self._heap[0]
+                if largest.strict_duration >= self._min_split_s * 2:
+                    self._bisect(largest)
+                    did_split = True
+                    self._cond.notify_all()
+            if self._pending == 0:
+                self._closed = True
+                self._cond.notify_all()
+            return did_split
+
+    def _bisect(self, c: Chunk) -> None:
+        """Replace ``c`` (heap root) with two equal halves."""
+        heapq.heappop(self._heap)  # remove c (it's at root = largest)
+        self._pending -= 1         # will add 2 via _push
+
+        mid = round((c.strict_start + c.strict_end) / 2, 3)
+        pad = 2.0  # overlap at split boundary
+
+        c1 = Chunk(
+            chunk_id=c.chunk_id,
+            scene_id=c.scene_id,
+            part_idx=c.part_idx,
+            strict_start=c.strict_start,
+            strict_end=mid,
+            pad_start=c.pad_start,
+            pad_end=min(c.pad_end, mid + pad),
+        )
+        c2 = Chunk(
+            chunk_id=self._next_id,
+            scene_id=c.scene_id,
+            part_idx=c.part_idx + 1,
+            strict_start=mid,
+            strict_end=c.strict_end,
+            pad_start=max(c.pad_start, mid - pad),
+            pad_end=c.pad_end,
+        )
+        self._next_id += 1
+        self._splits_done += 1
+        self._push(c1)
+        self._push(c2)
+        logger.info(
+            "adaptive split #%d: chunk %d [%.1f-%.1f]s (%.1fs) → halves at %.1fs",
+            self._splits_done, c.chunk_id, c.strict_start, c.strict_end,
+            c.strict_duration, mid,
+        )
+
+    @property
+    def splits_done(self) -> int:
+        return self._splits_done
+
+
 class ChunkDispatcher:
     """Fire N chunks concurrently over httpx, bounded by an asyncio.Semaphore.
 
@@ -406,6 +510,122 @@ class ChunkDispatcher:
             "decode_total":   sum(r["decode_tokens"] for r in results),
             "failed":         sum(1 for r in results if not r["ok"]),
             "peak_inflight":  self._peak_inflight,
+        }
+        return results
+
+    async def run_adaptive(
+        self,
+        chunks: list[Chunk],
+        build_payload: Callable[[Chunk], dict[str, Any]],
+        label_fn: Callable[[Chunk], str] | None = None,
+        log_fn: Callable[[str, str], None] | None = None,
+        shared_sem: asyncio.Semaphore | None = None,
+        min_split_s: float = 8.0,
+        max_splits: int = 48,
+    ) -> list[dict[str, Any]]:
+        """Like ``run()`` but uses WorkStealingQueue for adaptive tail splitting.
+
+        When a worker finishes and the largest pending chunk is still
+        >= 2 * min_split_s, that chunk is bisected so the freed GPU slot
+        gets new work immediately instead of draining idle.
+
+        Results are returned in completion order (not chunk_id order). The
+        caller is responsible for sorting by strict_start if needed.
+        """
+        self.metrics = {}
+        self._inflight = 0
+        self._peak_inflight = 0
+        self._first_at_cap = None
+        self._first_below_cap = None
+        self._lock = asyncio.Lock()
+
+        sem = shared_sem if shared_sem is not None else asyncio.Semaphore(self.max_inflight)
+        _label = label_fn or (lambda c: f"chunk-{c.chunk_id}")
+        _log = log_fn or (lambda label, msg: None)
+
+        queue = WorkStealingQueue(chunks, min_split_s=min_split_s, max_splits=max_splits)
+
+        t_map_start = time.monotonic()
+        results: list[dict[str, Any]] = []
+        results_lock = asyncio.Lock()
+
+        timeout = httpx.Timeout(
+            connect=10.0, read=self.client_timeout, write=30.0, pool=5.0,
+        )
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async def _worker() -> None:
+                while True:
+                    chunk = await queue.get()
+                    if chunk is None:
+                        break
+                    label = _label(chunk)
+                    result: dict[str, Any] = {
+                        "chunk_id":       chunk.chunk_id,
+                        "scene_id":       chunk.scene_id,
+                        "part_idx":       chunk.part_idx,
+                        "strict_start":   chunk.strict_start,
+                        "strict_end":     chunk.strict_end,
+                        "ok":             False,
+                        "error":          None,
+                        "submit_time":    0.0,
+                        "done_time":      0.0,
+                        "wall_s":         0.0,
+                        "prefill_tokens": 0,
+                        "decode_tokens":  0,
+                        "response":       None,
+                    }
+                    async with sem:
+                        await self._track(+1)
+                        submit_t = time.monotonic()
+                        result["submit_time"] = submit_t
+                        try:
+                            payload = build_payload(chunk)
+                            response = await self._request_with_retry(
+                                client, payload, label, _log,
+                            )
+                            result["response"] = response
+                            result["ok"] = True
+                            usage = (response.get("usage") or {}) if isinstance(response, dict) else {}
+                            result["prefill_tokens"] = int(usage.get("prompt_tokens") or 0)
+                            result["decode_tokens"] = int(usage.get("completion_tokens") or 0)
+                        except Exception as exc:
+                            result["error"] = f"{type(exc).__name__}: {exc}"
+                            _log(label, f"FAIL {result['error']}")
+                        finally:
+                            done_t = time.monotonic()
+                            result["done_time"] = done_t
+                            result["wall_s"] = done_t - submit_t
+                            await self._track(-1)
+                    async with results_lock:
+                        results.append(result)
+                    did_split = await queue.done(chunk)
+                    if did_split:
+                        _log(label,
+                             f"adaptive split triggered (splits so far: {queue.splits_done})")
+
+            # Spawn MAX_INFLIGHT workers; they self-terminate when queue drains
+            n_workers = self.max_inflight
+            workers = [asyncio.create_task(_worker()) for _ in range(n_workers)]
+            await asyncio.gather(*workers, return_exceptions=True)
+
+        t_map_end = time.monotonic()
+        map_wall = t_map_end - t_map_start
+
+        tail_idle_pct = 0.0
+        if self._first_below_cap is not None:
+            tail_window = t_map_end - self._first_below_cap
+            if map_wall > 0:
+                tail_idle_pct = 100.0 * tail_window / map_wall
+
+        self.metrics = {
+            "total_wall_s":    map_wall,
+            "map_wall_s":      map_wall,
+            "tail_idle_pct":   round(tail_idle_pct, 2),
+            "prefill_total":   sum(r["prefill_tokens"] for r in results),
+            "decode_total":    sum(r["decode_tokens"] for r in results),
+            "failed":          sum(1 for r in results if not r["ok"]),
+            "peak_inflight":   self._peak_inflight,
+            "adaptive_splits": queue.splits_done,
         }
         return results
 

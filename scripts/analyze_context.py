@@ -1115,7 +1115,7 @@ async def _dispatch_all_async(
     Returns {label: (raw_results_list, dispatcher)} for each video.
     """
     shared_sem = asyncio.Semaphore(MAX_INFLIGHT)
-    total_chunks = sum(p["n_planned"] for p in video_plans.values())
+    _planned_chunks = sum(p["n_planned"] for p in video_plans.values())
     t0_dispatch   = time.time()
 
     # Per-video progress counters (updated inside log_fn which runs in threads)
@@ -1125,6 +1125,7 @@ async def _dispatch_all_async(
         for lbl, plan in video_plans.items()
     }
     _total_done     = [0]   # mutable via list
+    _total_seen     = [_planned_chunks]  # grows when adaptive splits add chunks
     _tokens_prefill = [0]
     _tokens_decode  = [0]
 
@@ -1132,14 +1133,20 @@ async def _dispatch_all_async(
         _log_thread_safe(label, msg)
         is_ok    = msg.startswith("OK ")
         is_stub  = msg.startswith("stubbed")
-        if not (is_ok or is_stub):
+        is_split = "adaptive split" in msg
+        if not (is_ok or is_stub or is_split):
             return
         video_lbl = label.split("/")[0] if "/" in label else label
-        # Extract token counts from OK message: "OK 356.2s prefill=14393 decode=6422 ..."
         import re as _re
         _pf = _re.search(r"prefill=(\d+)", msg)
         _dc = _re.search(r"decode=(\d+)",  msg)
         with _prog_lock:
+            if is_split:
+                # Each bisect adds 1 net chunk (1 → 2)
+                _total_seen[0] += 1
+                if video_lbl in _prog:
+                    _prog[video_lbl]["total"] += 1
+                return
             if video_lbl in _prog:
                 _prog[video_lbl]["done"] += 1
                 if is_stub:
@@ -1147,30 +1154,31 @@ async def _dispatch_all_async(
             if _pf: _tokens_prefill[0] += int(_pf.group(1))
             if _dc: _tokens_decode[0]  += int(_dc.group(1))
             _total_done[0] += 1
-            done = _total_done[0]
-            snap = {lbl: dict(v) for lbl, v in _prog.items()}
+            done  = _total_done[0]
+            total = _total_seen[0]
+            snap  = {lbl: dict(v) for lbl, v in _prog.items()}
             tok_in  = _tokens_prefill[0]
             tok_out = _tokens_decode[0]
 
         elapsed = time.time() - t0_dispatch
         rate    = done / max(elapsed, 1)
-        eta     = (total_chunks - done) / max(rate, 0.001)
+        eta     = (total - done) / max(rate, 0.001)
         bar_w   = 24
-        filled  = int(bar_w * done / total_chunks)
+        filled  = int(bar_w * done / max(total, 1))
         bar_str = "█" * filled + "░" * (bar_w - filled)
         vid_str = "  ".join(f"{lbl}:{v['done']}/{v['total']}" for lbl, v in snap.items())
 
         log("progress",
-            f"[{bar_str}] {done}/{total_chunks} chunks | {vid_str} | "
+            f"[{bar_str}] {done}/{total} chunks | {vid_str} | "
             f"elapsed {_fmt_dur(elapsed)} | ETA ~{_fmt_dur(eta)}")
 
         if progress_path:
             try:
                 live = {
-                    "total_chunks":    total_chunks,
+                    "total_chunks":    total,
                     "chunks_done":     done,
                     "chunks_failed":   sum(v["failed"] for v in snap.values()),
-                    "pct":             round(100 * done / total_chunks, 1),
+                    "pct":             round(100 * done / max(total, 1), 1),
                     "elapsed_s":       round(elapsed, 1),
                     "eta_s":           round(eta, 1),
                     "tokens_prefill_K": round(tok_in  / 1000, 1),
@@ -1196,14 +1204,16 @@ async def _dispatch_all_async(
         )
         dispatchers[label] = disp
         label_order.append(label)
-        coros.append(disp.run(
+        coros.append(disp.run_adaptive(
             plan["chunks"], plan["build_payload"],
             label_fn=plan["label_fn"], log_fn=_log_with_progress,
             shared_sem=shared_sem,
+            min_split_s=5.0,   # min chunk size; split only if remaining >= 10s
+            max_splits=48,     # cap dynamic splits to avoid runaway tiny chunks
         ))
 
-    log("dispatch", f"Firing {total_chunks} chunks across {len(video_plans)} videos "
-        f"(shared Semaphore={MAX_INFLIGHT})")
+    log("dispatch", f"Firing {_planned_chunks} planned chunks across {len(video_plans)} videos "
+        f"(shared Semaphore={MAX_INFLIGHT}, adaptive splitting enabled)")
 
     results_list = await asyncio.gather(*coros, return_exceptions=True)
 
