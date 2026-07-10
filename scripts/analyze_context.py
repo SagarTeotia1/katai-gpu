@@ -258,7 +258,9 @@ def build_chunk_system_prompt(
     strict_end: float,
     total_duration: float,
 ) -> str:
-    return f"""You are a semantic video analysis engine working on ONE CHUNK of a video.
+    return f"""RESPOND WITH RAW JSON ONLY. YOUR ENTIRE RESPONSE MUST START WITH {{ AND END WITH }}. NO PROSE. NO MARKDOWN. NO EXPLANATION. NO STEP-BY-STEP. DO NOT THINK OUT LOUD. OUTPUT ONLY THE JSON OBJECT.
+
+You are a semantic video analysis engine. ONE CHUNK of a video.
 
 Video: {video_label} | Chunk {chunk_id + 1}/{total_chunks} | Window: {strict_start:.2f}s→{strict_end:.2f}s | Total: {total_duration:.2f}s
 
@@ -1442,7 +1444,7 @@ def _build_payload(
         "model": model_id,
         "messages": messages,
         "max_tokens": max_tokens,
-        "temperature": 0.05 if attempt > 1 else 0.1,  # lower temp on retry
+        "temperature": 0.0,  # greedy — prose generation caused by sampling noise
         "stream": False,
         "response_format": {"type": "json_object"},
         "extra_body": {
@@ -1640,9 +1642,9 @@ def _build_chunk_payload(
         chunk.strict_start, chunk.strict_end, total_duration,
     )
     user_text = (
-        f"Analyze chunk {chunk.chunk_id + 1}/{n_video_chunks} of video {video_label}. "
-        f"Output ONLY events between {chunk.strict_start:.2f}s and {chunk.strict_end:.2f}s. "
-        f"All timestamps absolute from video start."
+        f"Output the JSON object for chunk {chunk.chunk_id + 1}/{n_video_chunks} of {video_label}. "
+        f"Events between {chunk.strict_start:.2f}s–{chunk.strict_end:.2f}s only. "
+        f"Start your response with {{ immediately."
     )
     payload = _build_payload(model_id, system, user_text, safe_url, max_tokens, attempt=1)
     # Do NOT override mm_processor_kwargs here — let the server's --mm-processor-kwargs
