@@ -54,22 +54,22 @@ MODEL_ID    = "Qwen/Qwen3.6-27B"
 MAX_TOKENS  = 32768
 MAX_RETRIES    = 3               # per-chunk retry attempts (single-video path only)
 RETRY_DELAYS   = [5, 15]         # seconds before attempt 2, 3
-TOKEN_BUDGETS  = [6144, 4096, 2048]     # lean schema finishes ~2-3K naturally; 6144 ceiling = no truncation
+TOKEN_BUDGETS  = [4096, 2048, 1024]     # schema fills ~2-3K naturally; 4096 ceiling is enough
 TIMEOUTS       = [900, 1200, 1500]      # timeout per chunk attempt (s)
 CHUNK_OVERLAP  = 3.0             # seconds of frame overlap each side for visual context
 DEFAULT_CHUNKS = 8               # chunks per video when --chunks not specified
-# Hard ceiling on per-chunk duration.
-# Token math: ceil(chunk_s * fps / 2) * ceil(max_pixels / 196)
-# At fps=1, max_pixels=602112: ceil(18/2) * 3072 = 27648  (< 27852 safe budget = 0.85 × 32768)
-# At fps=1, max_pixels=602112: ceil(20/2) * 3072 = 30720  (EXCEEDS safe budget — don't use 20s)
-MAX_CHUNK_S    = 18.0
-# Max concurrent /v1/chat/completions requests across ALL chunks of ALL videos in flight.
-# vLLM continuous batching + PagedAttention admits chunks up to KV headroom (~12-16 typical).
-MAX_INFLIGHT   = 32
 # Must match vLLM --mm-processor-kwargs fps/max_pixels so budget assert is accurate.
-# Budget assert uses these values; mismatching them defeats the check entirely.
 MM_FPS         = float(os.environ.get("VLLM_MM_FPS", "1.0"))
 MM_MAX_PIXELS  = int(os.environ.get("VLLM_MM_MAX_PIXELS", "602112"))
+# Hard ceiling on per-chunk duration — auto-scales with FPS so vision tokens per chunk
+# stay constant regardless of FPS setting:
+#   fps=1.0 → MAX_CHUNK_S=18s: ceil(18*1/2)*3072 = 27648 < 27852 safe ✓
+#   fps=0.5 → MAX_CHUNK_S=36s: ceil(36*0.5/2)*3072 = 27648 < 27852 safe ✓
+#   fps=0.25→ MAX_CHUNK_S=36s: ceil(36*0.25/2)*1536 = 9216  < 27852 safe ✓
+# Set VLLM_MM_FPS=0.5 in .env to halve chunk count for long videos (1hr→100 chunks vs 200).
+MAX_CHUNK_S    = min(18.0 / max(MM_FPS, 0.25), 36.0)
+# Max concurrent /v1/chat/completions requests across ALL chunks of ALL videos in flight.
+MAX_INFLIGHT   = 32
 
 _THINK_RE   = re.compile(r"<think>.*?</think>", re.DOTALL)
 _JSON_START = re.compile(r"\{", re.DOTALL)
