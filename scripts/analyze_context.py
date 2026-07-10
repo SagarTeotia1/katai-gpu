@@ -1949,8 +1949,11 @@ def main() -> None:
     tr_path = (Path(args.transcripts) if args.transcripts
                else latest_file("output/transcripts_*.json"))
     if not tr_path or not tr_path.exists():
-        print("ERROR: no transcripts JSON. Run: make transcribe CAST=cast.json"); sys.exit(1)
-    transcripts: dict = json.loads(tr_path.read_text(encoding="utf-8"))
+        print("  [WARN] No transcripts JSON found — continuing without transcript data.", flush=True)
+        print("         Run 'make transcribe CAST=cast.json' to add transcripts.", flush=True)
+        transcripts: dict = {"videos": []}
+    else:
+        transcripts: dict = json.loads(tr_path.read_text(encoding="utf-8"))
 
     videos  = cast["videos"]
     n       = len(videos)

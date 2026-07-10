@@ -53,9 +53,8 @@ def dynamic_worker_count(durations: list[float | None], n_videos: int) -> int:
         # No probe data — fall back to a moderate default.
         return min(n_videos, 4)
     max_d = max(known)
-    # BatchedInferencePipeline (whisper service) already saturates GPU per call.
-    # Extra worker concurrency mostly helps overlap ffmpeg audio extraction + upload
-    # with GPU decode of prior request, so caps stay moderate.
+    # Whisper service serializes GPU calls via asyncio.Semaphore(1) — concurrent
+    # workers overlap ffmpeg audio extraction with prior GPU decode, not GPU itself.
     if max_d <= 60:
         cap = 12
     elif max_d <= 300:
