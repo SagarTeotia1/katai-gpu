@@ -4,6 +4,7 @@ Accepts video URLs, extracts audio via ffmpeg, returns timestamped segments.
 """
 import asyncio
 import logging
+import os
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,20 +19,41 @@ logger = logging.getLogger(__name__)
 
 MODEL_SIZE = "large-v3"
 _model: Optional[WhisperModel] = None
-_transcribe_sem: Optional[asyncio.Semaphore] = None  # serializes GPU transcription calls
+_transcribe_sem: Optional[asyncio.Semaphore] = None
 
 
 def _load_model() -> WhisperModel:
-    """Blocking model load — called in thread pool from lifespan."""
-    logger.info("Loading Whisper %s on CUDA float16...", MODEL_SIZE)
-    m = WhisperModel(
-        MODEL_SIZE,
-        device="cuda",
-        device_index=0,        # explicit — prevents ctranslate2 parallel_for from probing invalid device indices
-        compute_type="float16",
-        num_workers=1,         # single model replica; >1 spawns threads that lose CUDA context → InvalidDevice
-        cpu_threads=4,
-    )
+    """Blocking model load — called in thread pool from lifespan.
+
+    Device selection: if CUDA_VISIBLE_DEVICES is empty/"-1", fall back to CPU.
+    On CPU: int8 compute (3x faster than float16 on CPU, minimal quality loss)
+    and all available cores via cpu_threads.
+    On GPU: float16, single replica (num_workers>1 loses CUDA context → InvalidDevice).
+    """
+    cuda_env = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    use_gpu = cuda_env not in ("", "-1", "none", "None")
+
+    if use_gpu:
+        n_threads = 4
+        logger.info("Loading Whisper %s on CUDA float16...", MODEL_SIZE)
+        m = WhisperModel(
+            MODEL_SIZE,
+            device="cuda",
+            device_index=0,
+            compute_type="float16",
+            num_workers=1,
+            cpu_threads=n_threads,
+        )
+    else:
+        n_threads = os.cpu_count() or 4
+        logger.info("Loading Whisper %s on CPU int8 (%d threads)...", MODEL_SIZE, n_threads)
+        m = WhisperModel(
+            MODEL_SIZE,
+            device="cpu",
+            compute_type="int8",
+            num_workers=1,
+            cpu_threads=n_threads,
+        )
     logger.info("Whisper model ready.")
     return m
 
@@ -39,7 +61,7 @@ def _load_model() -> WhisperModel:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _model, _transcribe_sem
-    _transcribe_sem = asyncio.Semaphore(1)  # one GPU transcription at a time
+    _transcribe_sem = asyncio.Semaphore(1)  # one transcription at a time (cpu_threads already uses all cores)
     loop = asyncio.get_running_loop()
     _model = await loop.run_in_executor(None, _load_model)
     yield
