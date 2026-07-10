@@ -603,6 +603,10 @@ class ChunkDispatcher:
                             usage = (response.get("usage") or {}) if isinstance(response, dict) else {}
                             result["prefill_tokens"] = int(usage.get("prompt_tokens") or 0)
                             result["decode_tokens"] = int(usage.get("completion_tokens") or 0)
+                            _log(label,
+                                 f"OK {chunk.strict_start:.1f}s-{chunk.strict_end:.1f}s "
+                                 f"| prefill={result['prefill_tokens']} "
+                                 f"decode={result['decode_tokens']}")
                         except Exception as exc:
                             result["error"] = f"{type(exc).__name__}: {exc}"
                             _log(label, f"FAIL {result['error']}")
