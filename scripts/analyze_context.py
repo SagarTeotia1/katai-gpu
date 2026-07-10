@@ -499,8 +499,8 @@ def merge_chunks(
     total_duration: float,
 ) -> dict:
     """Combine N chunk outputs into one coherent context dict (minus synthesis fields)."""
-    # Sort chunks by window_start so events are chronological
-    chunk_results = sorted(chunk_results, key=lambda c: c.get("window_start", 0))
+    # Sort chunks by start time so events are chronological
+    chunk_results = sorted(chunk_results, key=lambda c: c.get("strict_start", c.get("window_start", 0)))
 
     # Merge and renumber timeline events
     all_events = _merge_sorted(chunk_results, "timeline")
