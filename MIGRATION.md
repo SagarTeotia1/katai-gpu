@@ -111,3 +111,93 @@ A "Top 10 slowest chunks" table follows — use it to spot outliers by scene pos
 - `httpx>=0.27.0`
 
 Install: `pip install -r scripts/requirements.txt`
+
+---
+
+## Async port of `analyze_context.py` (2026-07-10)
+
+Pipeline Step 3 calls `scripts/analyze_context.py`, not `scripts/chunk_analysis.py`.
+The earlier scene-aligned refactor landed in the wrong file — production was still
+running ThreadPoolExecutor(8) + FRACTURE_SPLIT retries. This port moves
+`analyze_context.py` onto the same shared dispatcher and makes
+`chunk_analysis.py` a thin CLI over it. One dispatcher, one `Chunk` type,
+one budget guardrail.
+
+### What changed
+
+- **New shared module** `scripts/chunk_dispatch.py` — single source of truth for
+  `Chunk`, `plan_chunks_scene_aligned`, `plan_chunks_equal_width`,
+  `estimate_embed_tokens`, `assert_chunks_fit_budget`, `ChunkDispatcher`,
+  `stub_failed_chunk`.
+- **`analyze_context.py`** now imports from `chunk_dispatch`. `plan_chunks`,
+  `_fracture_chunk`, `_run_chunk_attempt`, `analyze_one_chunk`, and the
+  in-file `ChunkDispatcher` are gone. Concurrency: `Semaphore(32)` replaces
+  `ThreadPoolExecutor(8)`. FRACTURE_SPLIT is removed — retrying a chunk that
+  400s on encoder-cache overflow just burns GPU. Budget assert catches it at
+  plan time instead.
+- **`chunk_analysis.py`** is now a thin shim over `chunk_dispatch` — keeps the
+  reduce (merge) logic and CLI, delegates planning + dispatch + budget.
+- **Videos run sequentially.** The old outer `ThreadPoolExecutor(video-parallel)`
+  is replaced by a `for v in videos` loop. Rationale: one video already saturates
+  the encoder cache at `--max-inflight 32`; overlapping two videos wastes
+  scheduling time and muddies metrics.
+- **Chunk-level failure stub.** When a chunk fails, the merge index stays dense
+  via `stub_failed_chunk` — one `"unanalyzed"` timeline event carrying the
+  transcript slice, empty lists for people/shots/audio/speakers so downstream
+  merge helpers don't KeyError.
+- **Aggregate synth timing.** Print now includes `synth_total` and its
+  percentage of wall — visible signal for whether Step 3 is bound by map or by
+  the synthesis passes.
+
+### The "8192 mystery"
+
+Old vLLM startup pinned encoder embedding cache to 8192 tokens (implicit default,
+coupled to `--max-num-batched-tokens`). A 60s chunk at fps=1.0 / max_pixels=602112
+lands at ~46K embed tokens — 5.6× the cache. Every long chunk 400'd with
+`"embedding tokens exceeds pre-allocated encoder cache size 8192"`. Two moves fix
+this:
+
+1. Server: `--max-num-batched-tokens 32768` in `docker-compose.yml` (already
+   deployed at commit `e63e1ae`) — decouples encoder cache from the 8192 default.
+2. Client: `MAX_CHUNK_S=20` cap in the planner + `assert_chunks_fit_budget` in
+   both entry points. A 20s window at fps=1.0 / max_pixels=602112 is ~15.4K
+   embed tokens, well inside the 27852 safe budget (0.85 × 32768). At fps=2.0
+   it would be ~30.7K — the assert catches this at plan time with the
+   remediation levers named in the message.
+
+The safe budget is env-coupled via `VLLM_ENCODER_CACHE` (new in `.env.example`).
+Keep it aligned with the compose flag or the assert protects nothing.
+
+### Baseline validity caveat
+
+Pre-patch runs never completed end-to-end (chunks 400'd; the ThreadPool retried
+via FRACTURE_SPLIT until it gave up). So "baseline" numbers before this port
+aren't a real comparison — they're partial. The port's headline metric is not
+"X% faster than before" but `peak_inflight` at the semaphore cap: if
+`peak_inflight` hits `max_inflight` well before the first `_first_below_cap`
+timestamp, the dispatcher is doing its job. `tail_idle_pct` under ~5% confirms
+the LPT sort is packing the tail.
+
+### Tests
+
+`tests/test_chunk_dispatch.py` covers:
+
+- `test_budget_assert_violation` — 20s @ fps=2.0 must raise `BudgetExceeded`
+  with `chunk_id=`, `est_embed_tokens=`, `safe_budget=`, and "Remediation" in
+  the message.
+- `test_budget_assert_passes_within_headroom` — 20s @ fps=1.0 must not raise.
+- `test_estimate_embed_tokens_monotonic` — token estimate grows with
+  `chunk_s`, `fps`, and `max_pixels`.
+- `test_stub_injection` — `stub_failed_chunk` shape is what
+  `merge_chunks._merge_sorted` / `_merge_people` expect (empty lists, one
+  `"unanalyzed"` timeline event, transcript preserved).
+- `test_dispatch_order_preserves_input_index` — `MockTransport` fan-out; four
+  chunks return in input order, all submitted within 100 ms of each other, all
+  succeed.
+
+### Env
+
+New in `.env.example`:
+
+- `VLLM_ENCODER_CACHE=32768` — MUST match compose `--max-num-batched-tokens`.
+  Client asserts against `0.85 × this`.

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Scene-aligned parallel chunk video analysis.
 
-Pipeline:
-  PROBE (ffprobe) → SCENE-DETECT (PySceneDetect) → PLAN (LPT) →
-  MAP (asyncio + httpx, all-inflight w/ semaphore) → REDUCE → output/
+Thin CLI over :mod:`chunk_dispatch` — the shared planner + async dispatcher
+also used by ``analyze_context.py``. This module keeps only:
+  - The map-side orchestration (``run``),
+  - The reduce-side merge (people / scenes / shots / timeline),
+  - The CLI + summary print.
 
-Backwards-compat CLI: --vid --chunks --duration --transcript --backend --out
-  --chunks is deprecated as an equal-width knob; treated as an inflight cap hint.
-  Use --max-inflight for the real semaphore. Warning is emitted.
+All chunk types, planning, budget assertion, and HTTP dispatch live in
+``chunk_dispatch``. Do not duplicate them here.
 """
 from __future__ import annotations
 
@@ -17,122 +18,22 @@ import json
 import logging
 import sys
 import time
-from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from scene_detect import detect_scene_cuts
-
+from chunk_dispatch import (
+    BudgetExceeded,
+    Chunk,
+    ChunkDispatcher,
+    assert_chunks_fit_budget,
+    plan_chunks_scene_aligned,
+    stub_failed_chunk,
+)
 
 logger = logging.getLogger(__name__)
-
-
-# ── Data types ────────────────────────────────────────────────────────────────
-
-
-@dataclass
-class Chunk:
-    chunk_id: int
-    scene_id: int
-    part_idx: int
-    start_s: float
-    end_s: float
-
-    @property
-    def duration(self) -> float:
-        return self.end_s - self.start_s
-
-
-@dataclass
-class ChunkMetrics:
-    chunk_id: int
-    start_s: float
-    end_s: float
-    submit_time: float = 0.0
-    first_token_time: float | None = None
-    done_time: float = 0.0
-    prefill_tokens: int = 0
-    decode_tokens: int = 0
-    wall_s: float = 0.0
-    error: str | None = None
-
-
-# ── PLAN ──────────────────────────────────────────────────────────────────────
-
-
-def plan_chunks(
-    scene_cuts: list[float],
-    duration: float,
-    min_s: float = 10.0,
-    max_s: float = 30.0,
-    overlap_s: float = 2.0,
-) -> list[Chunk]:
-    """Scene-aligned LPT chunk planner.
-
-    - Merge tiny scenes (< MIN_S) forward until segment >= MIN_S.
-    - Split long segments (> MAX_S) into equal sub-parts <= MAX_S.
-    - Overlap OVERLAP_S only on intra-scene split boundaries; never at scene cuts.
-    - Return sorted by duration DESCENDING (Longest Processing Time first).
-    """
-    if duration <= 0:
-        return []
-
-    cuts = sorted({round(float(c), 3) for c in scene_cuts if 0.0 <= c <= duration})
-    if not cuts or cuts[0] > 0.0:
-        cuts.insert(0, 0.0)
-    if cuts[-1] < duration:
-        cuts.append(float(duration))
-
-    # Step 1: merge scenes < MIN_S forward
-    merged: list[tuple[float, float]] = []
-    i = 0
-    while i < len(cuts) - 1:
-        seg_start = cuts[i]
-        j = i + 1
-        while j < len(cuts) and cuts[j] - seg_start < min_s and j < len(cuts) - 1:
-            j += 1
-        merged.append((seg_start, cuts[j]))
-        i = j
-
-    # If final segment < MIN_S, fold it into the previous one
-    if len(merged) >= 2 and (merged[-1][1] - merged[-1][0]) < min_s:
-        prev_start, _ = merged[-2]
-        _, last_end = merged[-1]
-        merged[-2] = (prev_start, last_end)
-        merged.pop()
-
-    # Step 2: split segments > MAX_S into equal parts <= MAX_S with overlap
-    planned: list[Chunk] = []
-    chunk_id_counter = 0
-    for scene_id, (s_start, s_end) in enumerate(merged):
-        seg_len = s_end - s_start
-        if seg_len <= max_s:
-            planned.append(Chunk(chunk_id_counter, scene_id, 0, s_start, s_end))
-            chunk_id_counter += 1
-            continue
-
-        n_parts = int((seg_len + max_s - 1e-6) // max_s) + (0 if seg_len % max_s == 0 else 0)
-        # Simpler: ceil(seg_len / max_s)
-        import math
-        n_parts = max(2, math.ceil(seg_len / max_s))
-        part_len = seg_len / n_parts
-        for p in range(n_parts):
-            raw_start = s_start + p * part_len
-            raw_end = s_start + (p + 1) * part_len
-            # Overlap only at intra-scene boundaries — never past the scene edge
-            eff_start = raw_start - overlap_s if p > 0 else raw_start
-            eff_end = raw_end + overlap_s if p < n_parts - 1 else raw_end
-            eff_start = max(s_start, eff_start)
-            eff_end = min(s_end, eff_end)
-            planned.append(Chunk(chunk_id_counter, scene_id, p, eff_start, eff_end))
-            chunk_id_counter += 1
-
-    # LPT: sort by duration DESC
-    planned.sort(key=lambda c: c.duration, reverse=True)
-    return planned
 
 
 # ── Transcript split ──────────────────────────────────────────────────────────
@@ -144,144 +45,13 @@ def split_transcript(transcript: str, chunks: list[Chunk], duration: float) -> d
     lines = transcript.strip().split("\n")
     out: dict[int, str] = {}
     for c in chunks:
-        start_line = int((c.start_s / duration) * len(lines))
-        end_line = int((c.end_s / duration) * len(lines))
+        start_line = int((c.strict_start / duration) * len(lines))
+        end_line = int((c.strict_end / duration) * len(lines))
         out[c.chunk_id] = "\n".join(lines[start_line:end_line])
     return out
 
 
-# ── MAP: async dispatcher ─────────────────────────────────────────────────────
-
-
-class ChunkDispatcher:
-    """Submits all chunks immediately, bounded by asyncio.Semaphore.
-
-    Retries: 2 attempts with exponential backoff on connect errors, 5xx, 429.
-    NEVER retries 400/422 (payload/config errors — retrying burns GPU).
-    """
-
-    NON_RETRY_STATUS = {400, 401, 403, 404, 405, 415, 422}
-    RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
-
-    def __init__(
-        self,
-        backend: str,
-        max_inflight: int,
-        max_retries: int = 2,
-        timeout_s: float = 600.0,
-    ) -> None:
-        self.backend = backend.rstrip("/")
-        self.sem = asyncio.Semaphore(max_inflight)
-        self.max_retries = max_retries
-        self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=timeout_s, write=30.0, pool=5.0),
-        )
-        # Concurrency instrumentation for tail_idle_pct
-        self._inflight: int = 0
-        self._inflight_log: list[tuple[float, int]] = []
-        self._lock = asyncio.Lock()
-
-    async def aclose(self) -> None:
-        await self.client.aclose()
-
-    async def _track(self, delta: int) -> None:
-        async with self._lock:
-            self._inflight += delta
-            self._inflight_log.append((time.monotonic(), self._inflight))
-
-    async def submit(
-        self,
-        chunk: Chunk,
-        video_url: str,
-        duration: float,
-        total_chunks: int,
-        transcript_segment: str,
-    ) -> tuple[dict | None, ChunkMetrics]:
-        metrics = ChunkMetrics(chunk_id=chunk.chunk_id, start_s=chunk.start_s, end_s=chunk.end_s)
-        payload = {
-            "video_url": video_url,
-            "chunk_id": chunk.chunk_id,
-            "total_chunks": total_chunks,
-            "start": round(chunk.start_s, 2),
-            "end": round(chunk.end_s, 2),
-            "duration": duration,
-            "transcript_segment": transcript_segment,
-        }
-
-        async with self.sem:
-            await self._track(+1)
-            metrics.submit_time = time.monotonic()
-            try:
-                result = await self._request_with_retry(payload, metrics)
-                return result, metrics
-            except Exception as exc:
-                metrics.error = str(exc)
-                logger.error("chunk %d failed: %s", chunk.chunk_id, exc)
-                return None, metrics
-            finally:
-                metrics.done_time = time.monotonic()
-                metrics.wall_s = metrics.done_time - metrics.submit_time
-                await self._track(-1)
-
-    async def _request_with_retry(self, payload: dict, metrics: ChunkMetrics) -> dict:
-        backoff = 1.0
-        last_exc: Exception | None = None
-        for attempt in range(self.max_retries + 1):
-            try:
-                r = await self.client.post(f"{self.backend}/api/video/chunk", json=payload)
-                if r.status_code in self.NON_RETRY_STATUS:
-                    raise RuntimeError(f"HTTP {r.status_code} (non-retriable): {r.text[:300]}")
-                if r.status_code in self.RETRY_STATUS:
-                    raise httpx.HTTPStatusError("retriable", request=r.request, response=r)
-                r.raise_for_status()
-                data = r.json()
-                usage = data.get("usage") or {}
-                metrics.prefill_tokens = int(usage.get("prompt_tokens") or 0)
-                metrics.decode_tokens = int(usage.get("completion_tokens") or 0)
-                return data
-            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
-                    httpx.HTTPStatusError) as exc:
-                last_exc = exc
-                if attempt >= self.max_retries:
-                    break
-                logger.warning("chunk %d attempt %d retry after %.1fs: %s",
-                               metrics.chunk_id, attempt + 1, backoff, exc)
-                await asyncio.sleep(backoff)
-                backoff *= 2
-            except RuntimeError:
-                raise  # non-retriable
-        raise last_exc or RuntimeError("chunk request failed with no exception recorded")
-
-    def tail_idle_pct(self, expected_max: int) -> float:
-        """Compute % wall time spent with inflight < min(expected_max, remaining tasks).
-
-        Approximation: identify the first monotonic timestamp where inflight
-        dropped below expected_max after having reached it; ratio of that
-        tail window to total wall time.
-        """
-        if not self._inflight_log:
-            return 0.0
-        t0 = self._inflight_log[0][0]
-        t_end = self._inflight_log[-1][0]
-        wall = t_end - t0
-        if wall <= 0:
-            return 0.0
-        # Find first time inflight hit expected_max
-        peak_reached = False
-        tail_start: float | None = None
-        for t, n in self._inflight_log:
-            if not peak_reached and n >= expected_max:
-                peak_reached = True
-                continue
-            if peak_reached and n < expected_max and tail_start is None:
-                tail_start = t
-                break
-        if tail_start is None:
-            return 0.0
-        return 100.0 * (t_end - tail_start) / wall
-
-
-# ── REDUCE (merge — unchanged logic, now scene-first) ─────────────────────────
+# ── REDUCE (merge) ────────────────────────────────────────────────────────────
 
 
 def _safe_list(d: dict, key: str) -> list:
@@ -411,8 +181,6 @@ def merge_summary(chunks: list[dict], people_count: int, duration: float) -> dic
 
 
 def merge(chunk_results: list[dict], duration: float) -> dict:
-    """Scene-first merge: group by scene_id, stitch intra-scene, then cross-scene."""
-    # Group by scene_id, ordered by (scene_id, part_idx)
     by_scene: dict[int, list[dict]] = {}
     for r in chunk_results:
         sid = int(r.get("_scene_id", 0))
@@ -423,7 +191,6 @@ def merge(chunk_results: list[dict], duration: float) -> dict:
     ordered: list[dict] = []
     for sid in sorted(by_scene):
         ordered.extend(by_scene[sid])
-    # Fall back to chunk_start sort if metadata absent
     ordered.sort(key=lambda c: (int(c.get("_scene_id", 0)), int(c.get("_part_idx", 0)), c.get("chunk_start", 0)))
 
     all_people_raw = [_safe_list(c, "people") for c in ordered]
@@ -439,7 +206,7 @@ def merge(chunk_results: list[dict], duration: float) -> dict:
     )
 
     return {
-        "metadata": _safe_dict(ordered[0], "metadata"),
+        "metadata": _safe_dict(ordered[0], "metadata") if ordered else {},
         "coverage": build_coverage(ordered, duration),
         "people": merged_people,
         "objects": merge_objects([_safe_list(c, "objects") for c in ordered]),
@@ -478,6 +245,21 @@ async def probe_duration(backend: str, video_url: str, given: float) -> float:
     return d
 
 
+def _build_payload(video_url: str, duration: float, total: int,
+                   trans_by_id: dict[int, str]):
+    def build(c: Chunk) -> dict[str, Any]:
+        return {
+            "video_url": video_url,
+            "chunk_id": c.chunk_id,
+            "total_chunks": total,
+            "start": round(c.strict_start, 2),
+            "end": round(c.strict_end, 2),
+            "duration": duration,
+            "transcript_segment": trans_by_id.get(c.chunk_id, ""),
+        }
+    return build
+
+
 async def run(
     video_url: str,
     backend: str,
@@ -488,6 +270,8 @@ async def run(
     min_s: float,
     max_s: float,
     overlap_s: float,
+    fps: float,
+    max_pixels: int,
 ) -> int:
     t_total = time.monotonic()
 
@@ -496,70 +280,84 @@ async def run(
         print("[!] Could not determine duration.", file=sys.stderr)
         return 1
 
-    print("[scene] Detecting scene cuts…")
-    t_scene = time.monotonic()
-    cuts = detect_scene_cuts(video_url, duration)
-    print(f"[scene] {len(cuts)} cuts in {time.monotonic() - t_scene:.1f}s")
-
-    chunks = plan_chunks(cuts, duration, min_s=min_s, max_s=max_s, overlap_s=overlap_s)
+    print("[plan] Scene-aligned plan…")
+    chunks = plan_chunks_scene_aligned(
+        video_url, duration, min_s=min_s, max_s=max_s, overlap_s=overlap_s,
+    )
     total = len(chunks)
     if total == 0:
         print("[!] Planner produced 0 chunks.", file=sys.stderr)
         return 1
+
+    # Encoder-cache budget guardrail — fail fast before firing GPU work.
+    try:
+        assert_chunks_fit_budget(chunks, fps=fps, max_pixels=max_pixels)
+    except BudgetExceeded as exc:
+        print(f"[!] BudgetExceeded: {exc}", file=sys.stderr)
+        return 1
+
     print(f"\n[plan] {total} chunks (LPT sorted):")
     for c in chunks:
         print(f"  chunk {c.chunk_id:02d} scene={c.scene_id} part={c.part_idx}  "
-              f"{c.start_s:.1f}s → {c.end_s:.1f}s  ({c.duration:.1f}s)")
+              f"{c.strict_start:.1f}s → {c.strict_end:.1f}s  ({c.strict_duration:.1f}s)")
 
     trans_by_id = split_transcript(transcript, chunks, duration)
 
     print(f"\n[map] Firing {total} chunks (inflight cap {max_inflight})…\n")
-    dispatcher = ChunkDispatcher(backend, max_inflight)
+    dispatcher = ChunkDispatcher(
+        vllm_url=f"{backend.rstrip('/')}/api/video/chunk",
+        max_inflight=max_inflight,
+    )
+
+    def _log(label: str, msg: str) -> None:
+        print(f"  [{label}] {msg}")
+
     t_map = time.monotonic()
-
-    try:
-        tasks = [
-            dispatcher.submit(c, video_url, duration, total, trans_by_id.get(c.chunk_id, ""))
-            for c in chunks
-        ]
-        results = await asyncio.gather(*tasks)
-    finally:
-        await dispatcher.aclose()
-
+    results = await dispatcher.run(
+        chunks,
+        build_payload=_build_payload(video_url, duration, total, trans_by_id),
+        log_fn=_log,
+    )
     map_wall = time.monotonic() - t_map
 
-    # Attach scene/part metadata to results for the merge step
     ok_results: list[dict] = []
-    metrics_all: list[ChunkMetrics] = []
-    failed: list[ChunkMetrics] = []
-    for chunk, (data, metrics) in zip(chunks, results):
-        metrics_all.append(metrics)
-        if data is None:
-            failed.append(metrics)
-            print(f"  [x] chunk {chunk.chunk_id:02d}  FAIL  {metrics.error}")
+    failed_count = 0
+    for chunk, r in zip(chunks, results):
+        if not r["ok"] or r["response"] is None:
+            failed_count += 1
+            print(f"  [x] chunk {chunk.chunk_id:02d}  FAIL  {r['error']}")
+            # Keep merge index dense.
+            stub = stub_failed_chunk(chunk, trans_by_id.get(chunk.chunk_id, ""))
+            stub["_scene_id"] = chunk.scene_id
+            stub["_part_idx"] = chunk.part_idx
+            stub["_planned_start"] = chunk.strict_start
+            stub["_planned_end"] = chunk.strict_end
+            ok_results.append(stub)
+            continue
+        data = r["response"]
+        if not isinstance(data, dict):
+            failed_count += 1
             continue
         data["_scene_id"] = chunk.scene_id
         data["_part_idx"] = chunk.part_idx
-        data["_planned_start"] = chunk.start_s
-        data["_planned_end"] = chunk.end_s
+        data["_planned_start"] = chunk.strict_start
+        data["_planned_end"] = chunk.strict_end
         ok_results.append(data)
-        print(f"  [✓] chunk {chunk.chunk_id:02d}  {metrics.wall_s:.1f}s  "
-              f"prefill={metrics.prefill_tokens} decode={metrics.decode_tokens}")
+        print(f"  [✓] chunk {chunk.chunk_id:02d}  {r['wall_s']:.1f}s  "
+              f"prefill={r['prefill_tokens']} decode={r['decode_tokens']}")
 
-    if not ok_results:
+    if not any(r["ok"] for r in results):
         print("[!] All chunks failed.", file=sys.stderr)
         return 1
 
-    print(f"\n[map] {len(ok_results)}/{total} chunks done in {map_wall:.1f}s")
+    print(f"\n[map] {total - failed_count}/{total} chunks done in {map_wall:.1f}s")
 
-    # REDUCE
     print("[reduce] Merging…")
     t_reduce = time.monotonic()
     merged = merge(ok_results, duration)
     reduce_time = time.monotonic() - t_reduce
     print(f"[reduce] {reduce_time:.2f}s")
 
-    # SAVE
     slug = video_url.split("/")[-1].split("?")[0].replace("%20", "_")[:40] or "video"
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -567,42 +365,42 @@ async def run(
     out_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
 
     total_wall = time.monotonic() - t_total
-    print_summary(metrics_all, failed, total_wall, map_wall, max_inflight, dispatcher, out_path)
-    return 0 if not failed else 2
+    print_summary(results, dispatcher.metrics, total_wall, map_wall, out_path)
+    return 0 if failed_count == 0 else 2
 
 
 def print_summary(
-    metrics: list[ChunkMetrics],
-    failed: list[ChunkMetrics],
+    results: list[dict],
+    metrics: dict,
     total_wall: float,
     map_wall: float,
-    max_inflight: int,
-    dispatcher: ChunkDispatcher,
     out_path: Path,
 ) -> None:
-    ok = [m for m in metrics if m.error is None]
-    prefill = sum(m.prefill_tokens for m in ok)
-    decode = sum(m.decode_tokens for m in ok)
-    expected_max = min(max_inflight, len(metrics))
-    tail_pct = dispatcher.tail_idle_pct(expected_max)
+    ok = [r for r in results if r["ok"]]
+    prefill = metrics.get("prefill_total", 0)
+    decode = metrics.get("decode_total", 0)
+    tail_pct = float(metrics.get("tail_idle_pct", 0.0))
+    peak = metrics.get("peak_inflight", 0)
+    failed = metrics.get("failed", 0)
 
     print(f"\n{'='*60}")
-    print(f"  Saved: {out_path}")
+    print(f"  Saved:           {out_path}")
     print(f"  Total wall:      {total_wall:.1f}s")
     print(f"  Map wall:        {map_wall:.1f}s")
+    print(f"  Peak inflight:   {peak}")
     print(f"  Tail idle pct:   {tail_pct:.1f}%")
     print(f"  Prefill tokens:  {prefill}")
     print(f"  Decode tokens:   {decode}")
-    print(f"  Failed:          {len(failed)}/{len(metrics)}")
+    print(f"  Failed:          {failed}/{len(results)}")
     print(f"{'='*60}")
 
-    slowest = sorted(ok, key=lambda m: m.wall_s, reverse=True)[:10]
+    slowest = sorted(ok, key=lambda r: r["wall_s"], reverse=True)[:10]
     if slowest:
         print("\n  Top 10 slowest chunks:")
         print(f"  {'id':>3} {'start':>7} {'end':>7} {'wall':>7} {'prefill':>8} {'decode':>7}")
-        for m in slowest:
-            print(f"  {m.chunk_id:>3} {m.start_s:>7.1f} {m.end_s:>7.1f} "
-                  f"{m.wall_s:>7.1f} {m.prefill_tokens:>8} {m.decode_tokens:>7}")
+        for r in slowest:
+            print(f"  {r['chunk_id']:>3} {r['strict_start']:>7.1f} {r['strict_end']:>7.1f} "
+                  f"{r['wall_s']:>7.1f} {r['prefill_tokens']:>8} {r['decode_tokens']:>7}")
 
     if tail_pct > 5.0:
         print(f"\n  [warn] tail_idle_pct={tail_pct:.1f}% > 5% — GPU under-utilised at end; "
@@ -610,11 +408,6 @@ def print_summary(
     if prefill > decode and decode > 0:
         print(f"  [warn] prefill ({prefill}) > decode ({decode}) — prompts dominate; "
               "check max_pixels or fps.")
-
-    if failed:
-        print(f"\n  [warn] {len(failed)} chunk(s) failed:")
-        for m in failed:
-            print(f"    chunk {m.chunk_id}  {m.start_s:.1f}-{m.end_s:.1f}s  {m.error}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -635,12 +428,15 @@ def main() -> None:
     parser.add_argument("--min-s", type=float, default=8.0)
     parser.add_argument("--max-s", type=float, default=20.0)
     parser.add_argument("--overlap-s", type=float, default=2.0)
+    parser.add_argument("--fps", type=float, default=1.0,
+                        help="Must match vLLM --mm-processor-kwargs fps")
+    parser.add_argument("--max-pixels", type=int, default=602112,
+                        help="Must match vLLM --mm-processor-kwargs max_pixels")
     args = parser.parse_args()
 
     if args.chunks:
         print(f"[warn] --chunks={args.chunks} is deprecated for equal-width splitting; "
               f"using scene-aligned planner. Treating value as inflight hint.")
-        # Only override if caller didn't explicitly pass --max-inflight
         if args.max_inflight == 32:
             args.max_inflight = args.chunks
 
@@ -652,16 +448,18 @@ def main() -> None:
             print(f"[transcript] Loaded {len(transcript)} chars")
 
     print(f"\n{'='*60}")
-    print(f"  Scene-Aligned Chunk Analysis")
+    print(f"  Scene-Aligned Chunk Analysis (shared dispatcher)")
     print(f"  Video:        {args.vid}")
     print(f"  Backend:      {args.backend}")
     print(f"  Max inflight: {args.max_inflight}")
     print(f"  min/max/overlap: {args.min_s}s / {args.max_s}s / {args.overlap_s}s")
+    print(f"  fps={args.fps} max_pixels={args.max_pixels}")
     print(f"{'='*60}\n")
 
     rc = asyncio.run(run(
         args.vid, args.backend, args.max_inflight, args.duration,
         transcript, Path(args.out), args.min_s, args.max_s, args.overlap_s,
+        args.fps, args.max_pixels,
     ))
     sys.exit(rc)
 
