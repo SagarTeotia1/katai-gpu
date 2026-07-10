@@ -350,7 +350,7 @@ class WorkStealingQueue:
                     break
             if self._pending == 0:
                 self._closed = True
-            if splits > 0:
+            if splits > 0 or self._closed:
                 self._cond.notify_all()
             return splits
 
