@@ -55,8 +55,7 @@ def detect_scene_cuts(
         video = open_video(video_url)
         sm = SceneManager()
         sm.add_detector(ContentDetector(threshold=threshold))
-        sm.auto_downscale = True
-        sm.detect_scenes(video, show_progress=False)
+        sm.detect_scenes(video, show_progress=False, frame_skip=1)
         scene_list = sm.get_scene_list()
     except Exception as exc:
         logger.warning("scene_detect: detection failed (%s) — falling back to [0, duration]", exc)
