@@ -49,6 +49,9 @@ from chunk_dispatch import (
     stub_failed_chunk,
 )
 
+# Semantic event builder — replaces fixed-width chunking as the default planner.
+import event_builder as _eb
+
 VLLM_URL    = "http://localhost:8000/v1/chat/completions"
 MODEL_ID    = "Qwen/Qwen3.6-27B"
 MAX_TOKENS  = 32768
@@ -257,7 +260,193 @@ def allocate_chunks(durations: dict[str, float], total_budget: int) -> dict[str,
 # and ChunkDispatcher retries handle transient failures.
 
 
-# ── Chunk-aware system prompt ─────────────────────────────────────────────────
+# ── Chunk-aware system prompts (tiered by processing profile) ─────────────────
+#
+# THREE templates — same output schema (merge logic stays identical), but
+# instruction depth scales with event importance:
+#   quick  (LOW profile,  512 tok) — who/where/what, minimal scoring
+#   rich   (MEDIUM,      1500 tok) — full timeline, scores, world_state
+#   full   (HIGH,        4096 tok) — everything + editing hooks, retention, b-roll
+#
+# build_chunk_system_prompt_tiered() is the single entry point; callers pass
+# profile="LOW"|"MEDIUM"|"HIGH" and the right template is selected.
+
+_CHUNK_JSON_HEADER = (
+    "RESPOND WITH RAW JSON ONLY. YOUR ENTIRE RESPONSE MUST START WITH { AND END WITH }. "
+    "NO PROSE. NO MARKDOWN. NO EXPLANATION. NO STEP-BY-STEP. "
+    "DO NOT THINK OUT LOUD. OUTPUT ONLY THE JSON OBJECT."
+)
+
+_CHUNK_SCHEMA_COMMON = """\
+{{
+  "chunk_id": {chunk_id},
+  "video_id": "{video_label}",
+  "window_start": {strict_start},
+  "window_end": {strict_end},
+  "active_people": ["P001"],
+  "timeline": [
+    {{
+      "id": "E{chunk_id:02d}_000",
+      "start": <float ≥ {strict_start:.2f}>,
+      "end": <float ≤ {strict_end:.2f}>,
+      "type": "<dialogue|reaction|laugh|joke|question|answer|transition>",
+      "moment": "<8 words max>",
+      "visible_people": ["P001"],
+      "speaker": "<person_id or null>",
+      "transcript_text": "<exact words or empty>",
+      "listener_reactions": [{{"person_id": "P002", "reaction": "<laughing|nodding|surprised|shocked>"}}],
+      "scores": {{"importance": <0-10>, "hook": <0-10>, "clip": <0-10>, "viral": <0-10>, "emotion": <0-10>}},
+      "clip_worthy": <true|false>,
+      "thumbnail_worthy": <true|false>
+    }}
+  ],
+  "audio_events": [{{"start": <float>, "end": <float>, "type": "<laughter|music|silence|crosstalk>", "intensity": "<soft|medium|loud>"}}],
+  "world_state": {{
+    "story_stage": "<setup|conflict|explanation|punchline|resolution|transition>",
+    "scene_emotion": "<funny|tense|emotional|informative|awkward|excited|calm>",
+    "energy": "<high|medium|low>",
+    "current_topic": "<5 words max>",
+    "open_loops": ["<unresolved thread>"],
+    "callbacks": ["<recurring reference>"],
+    "last_moment": "<10 words>"
+  }}
+}}"""
+
+
+def _build_quick_prompt(
+    person_db: str, transcript_json: str, video_label: str,
+    chunk_id: int, total_chunks: int,
+    strict_start: float, strict_end: float, total_duration: float,
+) -> str:
+    """LOW profile — minimal reasoning, 2-4 events, basic who/where/what."""
+    return f"""{_CHUNK_JSON_HEADER}
+
+You are a fast video metadata scanner. LOW-IMPORTANCE segment.
+
+Video: {video_label} | Window: {strict_start:.2f}s→{strict_end:.2f}s of {total_duration:.2f}s
+
+RULES:
+- 2-4 events only — capture major moment changes, skip minor reactions
+- All timestamps ABSOLUTE from video start
+- scores may all be 0 unless something is clearly clip-worthy
+- "moment" field: 8 words max
+
+PEOPLE:
+{person_db}
+
+TRANSCRIPT (this window only):
+{transcript_json}
+
+Return ONLY valid JSON:
+{_CHUNK_SCHEMA_COMMON.format(
+    chunk_id=chunk_id, video_label=video_label,
+    strict_start=strict_start, strict_end=strict_end,
+)}"""
+
+
+def _build_rich_prompt(
+    person_db: str, transcript_json: str, video_label: str,
+    chunk_id: int, total_chunks: int,
+    strict_start: float, strict_end: float, total_duration: float,
+) -> str:
+    """MEDIUM profile — standard depth, full timeline + scores + world_state."""
+    n_min = max(3, int((strict_end - strict_start) / 6))
+    n_max = max(6, int((strict_end - strict_start) / 3))
+    return f"""{_CHUNK_JSON_HEADER}
+
+You are a semantic video analysis engine. MEDIUM-IMPORTANCE segment.
+
+Video: {video_label} | Window: {strict_start:.2f}s→{strict_end:.2f}s of {total_duration:.2f}s total
+
+RULES:
+- Output ONLY events where start >= {strict_start:.2f} AND end <= {strict_end:.2f}
+- All timestamps ABSOLUTE from video start (never relative to chunk)
+- Max event duration: 8 seconds
+- Events per window: {n_min}-{n_max} (keep all clear dialogue exchanges, reactions, topic shifts)
+- Keep ALL spoken exchanges with clear transcript text. Skip only truly silent gaps.
+- "moment" field: 8 words max — what happens visually or verbally
+
+PEOPLE:
+{person_db}
+
+TRANSCRIPT:
+{transcript_json}
+
+Return ONLY valid JSON:
+{_CHUNK_SCHEMA_COMMON.format(
+    chunk_id=chunk_id, video_label=video_label,
+    strict_start=strict_start, strict_end=strict_end,
+)}"""
+
+
+def _build_full_prompt(
+    person_db: str, transcript_json: str, video_label: str,
+    chunk_id: int, total_chunks: int,
+    strict_start: float, strict_end: float, total_duration: float,
+) -> str:
+    """HIGH profile — maximum depth: editing hooks, retention, b-roll, continuity."""
+    n_min = max(4, int((strict_end - strict_start) / 5))
+    n_max = max(8, int((strict_end - strict_start) / 2))
+    return f"""{_CHUNK_JSON_HEADER}
+
+You are a senior video editor performing DEEP analysis. HIGH-IMPORTANCE segment — this window
+contains a significant editorial event (scene cut + topic shift, speaker change, high-energy
+action, or climax moment). Maximum depth required.
+
+Video: {video_label} | Window: {strict_start:.2f}s→{strict_end:.2f}s of {total_duration:.2f}s total
+
+RULES:
+- Output ONLY events where start >= {strict_start:.2f} AND end <= {strict_end:.2f}
+- All timestamps ABSOLUTE from video start
+- Max event duration: 8 seconds
+- Events per window: {n_min}-{n_max} — capture EVERY exchange, reaction, pause, punchline
+- Score every event honestly: importance/hook/clip/viral/emotion are 0-10
+- Flag retention hooks: first-frame hooks, pattern interrupts, emotional peaks
+- Note b-roll opportunities in "moment" (e.g. "reaction shot", "cutaway needed")
+- Identify transition quality: abrupt cut vs smooth vs motivated
+- "moment" field: 8 words max but be specific about WHAT and WHO
+
+PEOPLE:
+{person_db}
+
+TRANSCRIPT (full precision required for this window):
+{transcript_json}
+
+Return ONLY valid JSON (this is a HIGH-priority segment — complete all fields):
+{_CHUNK_SCHEMA_COMMON.format(
+    chunk_id=chunk_id, video_label=video_label,
+    strict_start=strict_start, strict_end=strict_end,
+)}"""
+
+
+def build_chunk_system_prompt_tiered(
+    profile: str,
+    person_db: str,
+    transcript_json: str,
+    video_label: str,
+    chunk_id: int,
+    total_chunks: int,
+    strict_start: float,
+    strict_end: float,
+    total_duration: float,
+) -> str:
+    """Select prompt template based on processing profile name."""
+    if profile == "HIGH":
+        return _build_full_prompt(
+            person_db, transcript_json, video_label,
+            chunk_id, total_chunks, strict_start, strict_end, total_duration,
+        )
+    if profile == "LOW":
+        return _build_quick_prompt(
+            person_db, transcript_json, video_label,
+            chunk_id, total_chunks, strict_start, strict_end, total_duration,
+        )
+    # MEDIUM (default)
+    return _build_rich_prompt(
+        person_db, transcript_json, video_label,
+        chunk_id, total_chunks, strict_start, strict_end, total_duration,
+    )
+
 
 def build_chunk_system_prompt(
     person_db: str,
@@ -269,66 +458,11 @@ def build_chunk_system_prompt(
     strict_end: float,
     total_duration: float,
 ) -> str:
-    return f"""RESPOND WITH RAW JSON ONLY. YOUR ENTIRE RESPONSE MUST START WITH {{ AND END WITH }}. NO PROSE. NO MARKDOWN. NO EXPLANATION. NO STEP-BY-STEP. DO NOT THINK OUT LOUD. OUTPUT ONLY THE JSON OBJECT.
-
-You are a semantic video analysis engine. ONE CHUNK of a video.
-
-Video: {video_label} | Window: {strict_start:.2f}s→{strict_end:.2f}s of {total_duration:.2f}s total
-
-RULES:
-- Output ONLY events where start >= {strict_start:.2f} AND end <= {strict_end:.2f}
-- All timestamps ABSOLUTE from video start (never relative to chunk)
-- Max event duration: 8 seconds
-- Events per window: {max(3, int((strict_end-strict_start)/6))}-{max(6, int((strict_end-strict_start)/3))} (keep all clear dialogue exchanges, reactions, topic shifts)
-- Keep ALL spoken exchanges with clear transcript text. Skip only truly silent gaps with no action or speech.
-- "moment" field: 8 words max — what happens visually or verbally (key visual OR key line said)
-
-PEOPLE:
-{person_db}
-
-TRANSCRIPT:
-{transcript_json}
-
-Return ONLY valid JSON — no prose, no markdown:
-{{
-  "chunk_id": {chunk_id},
-  "video_id": "{video_label}",
-  "window_start": {strict_start},
-  "window_end": {strict_end},
-
-  "active_people": ["P001", "P002"],
-
-  "timeline": [
-    {{
-      "id": "E{chunk_id:02d}_{'{:03d}'.format(0)}",
-      "start": <float ≥ {strict_start:.2f}>,
-      "end": <float ≤ {strict_end:.2f}>,
-      "type": "<dialogue|reaction|laugh|joke|question|answer|transition>",
-      "moment": "<8 words max — what visually happens>",
-      "visible_people": ["P001"],
-      "speaker": "<person_id or null>",
-      "transcript_text": "<exact words or empty>",
-      "listener_reactions": [{{"person_id": "P002", "reaction": "<laughing|nodding|surprised|shocked>"}}],
-      "scores": {{"importance": <0-10>, "hook": <0-10>, "clip": <0-10>, "viral": <0-10>, "emotion": <0-10>}},
-      "clip_worthy": <true|false>,
-      "thumbnail_worthy": <true|false>
-    }}
-  ],
-
-  "audio_events": [
-    {{"start": <float>, "end": <float>, "type": "<laughter|music|silence|crosstalk>", "intensity": "<soft|medium|loud>"}}
-  ],
-
-  "world_state": {{
-    "story_stage": "<setup|conflict|explanation|punchline|resolution|transition>",
-    "scene_emotion": "<funny|tense|emotional|informative|awkward|excited|calm>",
-    "energy": "<high|medium|low>",
-    "current_topic": "<5 words max>",
-    "open_loops": ["<unresolved question or thread, 8 words max>"],
-    "callbacks": ["<recurring joke or reference, 6 words max>"],
-    "last_moment": "<10 words — what just happened at window end>"
-  }}
-}}"""
+    """Legacy wrapper — always uses MEDIUM (rich) profile."""
+    return build_chunk_system_prompt_tiered(
+        "MEDIUM", person_db, transcript_json, video_label,
+        chunk_id, total_chunks, strict_start, strict_end, total_duration,
+    )
 
 
 # ── Synthesis prompt — text-only second pass after chunk merge ────────────────
@@ -1055,9 +1189,12 @@ def _plan_video_chunks(
     total_duration: float,
     n_chunks: int,
     model_id: str,
-    scene_align: bool,
+    planner: str = "semantic",
 ) -> dict:
-    """Returns plan dict or dict with 'error' key if planning fails."""
+    """Returns plan dict or dict with 'error' key if planning fails.
+
+    planner: "semantic" (default) | "scene" | "fixed"
+    """
     t0       = time.time()
     safe_url = urllib.parse.quote(video_url, safe=":/?=&%#@!")
     if safe_url != video_url:
@@ -1065,7 +1202,31 @@ def _plan_video_chunks(
 
     person_db = build_person_database(cast_analysis, video_label)
 
-    if scene_align:
+    # Per-event profile map (chunk_id → "LOW"|"MEDIUM"|"HIGH")
+    event_profiles: dict[int, str] = {}
+
+    if planner == "semantic":
+        segs: list[dict] = []
+        for v in transcripts.get("videos", []):
+            if v.get("video") == video_label:
+                segs = v.get("segments", [])
+                break
+        events = _eb.build_events(
+            duration=total_duration,
+            scene_cuts=None,
+            transcript_segments=segs,
+            max_event_s=MAX_CHUNK_S,
+            min_event_s=5.0,
+        )
+        chunks = _eb.events_to_chunks(events, duration=total_duration, overlap_s=CHUNK_OVERLAP)
+        event_profiles = {e.event_id: e.profile for e in events}
+        stats = _eb.event_stats(events)
+        log(video_label,
+            f"Semantic plan: {stats['total_events']} events — "
+            f"HIGH={stats['by_tier']['HIGH']} MEDIUM={stats['by_tier']['MEDIUM']} "
+            f"LOW={stats['by_tier']['LOW']} | avg={stats['avg_duration_s']}s")
+
+    elif planner == "scene":
         chunks = plan_chunks_scene_aligned(
             video_url, total_duration,
             min_s=5.0, max_s=MAX_CHUNK_S, overlap_s=CHUNK_OVERLAP,
@@ -1073,7 +1234,8 @@ def _plan_video_chunks(
         log(video_label,
             f"Scene-aligned: {len(chunks)} chunks "
             f"(durations: {[round(c.strict_duration, 1) for c in chunks]})")
-    else:
+
+    else:  # "fixed"
         chunks = plan_chunks_equal_width(
             total_duration, n_chunks,
             overlap_s=CHUNK_OVERLAP, max_s=MAX_CHUNK_S,
@@ -1081,7 +1243,7 @@ def _plan_video_chunks(
 
     n_planned = len(chunks)
     if n_planned == 0:
-        return {"error": "planner produced 0 chunks"}
+        return {"error": "planner produced 0 events"}
 
     try:
         assert_chunks_fit_budget(chunks, fps=MM_FPS, max_pixels=MM_MAX_PIXELS)
@@ -1089,14 +1251,17 @@ def _plan_video_chunks(
         log(video_label, f"BUDGET FAIL — {e}")
         return {"error": f"budget: {e}"}
 
-    log(video_label,
-        f"Planned {n_planned} chunks (~{total_duration / n_planned:.0f}s each) queued into shared pool")
+    if planner != "semantic":
+        log(video_label,
+            f"Planned {n_planned} chunks (~{total_duration / n_planned:.0f}s each) queued into shared pool")
 
     def build_payload(c: Chunk) -> dict:
+        prof      = event_profiles.get(c.chunk_id, "MEDIUM")
+        tok_limit = _eb.PROFILES[prof].max_tokens if prof in _eb.PROFILES else TOKEN_BUDGETS[0]
         return _build_chunk_payload(
             c, video_label, safe_url,
             person_db, transcripts, total_duration,
-            n_planned, model_id, max_tokens=TOKEN_BUDGETS[0],
+            n_planned, model_id, max_tokens=tok_limit, profile=prof,
         )
 
     def label_fn(c: Chunk) -> str:
@@ -1647,8 +1812,14 @@ def _build_chunk_payload(
     n_video_chunks: int,
     model_id: str,
     max_tokens: int = 20480,
+    profile: str = "MEDIUM",
 ) -> dict:
     """Build a single vLLM /v1/chat/completions payload for one chunk.
+
+    ``profile`` selects the prompt template (LOW/MEDIUM/HIGH) which controls
+    instruction depth, event density requirements, and reasoning guidance.
+    ``max_tokens`` should come from ``event_builder.PROFILES[profile].max_tokens``
+    when using semantic event planning.
 
     Kept as a plain helper (not a closure) so it stays independently testable and
     the closure passed to ChunkDispatcher is trivially thin.
@@ -1657,13 +1828,13 @@ def _build_chunk_payload(
         transcripts, video_label,
         start_s=chunk.strict_start, end_s=chunk.strict_end,
     )
-    system = build_chunk_system_prompt(
-        person_db, transcript_seg, video_label,
+    system = build_chunk_system_prompt_tiered(
+        profile, person_db, transcript_seg, video_label,
         chunk.chunk_id, n_video_chunks,
         chunk.strict_start, chunk.strict_end, total_duration,
     )
     user_text = (
-        f"Output the JSON object for chunk {chunk.chunk_id + 1}/{n_video_chunks} of {video_label}. "
+        f"Output the JSON object for event {chunk.chunk_id + 1}/{n_video_chunks} of {video_label}. "
         f"Events between {chunk.strict_start:.2f}s–{chunk.strict_end:.2f}s only. "
         f"Start your response with {{ immediately."
     )
@@ -1710,17 +1881,21 @@ def analyze_video_chunked(
     global_progress: dict,
     global_lock: threading.Lock,
     agent_base: int = 0,
-    scene_align: bool = False,
+    planner: str = "semantic",
 ) -> dict:
-    """Plan chunks, dispatch concurrently via ``ChunkDispatcher``, merge, synth.
+    """Plan events/chunks, dispatch concurrently via ``ChunkDispatcher``, merge, synth.
 
-    - Chunk planning delegates to ``chunk_dispatch.plan_chunks_scene_aligned`` or
-      ``plan_chunks_equal_width``. ``n_chunks`` is a hint only; the planner may
-      auto-bump it to satisfy ``MAX_CHUNK_S``.
+    Planner modes:
+      ``semantic`` (default) — SemanticEventBuilder: signal-weighted variable-length
+          events with per-event VLM processing profiles (LOW/MEDIUM/HIGH).
+          Replaces fixed-width chunking. Chunk count adapts to content.
+      ``scene``    — PySceneDetect scene-aligned equal-width chunks.
+      ``fixed``    — Legacy equal-width chunks. ``n_chunks`` is a hint.
+
     - Encoder-cache budget asserted at plan time (belt); on violation, this
       video fails without dispatching a single request (protects the whole
       batch from a poisoned plan).
-    - Failed chunks are represented by ``stub_failed_chunk`` so merge indexing
+    - Failed events are represented by ``stub_failed_chunk`` so merge indexing
       stays dense and transcript coverage survives the visual gap.
     """
     t0       = time.time()
@@ -1731,7 +1906,36 @@ def analyze_video_chunked(
     person_db = build_person_database(cast_analysis, video_label)
 
     # ── PLAN ──────────────────────────────────────────────────────────────────
-    if scene_align:
+    # event_profiles maps chunk_id → profile name for per-event prompt/budget routing.
+    event_profiles: dict[int, str] = {}
+
+    if planner == "semantic":
+        # Extract transcript segments for this video
+        segs: list[dict] = []
+        for v in transcripts.get("videos", []):
+            if v.get("video") == video_label:
+                segs = v.get("segments", [])
+                break
+
+        # Build semantic events (signal-weighted, variable-length)
+        events = _eb.build_events(
+            duration=total_duration,
+            scene_cuts=None,   # scene_detect called internally by signal stack
+            transcript_segments=segs,
+            max_event_s=MAX_CHUNK_S,
+            min_event_s=5.0,
+        )
+        chunks = _eb.events_to_chunks(events, duration=total_duration, overlap_s=CHUNK_OVERLAP)
+        event_profiles = {e.event_id: e.profile for e in events}
+        stats = _eb.event_stats(events)
+        log(video_label,
+            f"Semantic plan: {stats['total_events']} events — "
+            f"HIGH={stats['by_tier']['HIGH']} MEDIUM={stats['by_tier']['MEDIUM']} "
+            f"LOW={stats['by_tier']['LOW']} | "
+            f"avg={stats['avg_duration_s']}s | "
+            f"token savings vs all-HIGH: {stats['token_savings_vs_fixed']}")
+
+    elif planner == "scene":
         chunks = plan_chunks_scene_aligned(
             video_url, total_duration,
             min_s=5.0, max_s=MAX_CHUNK_S, overlap_s=CHUNK_OVERLAP,
@@ -1739,7 +1943,8 @@ def analyze_video_chunked(
         log(video_label,
             f"Scene-aligned: {len(chunks)} chunks "
             f"(strict durations: {[round(c.strict_duration, 1) for c in chunks]})")
-    else:
+
+    else:  # "fixed"
         chunks = plan_chunks_equal_width(
             total_duration, n_chunks,
             overlap_s=CHUNK_OVERLAP, max_s=MAX_CHUNK_S,
@@ -1747,12 +1952,13 @@ def analyze_video_chunked(
 
     n_planned = len(chunks)
     if n_planned == 0:
-        return {"ok": False, "error": "planner produced 0 chunks",
+        return {"ok": False, "error": "planner produced 0 events",
                 "elapsed": round(time.time() - t0, 1), "attempts": 1}
 
-    log(video_label,
-        f"Planned {n_planned} chunks (~{total_duration / n_planned:.0f}s each) — "
-        f"MAX_INFLIGHT={MAX_INFLIGHT}")
+    if planner != "semantic":
+        log(video_label,
+            f"Planned {n_planned} chunks (~{total_duration / n_planned:.0f}s each) — "
+            f"MAX_INFLIGHT={MAX_INFLIGHT}")
 
     # ── BUDGET ASSERT (belt) ──────────────────────────────────────────────────
     try:
@@ -1764,14 +1970,18 @@ def analyze_video_chunked(
 
     # ── DISPATCH ──────────────────────────────────────────────────────────────
     def build_payload(c: Chunk) -> dict:
+        prof      = event_profiles.get(c.chunk_id, "MEDIUM")
+        tok_limit = _eb.PROFILES[prof].max_tokens if prof in _eb.PROFILES else TOKEN_BUDGETS[0]
         return _build_chunk_payload(
             c, video_label, safe_url,
             person_db, transcripts, total_duration,
-            n_planned, model_id, max_tokens=TOKEN_BUDGETS[0],
+            n_planned, model_id, max_tokens=tok_limit, profile=prof,
         )
 
     def label_fn(c: Chunk) -> str:
-        return f"{video_label}/chunk{c.chunk_id}"
+        prof = event_profiles.get(c.chunk_id, "")
+        suffix = f"[{prof}]" if prof else ""
+        return f"{video_label}/event{c.chunk_id}{suffix}"
 
     dispatcher = ChunkDispatcher(
         vllm_url=vllm_url,
@@ -1942,9 +2152,15 @@ def main() -> None:
                              f"1 = single full-video pass (slow). "
                              f"4 = 4x faster. Total agents = videos × chunks.")
     parser.add_argument("--scene-align", action="store_true",
-                        help="Use PySceneDetect ContentDetector for chunk boundaries; "
-                             "chunks sorted LPT (long-first) to shorten straggler tail. "
-                             "Adds ~5-15s CPU pass per video (cached).")
+                        help="DEPRECATED — use --planner=scene instead. "
+                             "Kept for backwards-compat; sets --planner=scene when passed.")
+    parser.add_argument("--planner",
+                        choices=["semantic", "scene", "fixed"],
+                        default="semantic",
+                        help="Event planning strategy (default: semantic). "
+                             "semantic=signal-weighted variable-length events with tiered VLM budgets; "
+                             "scene=PySceneDetect scene-aligned chunks; "
+                             "fixed=legacy equal-width chunks (use --chunks to set count).")
     parser.add_argument("--context-mode",
                         choices=["parallel", "continuity", "sequential"],
                         default="parallel",
@@ -1957,6 +2173,8 @@ def main() -> None:
     model_id    = args.model
     n_chunks    = max(1, args.chunks)
     backend_url = args.backend
+    # --scene-align is deprecated; let it override --planner for compat
+    planner = "scene" if args.scene_align else args.planner
 
     # ── Load inputs ──────────────────────────────────────────────────────────
     cast_path = Path(args.cast)
@@ -2074,7 +2292,7 @@ def main() -> None:
                 plan = _plan_video_chunks(
                     label, v["url"], cast_analysis, transcripts,
                     durations.get(label, 600.0), chunk_alloc.get(label, n_chunks),
-                    model_id, args.scene_align,
+                    model_id, planner,
                 )
                 if "error" in plan:
                     results[label] = {"ok": False, "error": plan["error"],

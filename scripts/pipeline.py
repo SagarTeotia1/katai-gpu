@@ -295,8 +295,13 @@ def main() -> None:
                              "(dynamic based on video durations, via ffprobe). "
                              "vLLM idle during this stage so safe to stack.")
     parser.add_argument("--no-scene-align", action="store_true",
-                        help="Disable scene-aligned LPT chunk planning for context step "
-                             "(default: enabled). Use if PySceneDetect broken or debugging.")
+                        help="DEPRECATED — use --planner=fixed instead. Kept for compat.")
+    parser.add_argument("--planner",
+                        choices=["semantic", "scene", "fixed"],
+                        default="semantic",
+                        help="Event planner for context step (default: semantic). "
+                             "semantic=signal-weighted variable-length events (recommended); "
+                             "scene=PySceneDetect chunks; fixed=legacy equal-width chunks.")
     parser.add_argument("--context-mode",
                         choices=["parallel", "continuity", "sequential"],
                         default="parallel",
@@ -527,15 +532,15 @@ def main() -> None:
         print(f"  Watch live (new terminal): {dim(f'watch -n 2 cat {live_path}')}", flush=True)
         print(f"  Or one-shot:               {dim(f'cat {live_path}')}\n", flush=True)
 
+        _planner = "fixed" if args.no_scene_align else args.planner
         cmd = [PYTHON, SCRIPTS / "analyze_context.py",
                "--cast", cast_path,
                "--vllm", args.vllm,
                "--backend", args.backend,
                "--chunks", str(args.chunks),
                "--context-mode", args.context_mode,
+               "--planner", _planner,
                "--output", "output"]
-        if not args.no_scene_align:
-            cmd.append("--scene-align")
         if cast_analysis_file:
             cmd += ["--cast-analysis", cast_analysis_file]
         if transcript_file:

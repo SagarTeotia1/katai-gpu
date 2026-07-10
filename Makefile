@@ -186,13 +186,15 @@ transcribe-urls: ## Transcribe raw video URLs — usage: make transcribe-urls VI
 
 WORKERS ?= 24
 CHUNKS  ?= 8
+PLANNER ?= semantic
 
-analyze-context: ## Full semantic video context — usage: make analyze-context CAST=cast.json CHUNKS=4
+analyze-context: ## Full semantic video context — usage: make analyze-context CAST=cast.json [PLANNER=semantic|scene|fixed] [CHUNKS=8]
 	@python3 scripts/analyze_context.py --cast $(CAST) \
 		--vllm http://localhost:$(VLLM_PORT)/v1/chat/completions \
 		--backend http://localhost:$(BACKEND_PORT) \
 		--workers $(WORKERS) \
-		--chunks $(CHUNKS)
+		--chunks $(CHUNKS) \
+		--planner $(PLANNER)
 
 pipeline: ## ONE CMD — full pipeline: cast→transcript→context→index — usage: make pipeline CAST=cast.json [CHUNKS=8] [WORKERS=24] [WHISPER_WORKERS=0=auto]
 	@python3 scripts/pipeline.py $(CAST) \
