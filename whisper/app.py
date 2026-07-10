@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 MODEL_SIZE = "large-v3"
 _model: Optional[WhisperModel] = None
+_transcribe_sem: Optional[asyncio.Semaphore] = None  # serializes GPU transcription calls
 
 
 def _load_model() -> WhisperModel:
@@ -37,11 +38,13 @@ def _load_model() -> WhisperModel:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _model
+    global _model, _transcribe_sem
+    _transcribe_sem = asyncio.Semaphore(1)  # one GPU transcription at a time
     loop = asyncio.get_running_loop()
     _model = await loop.run_in_executor(None, _load_model)
     yield
     _model = None
+    _transcribe_sem = None
 
 
 app = FastAPI(title="Whisper Transcription Service", lifespan=lifespan)
@@ -90,6 +93,8 @@ def health() -> dict:
 async def transcribe(req: TranscribeRequest) -> TranscribeResponse:
     if _model is None:
         raise HTTPException(503, "Model not loaded yet")
+    if _transcribe_sem is None:
+        raise HTTPException(503, "Service not ready")
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_path = tmp.name
@@ -113,7 +118,8 @@ async def transcribe(req: TranscribeRequest) -> TranscribeResponse:
 
         logger.info("Transcribing with Whisper %s...", MODEL_SIZE)
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, lambda: _transcribe_sync(tmp_path, req))
+        async with _transcribe_sem:  # serialize: only one GPU transcription at a time
+            result = await loop.run_in_executor(None, lambda: _transcribe_sync(tmp_path, req))
         return result
 
     finally:

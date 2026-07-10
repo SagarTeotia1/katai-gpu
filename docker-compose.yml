@@ -28,7 +28,7 @@ services:
       --tensor-parallel-size 1
       --max-model-len ${MAX_MODEL_LEN:-131072}
       --dtype bfloat16
-      --gpu-memory-utilization ${GPU_MEM_UTIL:-0.92}
+      --gpu-memory-utilization ${GPU_MEM_UTIL:-0.85}
       --max-num-seqs 16
       --max-num-batched-tokens 32768
       --enable-chunked-prefill
