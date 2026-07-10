@@ -62,14 +62,14 @@ TIMEOUTS       = [900, 1200, 1500]      # timeout per chunk attempt (s)
 CHUNK_OVERLAP  = 3.0             # seconds of frame overlap each side for visual context
 DEFAULT_CHUNKS = 8               # chunks per video when --chunks not specified
 # Must match vLLM --mm-processor-kwargs fps/max_pixels so budget assert is accurate.
-MM_FPS         = float(os.environ.get("VLLM_MM_FPS", "1.0"))
+MM_FPS         = float(os.environ.get("VLLM_MM_FPS", "0.5"))   # 0.5 halves visual tokens vs 1.0; set VLLM_MM_FPS=1.0 to restore
 MM_MAX_PIXELS  = int(os.environ.get("VLLM_MM_MAX_PIXELS", "602112"))
 # Hard ceiling on per-chunk duration — auto-scales with FPS so vision tokens per chunk
 # stay constant regardless of FPS setting:
 #   fps=1.0 → MAX_CHUNK_S=18s: ceil(18*1/2)*3072 = 27648 < 27852 safe ✓
 #   fps=0.5 → MAX_CHUNK_S=36s: ceil(36*0.5/2)*3072 = 27648 < 27852 safe ✓
 #   fps=0.25→ MAX_CHUNK_S=36s: ceil(36*0.25/2)*1536 = 9216  < 27852 safe ✓
-# Set VLLM_MM_FPS=0.5 in .env to halve chunk count for long videos (1hr→100 chunks vs 200).
+# Default is now 0.5 — set VLLM_MM_FPS=1.0 in .env to restore full frame rate.
 MAX_CHUNK_S    = min(18.0 / max(MM_FPS, 0.25), 36.0)
 # Max concurrent /v1/chat/completions requests across ALL chunks of ALL videos in flight.
 MAX_INFLIGHT   = 32
@@ -715,9 +715,9 @@ def synthesize_merged(
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content":
-             "Generate the complete editorial intelligence layer for this video."},
+             "/no_think\n\nGenerate the complete editorial intelligence layer for this video."},
         ],
-        "max_tokens": 20480,
+        "max_tokens": 6144,
         "temperature": 0.0,
         "response_format": {"type": "json_object"},
         "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
@@ -730,9 +730,10 @@ def synthesize_merged(
     merged["_synth_tokens_out"] = usage.get("completion_tokens", 0)
 
     msg = raw_resp["choices"][0]["message"]
-    raw = msg.get("content") or msg.get("reasoning") or ""
-    if not raw:
-        log(video_label, "Synthesis returned EMPTY content — check model reasoning leak")
+    raw = msg.get("content") or ""
+    if not raw.strip():
+        finish = raw_resp["choices"][0].get("finish_reason", "unknown")
+        log(video_label, f"Synthesis returned EMPTY content (finish_reason={finish}) — model used all tokens thinking; /no_think not applied to text-only calls")
         return merged
 
     # Show first 200 chars for debugging
@@ -794,7 +795,7 @@ OUTPUT ONLY VALID JSON — no markdown, no explanation:
         "model": model_id,
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": f"known_people:\n{people_json}"},
+            {"role": "user", "content": f"/no_think\n\nknown_people:\n{people_json}"},
         ],
         "max_tokens": 8192,
         "temperature": 0.1,
@@ -809,9 +810,10 @@ OUTPUT ONLY VALID JSON — no markdown, no explanation:
         merged["_cont_tokens_in"]  = usage.get("prompt_tokens", 0)
         merged["_cont_tokens_out"] = usage.get("completion_tokens", 0)
         msg  = raw_resp["choices"][0]["message"]
-        raw  = msg.get("content") or msg.get("reasoning") or ""
-        if not raw:
-            log(video_label, "Continuity pass empty — skipping")
+        raw  = msg.get("content") or ""
+        if not raw.strip():
+            finish = raw_resp["choices"][0].get("finish_reason", "unknown")
+            log(video_label, f"Continuity pass empty (finish_reason={finish}) — skipping")
             return merged
 
         result    = parse_robust(raw, f"{video_label}_continuity")
@@ -1386,7 +1388,7 @@ async def _dispatch_all_async(
             max_inflight=MAX_INFLIGHT,
             retries=2,
             backoff=(RETRY_DELAYS[0], RETRY_DELAYS[1]),
-            client_timeout=float(TIMEOUTS[0]),
+            client_timeout=360.0,  # 6 min covers HIGH chunks (4096 tok / 22 tok/s ≈ 186s) with 2x safety; TIMEOUTS[0]=900 was 15 min
         )
         dispatchers[label] = disp
         label_order.append(label)
@@ -1396,7 +1398,7 @@ async def _dispatch_all_async(
             shared_sem=shared_sem,
             fps=MM_FPS,        # must match vLLM --mm-processor-kwargs fps
             min_frames=3,      # each half must have >= 3 frames → min 3s at fps=1
-            max_splits=64,
+            max_splits=16,     # cap at initial chunk count to prevent runaway explosion
         ))
 
     log("dispatch", f"Firing {_planned_chunks} planned chunks across {len(video_plans)} videos "
@@ -1610,8 +1612,11 @@ def _build_payload(
     """Build vLLM payload. Attempt 2+ adds an extra JSON-enforcement reminder."""
     messages = [{"role": "system", "content": system}]
 
+    # /no_think forces Qwen3 to skip reasoning even when enable_thinking=False
+    # doesn't take effect for multimodal requests in vLLM.
+    no_think_prefix = "/no_think\n\n"
     user_content: list = [
-        {"type": "text", "text": user_text},
+        {"type": "text", "text": no_think_prefix + user_text},
         {"type": "video_url", "video_url": {"url": safe_url}},
     ]
 
@@ -1666,10 +1671,10 @@ def _attempt_analysis(
     raw_resp = post_vllm(payload, vllm_url, timeout=timeout)
 
     msg = raw_resp["choices"][0]["message"]
-    raw = msg.get("content") or msg.get("reasoning") or ""
-    if not raw:
-        raise ValueError(f"vLLM returned empty content. finish_reason="
-                         f"{raw_resp['choices'][0].get('finish_reason')}")
+    raw = msg.get("content") or ""
+    if not raw.strip():
+        raise ValueError(f"vLLM returned empty content (finish_reason="
+                         f"{raw_resp['choices'][0].get('finish_reason')}) — model used all tokens thinking")
 
     result = parse_robust(raw, video_label)
     result.setdefault("video_url", safe_url)
@@ -1851,10 +1856,10 @@ def _extract_chunk_json(response: dict, label: str) -> dict:
     Raises ``ValueError`` if the content is empty or unparseable.
     """
     msg = response["choices"][0]["message"]
-    raw = msg.get("content") or msg.get("reasoning") or ""
-    if not raw:
+    raw = msg.get("content") or ""
+    if not raw.strip():
         finish = response["choices"][0].get("finish_reason")
-        raise ValueError(f"Empty content, finish_reason={finish}")
+        raise ValueError(f"Empty content (finish_reason={finish}) — model used all tokens thinking; /no_think should prevent this")
     return parse_robust(raw, label)
 
 
@@ -1988,7 +1993,7 @@ def analyze_video_chunked(
         max_inflight=MAX_INFLIGHT,
         retries=2,
         backoff=(RETRY_DELAYS[0], RETRY_DELAYS[1]),
-        client_timeout=float(TIMEOUTS[0]),
+        client_timeout=360.0,
     )
 
     t_map = time.time()

@@ -107,8 +107,8 @@ PROFILES: dict[str, ProcessingProfile] = {
 # ── Score thresholds ──────────────────────────────────────────────────────────
 
 MERGE_THRESHOLD = 3   # boundary score below this → merge with neighbour
-MED_THRESHOLD   = 5   # score ≥ this → MEDIUM profile
-HIGH_THRESHOLD  = 9   # score ≥ this → HIGH profile
+MED_THRESHOLD   = 4   # score ≥ this → MEDIUM profile
+HIGH_THRESHOLD  = 7   # score ≥ this → HIGH profile (lowered: scene_cuts=None caps max score; restore to 9 when scene cuts are wired)
 
 # Signal fusion: signals within this many seconds cluster into one boundary
 FUSION_WINDOW_S  = 1.5

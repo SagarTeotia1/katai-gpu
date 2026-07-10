@@ -741,10 +741,13 @@ class ChunkDispatcher:
     def _validate_response(response: dict) -> None:
         """Raise ProseFailed if response content is prose instead of JSON."""
         msg = response.get("choices", [{}])[0].get("message", {})
-        content = msg.get("content") or msg.get("reasoning") or ""
+        # Never fall back to reasoning — that's the model's thinking text, always prose.
+        # If content is None the model exhausted max_tokens inside <think> blocks.
+        content = msg.get("content") or ""
         stripped = content.strip()
         if not stripped:
-            raise ProseFailed("empty response content")
+            finish = response.get("choices", [{}])[0].get("finish_reason", "unknown")
+            raise ProseFailed(f"empty content (finish_reason={finish}) — model used all tokens thinking; raise max_tokens or add /no_think")
         if not stripped.startswith("{"):
             preview = stripped[:120].replace("\n", " ")
             raise ProseFailed(f"model output prose. Preview: {preview}")
