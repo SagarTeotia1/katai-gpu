@@ -581,6 +581,10 @@ def synthesize_merged(
 
     log(video_label, "Synthesis pass — text-only LLM call for conversation/story/editorial...")
     raw_resp = post_vllm(payload, vllm_url, timeout=300)
+    usage = raw_resp.get("usage", {})
+    merged["_synth_tokens_in"]  = usage.get("prompt_tokens", 0)
+    merged["_synth_tokens_out"] = usage.get("completion_tokens", 0)
+
     msg = raw_resp["choices"][0]["message"]
     raw = msg.get("content") or msg.get("reasoning") or ""
     if not raw:
@@ -652,6 +656,9 @@ OUTPUT ONLY VALID JSON — no markdown, no explanation:
     log(video_label, "Continuity pass — dedup people across chunk boundaries...")
     try:
         raw_resp = post_vllm(payload, vllm_url, timeout=120)
+        usage = raw_resp.get("usage", {})
+        merged["_cont_tokens_in"]  = usage.get("prompt_tokens", 0)
+        merged["_cont_tokens_out"] = usage.get("completion_tokens", 0)
         msg  = raw_resp["choices"][0]["message"]
         raw  = msg.get("content") or msg.get("reasoning") or ""
         if not raw:
@@ -1117,7 +1124,9 @@ async def _dispatch_all_async(
         lbl: {"done": 0, "failed": 0, "total": plan["n_planned"]}
         for lbl, plan in video_plans.items()
     }
-    _total_done = [0]  # mutable via list
+    _total_done     = [0]   # mutable via list
+    _tokens_prefill = [0]
+    _tokens_decode  = [0]
 
     def _log_with_progress(label: str, msg: str) -> None:
         _log_thread_safe(label, msg)
@@ -1126,14 +1135,22 @@ async def _dispatch_all_async(
         if not (is_ok or is_stub):
             return
         video_lbl = label.split("/")[0] if "/" in label else label
+        # Extract token counts from OK message: "OK 356.2s prefill=14393 decode=6422 ..."
+        import re as _re
+        _pf = _re.search(r"prefill=(\d+)", msg)
+        _dc = _re.search(r"decode=(\d+)",  msg)
         with _prog_lock:
             if video_lbl in _prog:
                 _prog[video_lbl]["done"] += 1
                 if is_stub:
                     _prog[video_lbl]["failed"] += 1
+            if _pf: _tokens_prefill[0] += int(_pf.group(1))
+            if _dc: _tokens_decode[0]  += int(_dc.group(1))
             _total_done[0] += 1
             done = _total_done[0]
             snap = {lbl: dict(v) for lbl, v in _prog.items()}
+            tok_in  = _tokens_prefill[0]
+            tok_out = _tokens_decode[0]
 
         elapsed = time.time() - t0_dispatch
         rate    = done / max(elapsed, 1)
@@ -1150,14 +1167,16 @@ async def _dispatch_all_async(
         if progress_path:
             try:
                 live = {
-                    "total_chunks":  total_chunks,
-                    "chunks_done":   done,
-                    "chunks_failed": sum(v["failed"] for v in snap.values()),
-                    "pct":           round(100 * done / total_chunks, 1),
-                    "elapsed_s":     round(elapsed, 1),
-                    "eta_s":         round(eta, 1),
-                    "videos": snap,
-                    "updated_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "total_chunks":    total_chunks,
+                    "chunks_done":     done,
+                    "chunks_failed":   sum(v["failed"] for v in snap.values()),
+                    "pct":             round(100 * done / total_chunks, 1),
+                    "elapsed_s":       round(elapsed, 1),
+                    "eta_s":           round(eta, 1),
+                    "tokens_prefill_K": round(tok_in  / 1000, 1),
+                    "tokens_decode_K":  round(tok_out / 1000, 1),
+                    "videos":          snap,
+                    "updated_at":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 progress_path.write_text(json.dumps(live, indent=2), encoding="utf-8")
             except Exception:
@@ -1317,6 +1336,28 @@ def _finalize_video(
     elif context_mode == "sequential":
         log(video_label, "sequential context mode not yet implemented — using parallel result")
 
+    # ── TOKEN ACCOUNTING ──────────────────────────────────────────────────────
+    chunk_prefill = sum(r.get("prefill_tokens", 0) for r in raw_results
+                        if isinstance(r, dict) and r.get("ok"))
+    chunk_decode  = sum(r.get("decode_tokens",  0) for r in raw_results
+                        if isinstance(r, dict) and r.get("ok"))
+    synth_in   = merged.pop("_synth_tokens_in",  0)
+    synth_out  = merged.pop("_synth_tokens_out", 0)
+    cont_in    = merged.pop("_cont_tokens_in",   0)
+    cont_out   = merged.pop("_cont_tokens_out",  0)
+    total_in   = chunk_prefill + synth_in  + cont_in
+    total_out  = chunk_decode  + synth_out + cont_out
+    total_tok  = total_in + total_out
+
+    def _k(n: int) -> str:
+        return f"{n / 1000:.1f}K"
+
+    log(video_label,
+        f"tokens — chunks in={_k(chunk_prefill)} out={_k(chunk_decode)} | "
+        f"synth in={_k(synth_in)} out={_k(synth_out)} | "
+        f"cont in={_k(cont_in)} out={_k(cont_out)} | "
+        f"TOTAL in={_k(total_in)} out={_k(total_out)} ({_k(total_tok)})")
+
     # ── SAVE ──────────────────────────────────────────────────────────────────
     slug     = video_label.replace(" ", "_")
     out_path = out_dir / f"context_{slug}_{ts}.json"
@@ -1337,7 +1378,7 @@ def _finalize_video(
     log(video_label,
         f"✓ COMPLETE {elapsed}s | {ok_chunks}/{n_planned} chunks | "
         f"{tl} events | {hi} highlights | {cl} clips | {kb:.0f}KB | "
-        f"synth={synth_wall_s:.1f}s → {out_path}")
+        f"synth={synth_wall_s:.1f}s | tokens={_k(total_tok)} → {out_path}")
     with _print_lock:
         print(f"\n  Videos: [{bar}] {done}/{total} ({int(done / total * 100)}%)\n", flush=True)
 
@@ -1346,7 +1387,14 @@ def _finalize_video(
             "size_kb": round(kb, 1), "chunks_ok": ok_chunks,
             "chunks_total": n_planned, "attempts": 1,
             "synth_wall_s": round(synth_wall_s, 2),
-            "map_wall_s": round(map_wall, 2),
+            "map_wall_s":   round(map_wall, 2),
+            "tokens": {
+                "chunk_prefill": chunk_prefill, "chunk_decode": chunk_decode,
+                "synth_in":      synth_in,      "synth_out":   synth_out,
+                "cont_in":       cont_in,        "cont_out":   cont_out,
+                "total_in":      total_in,       "total_out":  total_out,
+                "total":         total_tok,
+            },
             "dispatcher_metrics": dispatcher.metrics}
 
 

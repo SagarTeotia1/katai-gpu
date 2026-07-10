@@ -220,6 +220,12 @@ def parse_context(line: str, m: dict) -> None:
     if g4:
         m["chunks_done"]  = int(g4.group(1))
         m["chunks_total"] = int(g4.group(2))
+    # "tokens — chunks in=287.1K out=133.4K | ... | TOTAL in=295.1K out=137.2K (432.3K)"
+    g5 = re.search(r'TOTAL in=([\d.]+)K out=([\d.]+)K \(([\d.]+)K\)', line)
+    if g5:
+        m["tokens_in"]    = m.get("tokens_in",  0.0) + float(g5.group(1))
+        m["tokens_out"]   = m.get("tokens_out", 0.0) + float(g5.group(2))
+        m["tokens_total"] = m.get("tokens_total", 0.0) + float(g5.group(3))
     # Fallback: any context_ path anywhere in the line
     g3 = re.search(r'(output/context_[^\s]+\.json)', line)
     if g3:
@@ -527,15 +533,24 @@ def main() -> None:
         context_files = [f for f in context_files if not (f in seen or seen.add(f))]  # type: ignore[func-returns-value]
 
         if ok or context_files:
+            tok_in  = metrics.get("tokens_in",    0.0)
+            tok_out = metrics.get("tokens_out",   0.0)
+            tok_tot = metrics.get("tokens_total", 0.0)
             summary["steps"]["context_analysis"] = {
-                "status":       "done" if ok else "partial",
-                "output_files":  context_files,
-                "time_s":        metrics["time_s"],
-                "videos_done":   metrics.get("done", len(context_files)),
-                "videos_total":  metrics.get("total", n_videos),
+                "status":        "done" if ok else "partial",
+                "output_files":   context_files,
+                "time_s":         metrics["time_s"],
+                "videos_done":    metrics.get("done", len(context_files)),
+                "videos_total":   metrics.get("total", n_videos),
+                "chunks_done":    metrics.get("chunks_done"),
+                "chunks_total":   metrics.get("chunks_total"),
+                "tokens_in_K":    round(tok_in,  1),
+                "tokens_out_K":   round(tok_out, 1),
+                "tokens_total_K": round(tok_tot, 1),
             }
+            tok_str = f"  |  {tok_tot:.1f}K tokens ({tok_in:.1f}K in / {tok_out:.1f}K out)" if tok_tot else ""
             section_result("Context Analysis", metrics,
-                           f"{metrics.get('done', len(context_files))}/{metrics.get('total', n_videos)} videos")
+                           f"{metrics.get('done', len(context_files))}/{metrics.get('total', n_videos)} videos{tok_str}")
             for f in context_files:
                 print(f"    {dim('→')} {f}", flush=True)
         else:
@@ -681,7 +696,10 @@ def main() -> None:
         elif key == "context_analysis":
             nd = s.get("videos_done", len(s.get("output_files", [])))
             nt = s.get("videos_total", n_videos)
+            tok = s.get("tokens_total_K", 0)
             extra = f"   {nd}/{nt} videos"
+            if tok:
+                extra += f"  |  {tok:.1f}K tokens ({s.get('tokens_in_K',0):.1f}K in / {s.get('tokens_out_K',0):.1f}K out)"
         elif key == "indexing":
             vecs = s.get("pinecone_vectors", 0)
             nods = s.get("neo4j_nodes", 0)
