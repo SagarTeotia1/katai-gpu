@@ -603,8 +603,16 @@ class ChunkDispatcher:
                         _log(label,
                              f"adaptive split triggered (splits so far: {queue.splits_done})")
 
-            # Spawn MAX_INFLIGHT workers; they self-terminate when queue drains
-            n_workers = self.max_inflight
+            # Spawn enough workers to fill GPU but keep a reserve in queue for splitting.
+            # If all chunks fire at once the queue is always empty at completion → no splits.
+            # Reserve floor(n/4) chunks (min 2) so done() always finds items to bisect.
+            n_chunks_init = len(chunks)
+            reserve = max(2, n_chunks_init // 4)
+            n_workers = max(1, min(self.max_inflight, n_chunks_init - reserve))
+            logger.info(
+                "run_adaptive: %d chunks, %d workers (reserve=%d for adaptive splits)",
+                n_chunks_init, n_workers, reserve,
+            )
             workers = [asyncio.create_task(_worker()) for _ in range(n_workers)]
             await asyncio.gather(*workers, return_exceptions=True)
 
