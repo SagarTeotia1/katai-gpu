@@ -697,11 +697,17 @@ class ChunkDispatcher:
                 last_exc = exc
                 if attempt >= self.retries:
                     break
-                delay = self.backoff[min(attempt, len(self.backoff) - 1)]
-                log_fn(label,
-                       f"attempt {attempt + 1} retriable ({exc}); "
-                       f"sleeping {delay:.1f}s")
-                await asyncio.sleep(delay)
+                # Prose/parse failures (ValueError) retry immediately — response
+                # already came back, worker slot was idle during the delay.
+                # Network/server errors still back off to avoid hammering.
+                if isinstance(exc, ValueError):
+                    log_fn(label, f"attempt {attempt + 1} retriable (prose/parse); retrying immediately")
+                else:
+                    delay = self.backoff[min(attempt, len(self.backoff) - 1)]
+                    log_fn(label,
+                           f"attempt {attempt + 1} retriable ({exc}); "
+                           f"sleeping {delay:.1f}s")
+                    await asyncio.sleep(delay)
             except RuntimeError:
                 # Non-retriable HTTP status — surface immediately.
                 raise
