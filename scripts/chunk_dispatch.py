@@ -103,39 +103,30 @@ def _finalize_lpt(windows: list[tuple[int, int, float, float]],
     return chunks
 
 
-def plan_chunks_scene_aligned(
-    video_url: str,
+def plan_chunks_from_cuts(
+    cuts: list[float],
     duration: float,
     min_s: float = 8.0,
-    max_s: float = 20.0,
+    max_s: float = 18.0,
     overlap_s: float = 2.0,
 ) -> list[Chunk]:
-    """Scene-aligned LPT chunk planner.
+    """Scene-aligned LPT planner from a pre-computed cut list.
 
-    - Merge tiny scenes (< ``min_s``) forward until segment >= ``min_s``.
-    - Split long segments (> ``max_s``) into equal sub-parts <= ``max_s``.
-    - ``overlap_s`` applied on intra-scene splits only; never at scene cuts.
-    - Sorted DESC by strict duration (LPT). ``chunk_id`` assigned AFTER sort.
-    - Falls back to equal-width plan if scene detection fails or yields 0 cuts.
+    Accepts cut timestamps (including 0.0 and ``duration``). Exposed as a public
+    function so tests can drive the merge/split/LPT logic without hitting the
+    network or requiring PySceneDetect.
+
+    Algorithm:
+    1. Merge tiny segments (< ``min_s``) forward until >= ``min_s``.
+    2. Split long segments (> ``max_s``) into ceil(seg/max_s) equal parts.
+    3. LPT sort: reassign ``chunk_id`` 0..N-1 in descending strict-duration order.
+    4. ``pad_start/pad_end`` on intra-scene boundaries only, clamped to [0, duration].
     """
-    if duration <= 0:
-        return []
+    if duration <= 0 or len(cuts) < 2:
+        n = max(1, math.ceil(duration / max_s)) if duration > 0 else 1
+        return plan_chunks_equal_width(duration, n, overlap_s=overlap_s, max_s=max_s)
 
-    # Import locally so scripts/scene_detect.py is only required when a caller
-    # actually asks for scene alignment.
-    try:
-        from scene_detect import detect_scene_cuts  # type: ignore[import-not-found]
-    except ImportError:
-        logger.warning("scene_detect unavailable; falling back to equal-width plan")
-        n_fallback = max(1, math.ceil(duration / max_s))
-        return plan_chunks_equal_width(duration, n_fallback, overlap_s=overlap_s)
-
-    cuts = detect_scene_cuts(video_url, duration)
-    if len(cuts) < 2:
-        n_fallback = max(1, math.ceil(duration / max_s))
-        return plan_chunks_equal_width(duration, n_fallback, overlap_s=overlap_s)
-
-    # Step 1: merge tiny scenes forward
+    # Step 1: merge tiny segments forward
     merged: list[tuple[float, float]] = []
     i = 0
     while i < len(cuts) - 1:
@@ -151,7 +142,7 @@ def plan_chunks_scene_aligned(
         merged[-2] = (prev_s, last_e)
         merged.pop()
 
-    # Step 2: split long scenes; track (scene_id, part_idx, strict_start, strict_end)
+    # Step 2: split long scenes; produce (scene_id, part_idx, strict_start, strict_end)
     strict_windows: list[tuple[int, int, float, float]] = []
     for scene_id, (s, e) in enumerate(merged):
         seg_len = e - s
@@ -166,31 +157,48 @@ def plan_chunks_scene_aligned(
             strict_windows.append((scene_id, p, ss, se))
 
     if not strict_windows:
+        n = max(1, math.ceil(duration / max_s))
+        return plan_chunks_equal_width(duration, n, overlap_s=overlap_s, max_s=max_s)
+
+    return _finalize_lpt(strict_windows, duration, overlap_s)
+
+
+def plan_chunks_scene_aligned(
+    video_url: str,
+    duration: float,
+    min_s: float = 8.0,
+    max_s: float = 18.0,
+    overlap_s: float = 2.0,
+) -> list[Chunk]:
+    """Scene-aligned LPT chunk planner.
+
+    Probes scene cuts via PySceneDetect then delegates to
+    :func:`plan_chunks_from_cuts`. Falls back to equal-width if
+    detection fails or yields fewer than 2 cuts.
+    """
+    if duration <= 0:
+        return []
+
+    try:
+        from scene_detect import detect_scene_cuts  # type: ignore[import-not-found]
+    except ImportError:
+        logger.warning("scene_detect unavailable; falling back to equal-width plan")
         n_fallback = max(1, math.ceil(duration / max_s))
-        return plan_chunks_equal_width(duration, n_fallback, overlap_s=overlap_s)
+        return plan_chunks_equal_width(duration, n_fallback, overlap_s=overlap_s, max_s=max_s)
 
-    # Overlap on intra-scene splits only — apply BEFORE LPT so pad reflects the
-    # actual context the chunk will receive. Pad shrinks to 0 on scene edges.
-    padded_windows: list[tuple[int, int, float, float]] = []
-    # Group by scene_id to know which parts are intra-scene
-    scene_counts: dict[int, int] = {}
-    for sid, _pid, _ss, _se in strict_windows:
-        scene_counts[sid] = scene_counts.get(sid, 0) + 1
+    cuts = detect_scene_cuts(video_url, duration)
+    if len(cuts) < 2:
+        n_fallback = max(1, math.ceil(duration / max_s))
+        return plan_chunks_equal_width(duration, n_fallback, overlap_s=overlap_s, max_s=max_s)
 
-    for scene_id, part_idx, ss, se in strict_windows:
-        # For chunk_id / pad tracking we keep strict window; _finalize_lpt does
-        # the pad math based on overlap_s. Sign to _finalize_lpt via overlap_s
-        # only when there IS an intra-scene boundary.
-        padded_windows.append((scene_id, part_idx, ss, se))
-
-    return _finalize_lpt(padded_windows, duration, overlap_s)
+    return plan_chunks_from_cuts(cuts, duration, min_s=min_s, max_s=max_s, overlap_s=overlap_s)
 
 
 def plan_chunks_equal_width(
     duration: float,
     n: int,
     overlap_s: float = 3.0,
-    max_s: float = 20.0,
+    max_s: float = 18.0,
 ) -> list[Chunk]:
     """Equal-width planner. Auto-bumps ``n`` so per-chunk window <= ``max_s``.
 

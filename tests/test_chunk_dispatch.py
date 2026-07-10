@@ -25,9 +25,9 @@ from chunk_dispatch import (  # type: ignore  # noqa: E402
 
 
 def test_budget_assert_violation() -> None:
-    """A 20s chunk at fps=2.0, max_pixels=602112 lands around 30.7K embed tokens,
-    which exceeds 0.85 x 32768 = 27852. Assert must raise BudgetExceeded, name
-    the offending window, and mention the remediation levers."""
+    """20s chunk at fps=2.0, max_pixels=602112: ceil(40/2)*3072 = 61440 embed tokens.
+    61440 > 27852 (= 0.85 × 32768). Must raise BudgetExceeded naming chunk_id,
+    est_embed_tokens, safe_budget, and remediation levers."""
     os.environ["VLLM_ENCODER_CACHE"] = "32768"
     chunks = plan_chunks_equal_width(duration=20.0, n=1, overlap_s=0.0, max_s=20.0)
     assert len(chunks) == 1
@@ -42,10 +42,11 @@ def test_budget_assert_violation() -> None:
 
 
 def test_budget_assert_passes_within_headroom() -> None:
-    """20s at fps=1.0, max_pixels=602112 → ~15400 embed tokens. 0.85 x 32768 = 27852.
-    Well within budget — must not raise."""
+    """18s at fps=1.0, max_pixels=602112: ceil(18/2)*3072 = 27648 embed tokens.
+    27648 < 27852 (= 0.85 × 32768). Must not raise.
+    Note: 20s at fps=1.0 gives 30720 which EXCEEDS the safe budget — use MAX_CHUNK_S=18."""
     os.environ["VLLM_ENCODER_CACHE"] = "32768"
-    chunks = plan_chunks_equal_width(duration=20.0, n=1, overlap_s=0.0, max_s=20.0)
+    chunks = plan_chunks_equal_width(duration=18.0, n=1, overlap_s=0.0, max_s=18.0)
     assert_chunks_fit_budget(chunks, fps=1.0, max_pixels=602112)
 
 

@@ -21,6 +21,7 @@ Usage:
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 import threading
@@ -58,12 +59,18 @@ TOKEN_BUDGETS  = [20480, 14336, 8192]   # tokens per chunk attempt (shorter = le
 TIMEOUTS       = [900, 1200, 1500]      # timeout per chunk attempt (s)
 CHUNK_OVERLAP  = 3.0             # seconds of frame overlap each side for visual context
 DEFAULT_CHUNKS = 4               # chunks per video when --chunks not specified
-# Hard ceiling on per-chunk duration. At fps=1, max_pixels=602112 (Qwen2.5-VL 14x14 patches,
-# temporal_patch_size=2): tokens/chunk ~= chunk_s * 384. 20s -> ~7680 embed tokens.
-MAX_CHUNK_S    = 20.0
+# Hard ceiling on per-chunk duration.
+# Token math: ceil(chunk_s * fps / 2) * ceil(max_pixels / 196)
+# At fps=1, max_pixels=602112: ceil(18/2) * 3072 = 27648  (< 27852 safe budget = 0.85 × 32768)
+# At fps=1, max_pixels=602112: ceil(20/2) * 3072 = 30720  (EXCEEDS safe budget — don't use 20s)
+MAX_CHUNK_S    = 18.0
 # Max concurrent /v1/chat/completions requests across ALL chunks of ALL videos in flight.
 # vLLM continuous batching + PagedAttention admits chunks up to KV headroom (~12-16 typical).
 MAX_INFLIGHT   = 32
+# Must match vLLM --mm-processor-kwargs fps/max_pixels so budget assert is accurate.
+# Budget assert uses these values; mismatching them defeats the check entirely.
+MM_FPS         = float(os.environ.get("VLLM_MM_FPS", "1.0"))
+MM_MAX_PIXELS  = int(os.environ.get("VLLM_MM_MAX_PIXELS", "602112"))
 
 _THINK_RE   = re.compile(r"<think>.*?</think>", re.DOTALL)
 _JSON_START = re.compile(r"\{", re.DOTALL)
@@ -1148,7 +1155,9 @@ def _build_chunk_payload(
         f"All timestamps absolute from video start."
     )
     payload = _build_payload(model_id, system, user_text, safe_url, max_tokens, attempt=1)
-    payload["extra_body"]["mm_processor_kwargs"] = {"fps": 2.0, "do_sample_frames": True}
+    # Do NOT override mm_processor_kwargs here — let the server's --mm-processor-kwargs
+    # (fps=MM_FPS, max_pixels=MM_MAX_PIXELS) apply. Overriding fps to 2.0 doubles embed
+    # tokens per chunk and breaks the encoder cache budget check done at plan time.
     return payload
 
 
@@ -1234,7 +1243,7 @@ def analyze_video_chunked(
 
     # ── BUDGET ASSERT (belt) ──────────────────────────────────────────────────
     try:
-        assert_chunks_fit_budget(chunks, fps=1.0, max_pixels=602112)
+        assert_chunks_fit_budget(chunks, fps=MM_FPS, max_pixels=MM_MAX_PIXELS)
     except BudgetExceeded as e:
         log(video_label, f"BUDGET FAIL — {e}")
         return {"ok": False, "error": f"budget: {e}",
