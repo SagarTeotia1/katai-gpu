@@ -54,7 +54,7 @@ MODEL_ID    = "Qwen/Qwen3.6-27B"
 MAX_TOKENS  = 32768
 MAX_RETRIES    = 3               # per-chunk retry attempts (single-video path only)
 RETRY_DELAYS   = [5, 15]         # seconds before attempt 2, 3
-TOKEN_BUDGETS  = [5120, 3584, 2048]     # tokens per chunk: lean events + world_state (~1K tok)
+TOKEN_BUDGETS  = [3072, 2048, 1536]     # math: 300s × 334tok/s / 32chunks = 3131 max; 3072 headroom
 TIMEOUTS       = [900, 1200, 1500]      # timeout per chunk attempt (s)
 CHUNK_OVERLAP  = 3.0             # seconds of frame overlap each side for visual context
 DEFAULT_CHUNKS = 8               # chunks per video when --chunks not specified

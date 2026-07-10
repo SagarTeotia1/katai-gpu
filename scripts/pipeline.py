@@ -358,7 +358,7 @@ def main() -> None:
     # ── Estimate wall time ────────────────────────────────────────────────────
     est_cast    = n_crops  * 55   # ~55s per crop (parallel across crops)
     est_trans   = n_videos * 210  # ~210s per video (sequential)
-    est_context = n_videos * 180  # ~180s per video (parallel, GPU bound, lean schema ~2K tok/chunk)
+    est_context = n_videos * 120  # ~120s: 32chunks × 1500tok / 334tok/s = 144s decode + overhead
     est_index   = 60
     # Cast + Whisper run in PARALLEL → wall = max(cast, whisper), not sum.
     est_cast_trans = max(
@@ -533,7 +533,8 @@ def main() -> None:
                "--backend", args.backend,
                "--chunks", str(args.chunks),
                "--workers", str(args.workers),
-               "--context-mode", args.context_mode]
+               "--context-mode", args.context_mode,
+               "--output", "output"]
         if not args.no_scene_align:
             cmd.append("--scene-align")
         if cast_analysis_file:
