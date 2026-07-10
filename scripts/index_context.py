@@ -164,7 +164,15 @@ class PineconeIndexer:
 
     def index_context(self, ctx: dict) -> int:
         video_id   = ctx.get("video_id", "unknown")
-        person_map = {p["person_id"]: p["display_name"] for p in ctx.get("known_people", [])}
+        known_people = ctx.get("known_people", [])
+        person_map = {p["person_id"]: p.get("display_name", p["person_id"]) for p in known_people if "person_id" in p}
+        # Fallback: build person_map from cast_analysis-style people list if known_people is empty
+        if not person_map and "people" in ctx:
+            for p in ctx.get("people", []):
+                pid  = p.get("person_id") or p.get("id")
+                name = p.get("name") or p.get("display_name") or pid
+                if pid:
+                    person_map[pid] = name
         records    = []
 
         # Timeline events
@@ -313,10 +321,18 @@ class Neo4jGraphBuilder:
                 pass
 
     def index_context(self, ctx: dict) -> int:
-        video_id   = ctx.get("video_id", "unknown")
-        meta       = ctx.get("video_metadata") or {}
-        person_map = {p["person_id"]: p["display_name"] for p in ctx.get("known_people", [])}
-        count      = 0
+        video_id     = ctx.get("video_id", "unknown")
+        meta         = ctx.get("video_metadata") or {}
+        known_people = ctx.get("known_people", [])
+        person_map   = {p["person_id"]: p.get("display_name", p["person_id"]) for p in known_people if "person_id" in p}
+        # Fallback: build person_map from cast_analysis-style people list if known_people is empty
+        if not person_map and "people" in ctx:
+            for p in ctx.get("people", []):
+                pid  = p.get("person_id") or p.get("id")
+                name = p.get("name") or p.get("display_name") or pid
+                if pid:
+                    person_map[pid] = name
+        count        = 0
 
         # Video node
         self._run("""
@@ -568,6 +584,26 @@ class Neo4jGraphBuilder:
                     MATCH (c:Clip {id:$cid}),(e:Event {id:$eid})
                     MERGE (c)-[:REQUIRES_CONTEXT]->(e)
                 """, {"cid": cid, "eid": f"{video_id}_{ev_ref}"})
+
+        # WorldState nodes from world_state_timeline
+        for ws in ctx.get("world_state_timeline", []):
+            self._run("""
+                MERGE (ws:WorldState {video_id: $vid, start: $start})
+                SET ws.end=$end, ws.story_stage=$stage, ws.scene_emotion=$emotion,
+                    ws.energy=$energy, ws.current_topic=$topic,
+                    ws.open_loops=$loops, ws.callbacks=$callbacks
+            """, {
+                "vid":      video_id,
+                "start":    float(ws.get("start", 0)),
+                "end":      float(ws.get("end", 0)),
+                "stage":    ws.get("story_stage", ""),
+                "emotion":  ws.get("scene_emotion", ""),
+                "energy":   ws.get("energy", ""),
+                "topic":    ws.get("current_topic", ""),
+                "loops":    json.dumps(ws.get("open_loops", [])),
+                "callbacks": json.dumps(ws.get("callbacks", [])),
+            })
+            count += 1
 
         return count
 
