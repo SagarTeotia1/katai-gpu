@@ -315,6 +315,7 @@ class ChunkDispatcher:
         build_payload: Callable[[Chunk], dict[str, Any]],
         label_fn: Callable[[Chunk], str] | None = None,
         log_fn: Callable[[str, str], None] | None = None,
+        shared_sem: asyncio.Semaphore | None = None,
     ) -> list[dict[str, Any]]:
         """Fire all chunks; return results in the same order as ``chunks``.
 
@@ -330,7 +331,9 @@ class ChunkDispatcher:
         self._first_below_cap = None
         self._lock = asyncio.Lock()
 
-        sem = asyncio.Semaphore(self.max_inflight)
+        # shared_sem allows multiple dispatchers across multiple videos to share
+        # one pool, so freed slots from any video are immediately used by any other.
+        sem = shared_sem if shared_sem is not None else asyncio.Semaphore(self.max_inflight)
         _label = label_fn or (lambda c: f"chunk-{c.chunk_id}")
         _log = log_fn or (lambda label, msg: None)
 

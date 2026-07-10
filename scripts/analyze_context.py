@@ -937,6 +937,268 @@ OUTPUT SCHEMA — return ONLY valid JSON, nothing else
 }}"""
 
 
+# ── Three-phase chunked pipeline helpers ─────────────────────────────────────
+#
+# Phase 1  _plan_video_chunks()  — sync, per-video: plan + budget assert
+# Phase 2  _dispatch_all_async() — single asyncio event loop, ALL videos share
+#                                   ONE Semaphore(MAX_INFLIGHT) so freed slots
+#                                   from any video are immediately used by any other
+# Phase 3  _finalize_video()     — sync, per-video: parse/stub/merge/synth/save
+
+
+def _plan_video_chunks(
+    video_label: str,
+    video_url: str,
+    cast_analysis: dict,
+    transcripts: dict,
+    total_duration: float,
+    n_chunks: int,
+    model_id: str,
+    scene_align: bool,
+) -> dict:
+    """Returns plan dict or dict with 'error' key if planning fails."""
+    t0       = time.time()
+    safe_url = urllib.parse.quote(video_url, safe=":/?=&%#@!")
+    if safe_url != video_url:
+        log(video_label, f"URL encoded: {safe_url}")
+
+    person_db = build_person_database(cast_analysis, video_label)
+
+    if scene_align:
+        chunks = plan_chunks_scene_aligned(
+            video_url, total_duration,
+            min_s=8.0, max_s=MAX_CHUNK_S, overlap_s=CHUNK_OVERLAP,
+        )
+        log(video_label,
+            f"Scene-aligned: {len(chunks)} chunks "
+            f"(durations: {[round(c.strict_duration, 1) for c in chunks]})")
+    else:
+        chunks = plan_chunks_equal_width(
+            total_duration, n_chunks,
+            overlap_s=CHUNK_OVERLAP, max_s=MAX_CHUNK_S,
+        )
+
+    n_planned = len(chunks)
+    if n_planned == 0:
+        return {"error": "planner produced 0 chunks"}
+
+    try:
+        assert_chunks_fit_budget(chunks, fps=MM_FPS, max_pixels=MM_MAX_PIXELS)
+    except BudgetExceeded as e:
+        log(video_label, f"BUDGET FAIL — {e}")
+        return {"error": f"budget: {e}"}
+
+    log(video_label,
+        f"Planned {n_planned} chunks (~{total_duration / n_planned:.0f}s each) queued into shared pool")
+
+    def build_payload(c: Chunk) -> dict:
+        return _build_chunk_payload(
+            c, video_label, safe_url,
+            person_db, transcripts, total_duration,
+            n_planned, model_id, max_tokens=TOKEN_BUDGETS[0],
+        )
+
+    def label_fn(c: Chunk) -> str:
+        return f"{video_label}/chunk{c.chunk_id}"
+
+    return {
+        "chunks":         chunks,
+        "build_payload":  build_payload,
+        "label_fn":       label_fn,
+        "n_planned":      n_planned,
+        "person_db":      person_db,
+        "safe_url":       safe_url,
+        "video_url":      video_url,
+        "total_duration": total_duration,
+        "t0":             t0,
+    }
+
+
+async def _dispatch_all_async(
+    video_plans: dict,
+    vllm_url: str,
+) -> dict:
+    """Dispatch ALL videos' chunks concurrently under ONE shared Semaphore(MAX_INFLIGHT).
+
+    When a chunk from video-1 finishes and frees a slot, the next queued chunk
+    from ANY video (video-2, video-3, …) takes it immediately — no idle GPU time
+    between videos draining down.
+
+    Returns {label: (raw_results_list, dispatcher)} for each video.
+    """
+    shared_sem = asyncio.Semaphore(MAX_INFLIGHT)
+
+    dispatchers: dict = {}
+    label_order: list[str] = []
+    coros: list = []
+
+    for label, plan in video_plans.items():
+        disp = ChunkDispatcher(
+            vllm_url=vllm_url,
+            max_inflight=MAX_INFLIGHT,
+            retries=2,
+            backoff=(RETRY_DELAYS[0], RETRY_DELAYS[1]),
+            client_timeout=float(TIMEOUTS[0]),
+        )
+        dispatchers[label] = disp
+        label_order.append(label)
+        coros.append(disp.run(
+            plan["chunks"], plan["build_payload"],
+            label_fn=plan["label_fn"], log_fn=_log_thread_safe,
+            shared_sem=shared_sem,
+        ))
+
+    total_chunks = sum(p["n_planned"] for p in video_plans.values())
+    log("dispatch", f"Firing {total_chunks} chunks across {len(video_plans)} videos "
+        f"(shared Semaphore={MAX_INFLIGHT})")
+
+    results_list = await asyncio.gather(*coros, return_exceptions=True)
+
+    return {
+        label: (res, dispatchers[label])
+        for label, res in zip(label_order, results_list)
+    }
+
+
+def _finalize_video(
+    video_label: str,
+    plan: dict,
+    raw_results,          # list[dict] or Exception
+    dispatcher: "ChunkDispatcher",
+    transcripts: dict,
+    out_dir: Path,
+    ts: str,
+    global_progress: dict,
+    global_lock: threading.Lock,
+    vllm_url: str,
+    model_id: str,
+) -> dict:
+    """Parse + stub + merge + synthesize + save for one video (sync)."""
+    t0             = plan["t0"]
+    chunks         = plan["chunks"]
+    n_planned      = plan["n_planned"]
+    person_db      = plan["person_db"]
+    total_duration = plan["total_duration"]
+    video_url      = plan["video_url"]
+    label_fn       = plan["label_fn"]
+    map_wall       = dispatcher.metrics.get("total_wall_s", 0.0)
+
+    if isinstance(raw_results, Exception):
+        log(video_label, f"Dispatch raised exception — {raw_results}")
+        return {"ok": False, "error": str(raw_results),
+                "elapsed": round(time.time() - t0, 1), "attempts": 1}
+
+    # ── PARSE + STUB ──────────────────────────────────────────────────────────
+    chunk_results: list[dict] = []
+    ok_chunks = 0
+    for chunk, res in zip(chunks, raw_results):
+        lbl = label_fn(chunk)
+        if not res["ok"] or res["response"] is None:
+            slice_ = build_transcript_block(
+                transcripts, video_label,
+                start_s=chunk.strict_start, end_s=chunk.strict_end,
+            )
+            stub = stub_failed_chunk(chunk, slice_)
+            stub["error"] = res.get("error") or "unknown"
+            chunk_results.append(stub)
+            log(lbl, f"stubbed (error: {stub['error']})")
+            with global_lock:
+                global_progress["chunks_failed"] += 1
+            continue
+        try:
+            parsed = _extract_chunk_json(res["response"], lbl)
+        except (ValueError, KeyError) as e:
+            slice_ = build_transcript_block(
+                transcripts, video_label,
+                start_s=chunk.strict_start, end_s=chunk.strict_end,
+            )
+            stub = stub_failed_chunk(chunk, slice_)
+            stub["error"] = f"parse: {e}"
+            chunk_results.append(stub)
+            log(lbl, f"parse failure → stubbed ({e})")
+            with global_lock:
+                global_progress["chunks_failed"] += 1
+            continue
+        parsed["ok"]           = True
+        parsed["chunk_id"]     = chunk.chunk_id
+        parsed["scene_id"]     = chunk.scene_id
+        parsed["part_idx"]     = chunk.part_idx
+        parsed["strict_start"] = chunk.strict_start
+        parsed["strict_end"]   = chunk.strict_end
+        parsed["wall_s"]       = round(res["wall_s"], 2)
+        chunk_results.append(parsed)
+        ok_chunks += 1
+        with global_lock:
+            global_progress["chunks_done"] += 1
+        log(lbl,
+            f"OK {res['wall_s']:.1f}s prefill={res['prefill_tokens']} "
+            f"decode={res['decode_tokens']} events={len(parsed.get('timeline', []))}")
+
+    log(video_label,
+        f"map_wall={map_wall:.1f}s ok={ok_chunks}/{n_planned} "
+        f"peak_inflight={dispatcher.metrics.get('peak_inflight')} "
+        f"tail_idle_pct={dispatcher.metrics.get('tail_idle_pct')}")
+
+    if ok_chunks == 0:
+        log(video_label, "FATAL: all chunks failed")
+        return {"ok": False, "error": f"All {n_planned} chunks failed",
+                "elapsed": round(time.time() - t0, 1), "attempts": 1,
+                "dispatcher_metrics": dispatcher.metrics}
+
+    chunk_results.sort(key=lambda r: (int(r.get("scene_id", 0)), int(r.get("part_idx", 0))))
+
+    # ── MERGE ─────────────────────────────────────────────────────────────────
+    try:
+        merged = merge_chunks(chunk_results, video_label, video_url, total_duration)
+    except Exception as e:
+        log(video_label, f"merge_chunks CRASHED — {e}")
+        return {"ok": False, "error": f"merge failed: {e}",
+                "elapsed": round(time.time() - t0, 1), "attempts": 1}
+
+    # ── SYNTH ─────────────────────────────────────────────────────────────────
+    t_synth = time.time()
+    synth_wall_s = 0.0
+    try:
+        merged = synthesize_merged(merged, person_db, total_duration, vllm_url, model_id)
+        synth_wall_s = time.time() - t_synth
+    except Exception as e:
+        synth_wall_s = time.time() - t_synth
+        log(video_label,
+            f"Synthesis failed ({e}) — saving merged timeline without editorial")
+
+    # ── SAVE ──────────────────────────────────────────────────────────────────
+    slug     = video_label.replace(" ", "_")
+    out_path = out_dir / f"context_{slug}_{ts}.json"
+    out_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    elapsed = round(time.time() - t0, 1)
+    tl = len(merged.get("timeline", []))
+    hi = len(merged.get("highlights", []))
+    cl = len(merged.get("clip_candidates", []))
+    kb = out_path.stat().st_size / 1024
+
+    with global_lock:
+        global_progress["done"] += 1
+        done  = global_progress["done"]
+        total = global_progress["total"]
+        bar   = "█" * int(done / total * 20) + "░" * (20 - int(done / total * 20))
+
+    log(video_label,
+        f"✓ COMPLETE {elapsed}s | {ok_chunks}/{n_planned} chunks | "
+        f"{tl} events | {hi} highlights | {cl} clips | {kb:.0f}KB | "
+        f"synth={synth_wall_s:.1f}s → {out_path}")
+    with _print_lock:
+        print(f"\n  Videos: [{bar}] {done}/{total} ({int(done / total * 100)}%)\n", flush=True)
+
+    return {"ok": True, "path": str(out_path), "elapsed": elapsed,
+            "timeline_events": tl, "highlights": hi, "clips": cl,
+            "size_kb": round(kb, 1), "chunks_ok": ok_chunks,
+            "chunks_total": n_planned, "attempts": 1,
+            "synth_wall_s": round(synth_wall_s, 2),
+            "map_wall_s": round(map_wall, 2),
+            "dispatcher_metrics": dispatcher.metrics}
+
+
 # ── Per-video/chunk analysis — single attempt ─────────────────────────────────
 
 def _build_payload(
@@ -1530,13 +1792,6 @@ def main() -> None:
     print(flush=True)
 
     # ── Shared progress ───────────────────────────────────────────────────────
-    # _agent_base: cumulative chunk offset per video so agent IDs never overlap
-    agent_bases: dict[str, int] = {}
-    _base = 0
-    for v in videos:
-        agent_bases[v["label"]] = _base
-        _base += chunk_alloc.get(v["label"], n_chunks)
-
     progress = {
         "done":             0,
         "failed":           0,
@@ -1565,27 +1820,54 @@ def main() -> None:
                 results[label] = {"ok": False, "error": str(exc)}
                 log(label, f"CRASHED — {exc}")
     else:
-        # ── Chunked mode — sequential videos, chunk-level parallelism via
-        # ChunkDispatcher (Semaphore-bounded) saturates the GPU. Sequential video
-        # dispatch keeps tail_idle_pct honest (one dispatcher's cap owns the GPU
-        # at a time) and avoids compounding semaphores across videos.
-        for i, v in enumerate(videos):
+        # ── Chunked mode — THREE PHASES ───────────────────────────────────────
+        # Phase 1: Plan chunks for every video (sync, fast)
+        video_plans: dict = {}
+        for v in videos:
             label = v["label"]
             try:
-                results[label] = analyze_video_chunked(
-                    i, label, v["url"],
-                    cast_analysis, transcripts,
-                    out_dir, ts,
-                    chunk_alloc.get(label, n_chunks),
-                    durations.get(label, 600.0),
-                    vllm_url, model_id, backend_url,
-                    progress, progress_lock,
-                    agent_bases[label],
-                    args.scene_align,
+                plan = _plan_video_chunks(
+                    label, v["url"], cast_analysis, transcripts,
+                    durations.get(label, 600.0), chunk_alloc.get(label, n_chunks),
+                    model_id, args.scene_align,
                 )
+                if "error" in plan:
+                    results[label] = {"ok": False, "error": plan["error"],
+                                      "elapsed": 0.0, "attempts": 1}
+                    log(label, f"Plan failed — {plan['error']}")
+                else:
+                    video_plans[label] = plan
             except Exception as exc:
                 results[label] = {"ok": False, "error": str(exc)}
-                log(label, f"CRASHED — {exc}")
+                log(label, f"Plan CRASHED — {exc}")
+
+        # Phase 2: Dispatch ALL videos' chunks under ONE shared Semaphore(MAX_INFLIGHT).
+        # Freed slots from any video are immediately used by the next queued chunk
+        # from ANY other video → GPU stays at max_inflight at all times.
+        if video_plans:
+            t_map_all = time.time()
+            all_dispatch = asyncio.run(_dispatch_all_async(video_plans, vllm_url))
+            log("dispatch",
+                f"All-video map done in {time.time() - t_map_all:.1f}s "
+                f"({sum(p['n_planned'] for p in video_plans.values())} chunks total)")
+
+            # Phase 3: Finalize per-video (parse/stub/merge/synth/save) — sequential,
+            # no GPU contention; synthesis uses one serial vLLM text-only call per video.
+            for v in videos:
+                label = v["label"]
+                if label not in video_plans:
+                    continue
+                raw_results, dispatcher = all_dispatch[label]
+                try:
+                    results[label] = _finalize_video(
+                        label, video_plans[label], raw_results, dispatcher,
+                        transcripts, out_dir, ts,
+                        progress, progress_lock,
+                        vllm_url, model_id,
+                    )
+                except Exception as exc:
+                    results[label] = {"ok": False, "error": str(exc)}
+                    log(label, f"Finalize CRASHED — {exc}")
 
     wall = time.time() - t_wall
     ok   = sum(1 for r in results.values() if r.get("ok"))
