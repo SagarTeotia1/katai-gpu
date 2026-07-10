@@ -720,7 +720,7 @@ def synthesize_merged(
         "max_tokens": 6144,
         "temperature": 0.0,
         "response_format": {"type": "json_object"},
-        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        "chat_template_kwargs": {"enable_thinking": False},
     }
 
     log(video_label, "Synthesis pass — text-only LLM call for conversation/story/editorial...")
@@ -800,7 +800,7 @@ OUTPUT ONLY VALID JSON — no markdown, no explanation:
         "max_tokens": 8192,
         "temperature": 0.1,
         "response_format": {"type": "json_object"},
-        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        "chat_template_kwargs": {"enable_thinking": False},
     }
 
     log(video_label, "Continuity pass — dedup people across chunk boundaries...")
@@ -1630,6 +1630,9 @@ def _build_payload(
     # add_generation_prompt=False tells vLLM not to append another <|im_start|>assistant header.
     messages.append({"role": "assistant", "content": "{"})
 
+    # NOTE: We use urllib/httpx directly — NOT the OpenAI Python SDK.
+    # extra_body is an SDK abstraction that merges nested keys to top-level before sending.
+    # When bypassing the SDK, all vLLM extensions must be at TOP LEVEL of the JSON body.
     return {
         "model": model_id,
         "messages": messages,
@@ -1638,11 +1641,9 @@ def _build_payload(
         "stream": False,
         "response_format": {"type": "json_object"},
         "add_generation_prompt": False,
-        "extra_body": {
-            "top_k": 20,
-            "chat_template_kwargs": {"enable_thinking": False},
-            "mm_processor_kwargs": {"fps": MM_FPS},
-        },
+        "top_k": 20,
+        "chat_template_kwargs": {"enable_thinking": False},
+        "mm_processor_kwargs": {"fps": MM_FPS, "max_pixels": MM_MAX_PIXELS},
     }
 
 
@@ -2240,7 +2241,7 @@ def main() -> None:
     print(f"  Transcripts:   {tr_path}")
     print(f"  Chunk budget:  {n_chunks} per video → proportionally allocated")
     print(f"  Total agents:  {total_agents}  |  Retries: {MAX_RETRIES}/chunk")
-    print(f"  Token budgets: {TOKEN_BUDGETS}  |  Timeouts: {TIMEOUTS}s")
+    print(f"  Token budgets: {TOKEN_BUDGETS}  |  Dispatch timeout: 360s/chunk  |  Retries: 2")
     print(f"{'='*62}")
     print(f"\n  Persons: {len(cast_analysis.get('persons', []))}")
     for p in cast_analysis.get("persons", []):

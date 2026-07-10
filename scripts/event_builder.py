@@ -24,13 +24,13 @@ Boundary fusion window: signals within 1.5 s count toward the same boundary.
 
 Score thresholds:
   < 3   → not a real boundary (merged with neighbour)
-  3-4   → LOW profile
-  5-8   → MEDIUM profile
-  ≥ 9   → HIGH profile
+  3-3   → LOW profile
+  4-6   → MEDIUM profile
+  ≥ 7   → HIGH profile  (lowered from 9: scene_cuts=None caps max score at ~8)
 
 Processing profiles (control the full analysis strategy, not just token count):
   LOW    — 512 tok  | few frames    | quick template    | minimal reasoning
-  MEDIUM — 1500 tok | moderate frames | rich template   | standard reasoning
+  MEDIUM — 2048 tok | moderate frames | rich template   | standard reasoning
   HIGH   — 4096 tok | many frames   | full template     | deep reasoning
 
 Every event is analyzed by the VLM. Profile controls reasoning depth.
@@ -90,7 +90,7 @@ PROFILES: dict[str, ProcessingProfile] = {
     ),
     "MEDIUM": ProcessingProfile(
         name="MEDIUM",
-        max_tokens=1500,
+        max_tokens=2048,
         frames_hint="moderate",
         prompt_template="rich",
         reasoning_depth="standard",
