@@ -747,8 +747,11 @@ class ChunkDispatcher:
         stripped = content.strip()
         if not stripped:
             finish = response.get("choices", [{}])[0].get("finish_reason", "unknown")
-            raise ProseFailed(f"empty content (finish_reason={finish}) — model used all tokens thinking; raise max_tokens or add /no_think")
-        if not stripped.startswith("{"):
+            raise ProseFailed(f"empty content (finish_reason={finish})")
+        # With assistant prefix { the model continues mid-JSON — content starts after {.
+        # Valid if content starts with { (full JSON) OR with a JSON key/value continuation.
+        # Reject only clear prose: starts with a letter/word without any { in first 200 chars.
+        if not stripped.startswith("{") and "{" not in stripped[:200]:
             preview = stripped[:120].replace("\n", " ")
             raise ProseFailed(f"model output prose. Preview: {preview}")
 

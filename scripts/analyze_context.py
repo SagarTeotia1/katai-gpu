@@ -1609,40 +1609,38 @@ def _build_payload(
     max_tokens: int,
     attempt: int,
 ) -> dict:
-    """Build vLLM payload. Attempt 2+ adds an extra JSON-enforcement reminder."""
+    """Build vLLM payload. Forces JSON via assistant prefix { — model must continue as JSON."""
     messages = [{"role": "system", "content": system}]
 
-    # /no_think forces Qwen3 to skip reasoning even when enable_thinking=False
-    # doesn't take effect for multimodal requests in vLLM.
-    no_think_prefix = "/no_think\n\n"
     user_content: list = [
-        {"type": "text", "text": no_think_prefix + user_text},
+        {"type": "text", "text": user_text},
         {"type": "video_url", "video_url": {"url": safe_url}},
     ]
 
-    # On retry: prepend hard JSON reminder (model drifted to prose on attempt 1)
+    # On retry: prepend hard JSON reminder
     if attempt > 1:
         reminder = (
-            "CRITICAL REMINDER: Your ENTIRE response must be one valid JSON object. "
-            "Start with { and end with }. Zero prose before or after JSON. "
-            "Do NOT wrap in markdown. Do NOT explain. Just JSON."
+            "CRITICAL: Output ONLY valid JSON starting with {. No prose, no markdown, no explanation."
         )
         user_content.insert(0, {"type": "text", "text": reminder})
 
     messages.append({"role": "user", "content": user_content})
 
+    # Assistant prefix { forces the model to continue as JSON — cannot output prose.
+    # add_generation_prompt=False tells vLLM not to append another <|im_start|>assistant header.
+    messages.append({"role": "assistant", "content": "{"})
+
     return {
         "model": model_id,
         "messages": messages,
         "max_tokens": max_tokens,
-        "temperature": 0.0,  # greedy — prose generation caused by sampling noise
+        "temperature": 0.0,
         "stream": False,
         "response_format": {"type": "json_object"},
+        "add_generation_prompt": False,
         "extra_body": {
             "top_k": 20,
             "chat_template_kwargs": {"enable_thinking": False},
-            # fps MUST match MM_FPS / VLLM_MM_FPS env so the budget assert
-            # (assert_chunks_fit_budget) reflects the actual encoder token cost.
             "mm_processor_kwargs": {"fps": MM_FPS},
         },
     }
@@ -1859,7 +1857,10 @@ def _extract_chunk_json(response: dict, label: str) -> dict:
     raw = msg.get("content") or ""
     if not raw.strip():
         finish = response["choices"][0].get("finish_reason")
-        raise ValueError(f"Empty content (finish_reason={finish}) — model used all tokens thinking; /no_think should prevent this")
+        raise ValueError(f"Empty content (finish_reason={finish})")
+    # Assistant prefix { was injected — prepend it back so parse_robust gets valid JSON
+    if not raw.strip().startswith("{"):
+        raw = "{" + raw
     return parse_robust(raw, label)
 
 
