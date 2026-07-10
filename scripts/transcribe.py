@@ -38,7 +38,7 @@ def probe_duration(backend_base: str, video_url: str) -> float | None:
         )
         resp = urllib.request.urlopen(req, timeout=45)
         data = json.loads(resp.read())
-        return float(data.get("duration_s") or data.get("duration") or 0) or None
+        return float(data.get("duration_seconds") or data.get("duration_s") or data.get("duration") or 0) or None
     except Exception:
         return None
 
