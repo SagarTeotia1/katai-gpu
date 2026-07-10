@@ -100,14 +100,31 @@ def parse_robust(raw: str, ctx: str = "") -> dict:
     raise ValueError(f"{ctx}: JSON parse failed. Preview: {fragment[:300]}")
 
 
-def post_vllm(payload: dict, vllm_url: str, timeout: int = 900) -> dict:
+def post_vllm(payload: dict, vllm_url: str, timeout: int = 900,
+              max_retries: int = 3) -> dict:
     data = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        vllm_url, data=data,
-        headers={"Content-Type": "application/json"},
-    )
-    resp = urllib.request.urlopen(req, timeout=timeout)
-    return json.loads(resp.read())
+    _RETRYABLE = {429, 500, 502, 503, 504}
+    last_exc: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            req = urllib.request.Request(
+                vllm_url, data=data,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = urllib.request.urlopen(req, timeout=timeout)
+            return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code not in _RETRYABLE or attempt == max_retries:
+                raise
+            last_exc = e
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            if attempt == max_retries:
+                raise
+            last_exc = e
+        wait = 2 ** attempt
+        log(f"post_vllm attempt {attempt} failed ({last_exc}); retry in {wait}s")
+        time.sleep(wait)
+    raise RuntimeError("post_vllm: exhausted retries")
 
 
 # ── Prompt builders ──────────────────────────────────────────────────────────
