@@ -235,7 +235,6 @@ query: ## Natural language Q&A over indexed video — usage: make query Q="who l
 retrieve: ## RAG — retrieve ranked editable events (no LLM synthesis) — usage: make retrieve Q="best hook moment" [VIDEO=vid1] [TOPK=15] [MIN_SCORE=0.3]
 	@python3 scripts/retriever.py \
 		--query "$(Q)" \
-		--vllm http://localhost:$(VLLM_PORT)/v1/chat/completions \
 		$(if $(VIDEO),--video "$(VIDEO)") \
 		$(if $(TOPK),--top-k $(TOPK)) \
 		$(if $(MIN_SCORE),--min-score $(MIN_SCORE)) \
