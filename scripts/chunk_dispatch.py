@@ -27,6 +27,14 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+class ProseFailed(Exception):
+    """Raised when model outputs prose instead of JSON.
+
+    Not retried in _request_with_retry — propagates to the dispatcher so it
+    can split the chunk into two smaller halves and re-queue them in parallel.
+    """
+
+
 # ── Data types ────────────────────────────────────────────────────────────────
 
 
@@ -374,6 +382,50 @@ class WorkStealingQueue:
             mid, int((c.strict_end - mid) * self._fps),
         )
 
+    async def replace_with_halves(self, chunk: Chunk) -> bool:
+        """Called when a chunk fails with prose. Split it into 2 halves and re-queue.
+
+        The failed chunk's pending slot is consumed. Two halves are added if
+        the chunk is large enough, keeping _pending correct. Returns True if
+        halves were queued (caller should NOT add a result for the failed chunk).
+        Returns False if too small to split (caller should stub the chunk normally).
+        """
+        async with self._cond:
+            self._pending -= 1  # failed chunk is gone
+            if (chunk.strict_duration >= self._min_split_s
+                    and self._splits_done < self._max_splits):
+                mid = round((chunk.strict_start + chunk.strict_end) / 2, 3)
+                pad = 2.0
+                c1 = Chunk(
+                    chunk_id=chunk.chunk_id,
+                    scene_id=chunk.scene_id,
+                    part_idx=chunk.part_idx,
+                    strict_start=chunk.strict_start,
+                    strict_end=mid,
+                    pad_start=chunk.pad_start,
+                    pad_end=min(chunk.pad_end, mid + pad),
+                )
+                c2 = Chunk(
+                    chunk_id=self._next_id,
+                    scene_id=chunk.scene_id,
+                    part_idx=chunk.part_idx + 1,
+                    strict_start=mid,
+                    strict_end=chunk.strict_end,
+                    pad_start=max(chunk.pad_start, mid - pad),
+                    pad_end=chunk.pad_end,
+                )
+                self._next_id += 1
+                self._splits_done += 1
+                self._push(c1)
+                self._push(c2)
+                self._cond.notify_all()
+                return True
+            # Too small to split — just check if queue is now empty
+            if self._pending == 0:
+                self._closed = True
+                self._cond.notify_all()
+            return False
+
     @property
     def splits_done(self) -> int:
         return self._splits_done
@@ -589,6 +641,7 @@ class ChunkDispatcher:
                         "decode_tokens":  0,
                         "response":       None,
                     }
+                    prose_halved = False
                     async with sem:
                         await self._track(+1)
                         submit_t = time.monotonic()
@@ -607,6 +660,17 @@ class ChunkDispatcher:
                                  f"OK {chunk.strict_start:.1f}s-{chunk.strict_end:.1f}s "
                                  f"| prefill={result['prefill_tokens']} "
                                  f"decode={result['decode_tokens']}")
+                        except ProseFailed as exc:
+                            # Don't retry same window — split into 2 halves, both fire in parallel.
+                            prose_halved = await queue.replace_with_halves(chunk)
+                            if prose_halved:
+                                _log(label,
+                                     f"prose → split [{chunk.strict_start:.1f}-"
+                                     f"{chunk.strict_end:.1f}]s into 2 halves "
+                                     f"(prose splits: {queue.splits_done})")
+                            else:
+                                result["error"] = f"prose+unsplittable: {exc}"
+                                _log(label, "prose + chunk too small to split → stub")
                         except Exception as exc:
                             result["error"] = f"{type(exc).__name__}: {exc}"
                             _log(label, f"FAIL {result['error']}")
@@ -615,6 +679,8 @@ class ChunkDispatcher:
                             result["done_time"] = done_t
                             result["wall_s"] = done_t - submit_t
                             await self._track(-1)
+                    if prose_halved:
+                        continue  # halves re-queued; skip result append + queue.done
                     async with results_lock:
                         results.append(result)
                     did_split = await queue.done(chunk)
@@ -658,15 +724,15 @@ class ChunkDispatcher:
 
     @staticmethod
     def _validate_response(response: dict) -> None:
-        """Raise ValueError if response content is prose instead of JSON."""
+        """Raise ProseFailed if response content is prose instead of JSON."""
         msg = response.get("choices", [{}])[0].get("message", {})
         content = msg.get("content") or msg.get("reasoning") or ""
         stripped = content.strip()
         if not stripped:
-            raise ValueError("empty response content")
+            raise ProseFailed("empty response content")
         if not stripped.startswith("{"):
             preview = stripped[:120].replace("\n", " ")
-            raise ValueError(f"model output prose, no JSON found. Preview: {preview}")
+            raise ProseFailed(f"model output prose. Preview: {preview}")
 
     async def _request_with_retry(
         self,
@@ -690,24 +756,20 @@ class ChunkDispatcher:
                     )
                 r.raise_for_status()
                 response = r.json()
-                self._validate_response(response)
+                self._validate_response(response)  # raises ProseFailed — not caught here
                 return response
+            except ProseFailed:
+                # Propagate immediately — caller (run_adaptive _worker) will split
+                # the chunk into two halves and re-queue them. No retry of same window.
+                raise
             except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout,
-                    httpx.PoolTimeout, httpx.HTTPStatusError, ValueError) as exc:
+                    httpx.PoolTimeout, httpx.HTTPStatusError) as exc:
                 last_exc = exc
                 if attempt >= self.retries:
                     break
-                # Prose/parse failures (ValueError) retry immediately — response
-                # already came back, worker slot was idle during the delay.
-                # Network/server errors still back off to avoid hammering.
-                if isinstance(exc, ValueError):
-                    log_fn(label, f"attempt {attempt + 1} retriable (prose/parse); retrying immediately")
-                else:
-                    delay = self.backoff[min(attempt, len(self.backoff) - 1)]
-                    log_fn(label,
-                           f"attempt {attempt + 1} retriable ({exc}); "
-                           f"sleeping {delay:.1f}s")
-                    await asyncio.sleep(delay)
+                delay = self.backoff[min(attempt, len(self.backoff) - 1)]
+                log_fn(label, f"attempt {attempt + 1} retriable ({exc}); sleeping {delay:.1f}s")
+                await asyncio.sleep(delay)
             except RuntimeError:
                 # Non-retriable HTTP status — surface immediately.
                 raise
