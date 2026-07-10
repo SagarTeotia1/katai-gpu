@@ -96,7 +96,11 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - CUDA_VISIBLE_DEVICES=0
+      # Force Whisper to CPU — vLLM pre-allocates GPU_MEM_UTIL (~86GB on 96GB GPU),
+      # leaving insufficient VRAM for Whisper large-v3. CPU transcription is
+      # fast enough (~90s for 2.5-min audio) and runs sequentially before GPU
+      # context analysis begins.
+      - CUDA_VISIBLE_DEVICES=
       # Model cached alongside HF models
       - HF_HOME=/root/.cache/huggingface
     volumes:
