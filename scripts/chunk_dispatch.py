@@ -717,8 +717,7 @@ def stub_failed_chunk(chunk: Chunk, transcript_slice: str) -> dict[str, Any]:
             "note":       "NO VISUAL ANALYSIS AVAILABLE for this window; transcript only",
             "transcript": transcript_slice,
         }],
-        "known_people":     [],
-        "shot_boundaries":  [],
+        "active_people":    [],
         "audio_events":     [],
-        "speaker_timeline": [],
+        "world_state":      {},
     }

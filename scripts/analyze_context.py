@@ -326,7 +326,26 @@ def build_synthesis_prompt(
     person_db: str,
     timeline_summary: str,
     total_duration: float,
+    world_state_timeline: list | None = None,
 ) -> str:
+    world_state_str = ""
+    if world_state_timeline:
+        world_state_str = "\n\nWORLD STATE ACROSS CHUNKS:\n"
+        for ws in world_state_timeline:
+            world_state_str += (
+                f"  [{ws.get('start', 0):.1f}s-{ws.get('end', 0):.1f}s] "
+                f"stage={ws.get('story_stage', '')} "
+                f"emotion={ws.get('scene_emotion', '')} "
+                f"energy={ws.get('energy', '')} "
+                f"topic={ws.get('current_topic', '')}\n"
+            )
+        loops = [l for ws in world_state_timeline for l in ws.get("open_loops", [])]
+        callbacks = [cb for ws in world_state_timeline for cb in ws.get("callbacks", [])]
+        if loops:
+            world_state_str += f"  Open loops: {'; '.join(set(loops))}\n"
+        if callbacks:
+            world_state_str += f"  Callbacks/recurring: {'; '.join(set(callbacks))}\n"
+
     return f"""You are a senior video editor analyzing a complete merged timeline from parallel chunk analysis.
 
 Video ID: {video_label}
@@ -335,7 +354,7 @@ Known people:
 {person_db}
 
 MERGED TIMELINE (all events, chronological):
-{timeline_summary}
+{timeline_summary}{world_state_str}
 
 Based on this complete timeline, generate the editorial intelligence layer.
 Return ONLY valid JSON:
@@ -428,22 +447,36 @@ def _merge_sorted(chunks: list[dict], key: str) -> list:
     return sorted(items, key=lambda x: x.get("start", x.get("timestamp_s", 0)))
 
 
-def _merge_people(chunks: list[dict]) -> list[dict]:
-    seen: dict = {}
+def _merge_people(chunks: list[dict], cast_analysis: dict | None = None) -> list[dict]:
+    # Chunks now emit active_people: ["P001", "P002"] — list of string IDs, not dicts.
+    seen_ids: set[str] = set()
     for c in chunks:
         if not c.get("ok"):
             continue
-        for p in c.get("known_people", []):
-            pid = p.get("person_id", "")
-            if pid not in seen:
-                seen[pid] = p
-            else:
-                # Extend time range
-                seen[pid]["last_seen_s"] = max(
-                    seen[pid].get("last_seen_s", 0),
-                    p.get("last_seen_s", 0),
-                )
-    return list(seen.values())
+        for pid in c.get("active_people", []):
+            if isinstance(pid, str) and pid:
+                seen_ids.add(pid)
+
+    if not seen_ids:
+        return []
+
+    # Try to resolve IDs against cast_analysis person DB
+    if cast_analysis:
+        persons = cast_analysis.get("persons", [])
+        id_to_person: dict[str, dict] = {}
+        for i, p in enumerate(persons, 1):
+            canonical_pid = f"P{i:03d}"
+            id_to_person[canonical_pid] = {
+                "person_id":   canonical_pid,
+                "display_name": p.get("name", canonical_pid),
+            }
+        resolved = [id_to_person[pid] for pid in sorted(seen_ids) if pid in id_to_person]
+        # Include any IDs not found in cast_analysis as bare entries
+        missing = [pid for pid in sorted(seen_ids) if pid not in id_to_person]
+        resolved += [{"person_id": pid, "display_name": pid} for pid in missing]
+        return resolved
+
+    return [{"person_id": pid, "display_name": pid} for pid in sorted(seen_ids)]
 
 
 def merge_chunks(
@@ -451,6 +484,7 @@ def merge_chunks(
     video_label: str,
     video_url: str,
     total_duration: float,
+    cast_analysis: dict | None = None,
 ) -> dict:
     """Combine N chunk outputs into one coherent context dict (minus synthesis fields)."""
     # Sort chunks by start time so events are chronological
@@ -461,25 +495,38 @@ def merge_chunks(
     for i, ev in enumerate(all_events, 1):
         ev["id"] = f"E{i:03d}"
 
-    return {
-        "video_id":       video_label,
-        "video_url":      video_url,
-        "known_people":   _merge_people(chunk_results),
-        "timeline":       all_events,
-        "shot_boundaries": _merge_sorted(chunk_results, "shot_boundaries"),
-        "audio_events":   _merge_sorted(chunk_results, "audio_events"),
-        "speaker_timeline": _merge_sorted(chunk_results, "speaker_timeline"),
+    # Collect world_state entries from each successful chunk
+    world_states = []
+    for c in chunk_results:
+        if c.get("ok") and "world_state" in c:
+            ws = c["world_state"]
+            if isinstance(ws, dict) and ws:
+                world_states.append({
+                    "start": c.get("strict_start", 0),
+                    "end":   c.get("strict_end",   0),
+                    **ws,
+                })
+    world_state_timeline = sorted(world_states, key=lambda x: x["start"])
+
+    merged = {
+        "video_id":             video_label,
+        "video_url":            video_url,
+        "known_people":         _merge_people(chunk_results, cast_analysis),
+        "timeline":             all_events,
+        "audio_events":         _merge_sorted(chunk_results, "audio_events"),
+        "world_state_timeline": world_state_timeline,
         # Synthesis fields filled in by synthesize_merged()
-        "video_metadata":     {},
-        "scenes":             [],
-        "conversation":       {},
-        "story":              {},
-        "highlights":         [],
-        "clip_candidates":    [],
+        "video_metadata":       {},
+        "scenes":               [],
+        "conversation":         {},
+        "story":                {},
+        "highlights":           [],
+        "clip_candidates":      [],
         "thumbnail_candidates": [],
-        "ocr_results":        [],
-        "editorial_summary":  {},
+        "ocr_results":          [],
+        "editorial_summary":    {},
     }
+    return merged
 
 
 def synthesize_merged(
@@ -504,13 +551,14 @@ def synthesize_merged(
         txt     = ev.get("transcript_text", "")
         tl_lines.append(
             f"  {ev['id']} [{ev.get('start',0):.1f}s-{ev.get('end',0):.1f}s] "
-            f"{ev.get('type','?')} | speaker:{speaker} | emotion:{ev.get('emotion','')} | "
+            f"{ev.get('type','?')} | speaker:{speaker} | "
             f"clip:{ev.get('clip_worthy',False)} | \"{txt[:80]}\""
         )
     timeline_text = "\n".join(tl_lines)
 
     system = build_synthesis_prompt(
-        video_label, video_url, person_db, timeline_text, total_duration
+        video_label, video_url, person_db, timeline_text, total_duration,
+        world_state_timeline=merged.get("world_state_timeline", []),
     )
 
     payload = {
@@ -620,9 +668,8 @@ OUTPUT ONLY VALID JSON — no markdown, no explanation:
 
         if remapping:
             for ev in merged.get("timeline", []):
-                if "person_ids" in ev:
-                    remapped = [remapping.get(pid, pid) for pid in ev["person_ids"]]
-                    ev["person_ids"] = list(dict.fromkeys(remapped))
+                if "visible_people" in ev:
+                    ev["visible_people"] = [remapping.get(pid, pid) for pid in ev.get("visible_people", [])]
                 if ev.get("speaker") in remapping:
                     ev["speaker"] = remapping[ev["speaker"]]
             log(video_label,
@@ -1791,7 +1838,8 @@ def analyze_video_chunked(
 
     # ── MERGE ─────────────────────────────────────────────────────────────────
     try:
-        merged = merge_chunks(chunk_results, video_label, video_url, total_duration)
+        merged = merge_chunks(chunk_results, video_label, video_url, total_duration,
+                              cast_analysis=cast_analysis)
     except Exception as e:
         log(video_label, f"merge_chunks CRASHED — {e}")
         return {"ok": False, "error": f"merge failed: {e}",
