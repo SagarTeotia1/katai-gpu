@@ -195,19 +195,24 @@ def build_person_database(cast_analysis: dict, video_label: str) -> str:
 
 def build_transcript_block(transcripts: dict, video_label: str,
                            start_s: float = 0.0, end_s: float = 1e9) -> str:
-    """Extract transcript segments for this video (optionally filtered by time window)."""
+    """Extract transcript segments — readable timestamped lines, not raw JSON.
+
+    Format: [start→end] "text"
+    Easier for the model to quote exact lines and map timestamps to events.
+    """
     for v in transcripts.get("videos", []):
         if v.get("video") == video_label:
             segs = v.get("segments", [])
             if not segs:
-                return "[]"
-            compact = [
-                {"id": s["id"], "start": s["start"], "end": s["end"], "text": s["text"]}
-                for s in segs
-                if s["start"] >= start_s - 2 and s["end"] <= end_s + 2
-            ]
-            return json.dumps(compact, ensure_ascii=False)
-    return "[]"
+                return "(no transcript)"
+            lines = []
+            for s in segs:
+                if s["start"] >= start_s - 2 and s["end"] <= end_s + 2:
+                    text = s["text"].strip()
+                    if text:
+                        lines.append(f'[{s["start"]:.1f}s→{s["end"]:.1f}s] "{text}"')
+            return "\n".join(lines) if lines else "(no speech in this window)"
+    return "(no transcript)"
 
 
 # ── Video duration via backend ffprobe ────────────────────────────────────────
@@ -307,7 +312,10 @@ _CHUNK_SCHEMA_COMMON = """\
       "moment": "<8 words max — what happens visually or verbally>",
       "visible_people": ["P001"],
       "speaker": "<person_id or null>",
-      "transcript_text": "<exact words or empty>",
+      "transcript_text": "<exact quoted words spoken in this event — copy verbatim from transcript>",
+      "key_line": "<single most important phrase or sentence from transcript in this event — the line that defines the moment>",
+      "conversation_role": "<setup|punchline|callback|callback_payoff|question|answer|challenge|defense|escalation|deflection|tangent|reveal|running_joke|transition|observation|reaction_verbal>",
+      "speaker_confidence": "<high — mouth visibly moving|medium — voice matches but face not fully visible|low — guessed from context>",
       "scene_setting": "<specific location/background description — e.g. 'Netflix office with red logo backdrop', 'outdoor stage', 'studio with green screen'>",
       "props_visible": ["<specific objects, logos, signs, text visible in frame — e.g. 'Netflix logo', 'pineapple', 'whiteboard', 'coffee cup'>"],
       "ocr_text": ["<any readable text visible in frame — logos, signs, lower thirds, t-shirts>"],
@@ -442,11 +450,20 @@ RULES:
 - scores.emotion_intensity: 0.0 for flat events, 0.8-1.0 for clear peak
 - scores.emotion_contagion: true if second person visibly reacts to first person's emotion
 
-PEOPLE:
+PEOPLE (SPEAKER RULE: assign speaker = person whose MOUTH IS MOVING at that timestamp. A smiling/reacting silent person is NOT the speaker. If unsure, set speaker_confidence="low"):
 {person_db}
 
-TRANSCRIPT (this window only):
+TRANSCRIPT (this window — read this FIRST):
 {transcript_json}
+
+TRANSCRIPT ANALYSIS — do this BEFORE looking at frames:
+1. Read every line. What topic/subject is being discussed?
+2. Find the KEY LINE — the single phrase that matters most in this window.
+3. Identify conversation structure: is this setup for a joke? a punchline? a question being answered? a challenge? a callback to something earlier?
+4. Note any interesting verbal moves: exaggeration, self-deprecation, sarcasm, a reveal, an escalation.
+5. For each event: set key_line to the exact quoted phrase, set conversation_role to its function.
+
+Then use video frames to identify WHO says each line and HOW they deliver it (tone, expression, energy).
 
 CRITICAL: Every timeline event MUST have all fields. Partial events with missing camera/expressions/frame_people are not acceptable.
 
@@ -502,8 +519,15 @@ RULES:
 PEOPLE:
 {person_db}
 
-TRANSCRIPT:
+TRANSCRIPT (read this FIRST — this is what is actually being said):
 {transcript_json}
+
+TRANSCRIPT ANALYSIS — do this BEFORE looking at frames:
+1. Read every line. What is the topic? What is the conversational arc of this window?
+2. For each event, identify: key_line (exact quote), conversation_role (setup/punchline/question/answer/challenge/callback/reveal etc.)
+3. Find jokes — the setup is in transcript text, the punchline is in transcript text. Frames show the delivery and reaction.
+4. Find escalations, challenges, reveals, callbacks — these are the moments that matter editorially.
+5. Then use video frames to confirm WHO speaks each line and HOW they deliver it.
 
 CRITICAL: Every timeline event MUST have all fields. Partial events with missing camera/expressions/frame_people are not acceptable.
 
@@ -593,8 +617,19 @@ EMOTION MAGNITUDE + AUDIO ENERGY:
 PEOPLE:
 {person_db}
 
-TRANSCRIPT (full precision required for this window):
+TRANSCRIPT (read this FIRST — this is the ground truth of what is said):
 {transcript_json}
+
+TRANSCRIPT ANALYSIS — MANDATORY before looking at frames:
+1. Read every line carefully. Understand the ACTUAL CONTENT being discussed.
+2. For each event: key_line = exact verbatim quote from transcript. conversation_role = its function.
+3. Map the conversation arc: what is the setup, what is the conflict, what is the punchline, what is the callback?
+4. Identify WHO speaks each line by matching transcript timestamps to video frames:
+   - The person whose MOUTH IS MOVING at that timestamp is the speaker.
+   - Transcript has no speaker labels — YOU must assign speaker by watching frames.
+   - A person who is smiling/reacting but silent is NOT the speaker.
+5. Find escalations, reveals, self-contradictions, challenges, callbacks — tag them in conversation_role.
+6. "moment" field should reflect WHAT IS BEING SAID, not just what is visually happening.
 
 CRITICAL: Every timeline event MUST have all fields. Partial events with missing camera/expressions/frame_people are not acceptable.
 
