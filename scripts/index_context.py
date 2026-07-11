@@ -66,6 +66,14 @@ def _safe_str(v, limit: int = 0) -> str:
     return s[:limit] if limit else s
 
 
+def _coerce_eh(ev: dict) -> dict:
+    """edit_hints can be a dict or a list — normalize to dict."""
+    eh = ev.get("edit_hints")
+    if isinstance(eh, list):
+        return eh[0] if eh else {}
+    return eh if isinstance(eh, dict) else {}
+
+
 def build_event_text(event: dict, video_id: str, person_map: dict) -> str:
     speaker_name = person_map.get(event.get("speaker", ""), event.get("speaker", "unknown"))
     reactions = " ".join(
@@ -84,7 +92,7 @@ def build_event_text(event: dict, video_id: str, person_map: dict) -> str:
     cam     = event.get("camera") or {}
     ct      = event.get("comedy_timing") or {}
     scores  = event.get("scores") or {}
-    eh      = event.get("edit_hints") or {}
+    eh      = _coerce_eh(event)
     ae      = event.get("audio_energy") or {}
     return (
         f"Video:{video_id} Time:{event.get('start',0):.2f}s-{event.get('end',0):.2f}s "
@@ -328,10 +336,10 @@ class PineconeIndexer:
                     "broll_usable":     bool(ev.get("broll_usable", False)),
                     "visual_tags":      json.dumps(ev.get("visual_tags") or []),
                     "importance_reason": _safe_str((ev.get("scores") or {}).get("importance_reason", ""), 200),
-                    "edit_keep":        bool((ev.get("edit_hints") or {}).get("keep", True)),
-                    "edit_speed":       _safe_str((ev.get("edit_hints") or {}).get("speed", "1x")),
-                    "edit_transition":  _safe_str((ev.get("edit_hints") or {}).get("transition", "cut")),
-                    "edit_caption":     _safe_str((ev.get("edit_hints") or {}).get("caption_suggestion", ""), 200),
+                    "edit_keep":        bool(_coerce_eh(ev).get("keep", True)),
+                    "edit_speed":       _safe_str(_coerce_eh(ev).get("speed", "1x")),
+                    "edit_transition":  _safe_str(_coerce_eh(ev).get("transition", "cut")),
+                    "edit_caption":     _safe_str(_coerce_eh(ev).get("caption_suggestion", ""), 200),
                     "comedy_structure": _safe_str((ev.get("comedy_timing") or {}).get("structure", "none")),
                     "audio_level":      _safe_str((ev.get("audio_energy") or {}).get("level", "")),
                     "speech_rate":      _safe_str((ev.get("audio_energy") or {}).get("speech_rate", "")),
@@ -814,10 +822,10 @@ class Neo4jGraphBuilder:
                 "eye_contact": bool(cam.get("eye_contact",False) if isinstance(cam,dict) else False),
                 "broll": bool(ev.get("broll_usable",False)),
                 "comedy_struct": _safe_str((ev.get("comedy_timing") or {}).get("structure","none")),
-                "edit_keep": bool((ev.get("edit_hints") or {}).get("keep", True)),
-                "edit_speed": _safe_str((ev.get("edit_hints") or {}).get("speed","1x")),
-                "edit_trans": _safe_str((ev.get("edit_hints") or {}).get("transition","cut")),
-                "caption": _safe_str((ev.get("edit_hints") or {}).get("caption_suggestion",""), 200),
+                "edit_keep": bool(_coerce_eh(ev).get("keep", True)),
+                "edit_speed": _safe_str(_coerce_eh(ev).get("speed","1x")),
+                "edit_trans": _safe_str(_coerce_eh(ev).get("transition","cut")),
+                "caption": _safe_str(_coerce_eh(ev).get("caption_suggestion",""), 200),
                 "vtags": json.dumps(ev.get("visual_tags") or []),
                 "audio_level": _safe_str((ev.get("audio_energy") or {}).get("level", "")),
                 "laugh_detected": bool((ev.get("audio_energy") or {}).get("laugh_detected", False)),

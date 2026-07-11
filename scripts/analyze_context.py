@@ -1270,7 +1270,9 @@ def synthesize_merged(
         scores   = ev.get("scores") or {}
         imp_r    = scores.get("importance_reason", "")
         broll    = "broll" if ev.get("broll_usable") else ""
-        keep     = "" if (ev.get("edit_hints") or {}).get("keep", True) else "DROP"
+        _eh      = ev.get("edit_hints")
+        _eh      = (_eh[0] if _eh else {}) if isinstance(_eh, list) else (_eh if isinstance(_eh, dict) else {})
+        keep     = "" if _eh.get("keep", True) else "DROP"
         ae       = ev.get("audio_energy") or {}
         audio_s  = f"audio:{ae.get('level','')} laugh:{ae.get('laugh_detected',False)}" if ae else ""
         ct       = ev.get("comedy_timing") or {}
