@@ -81,6 +81,8 @@ def _get_embedder() -> tuple[EmbedFn | None, str | None]:
 
     except ImportError:
         pass
+    except Exception as _e:
+        print(f"  [diarize] resemblyzer load error: {_e}", flush=True)
 
     # ── 2. speechbrain ECAPA-TDNN ─────────────────────────────────────────────
     try:
