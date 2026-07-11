@@ -32,8 +32,11 @@ help: ## Show this help message
 
 ##@ Setup
 
-install: ## Install host-side script dependencies (pinecone, neo4j, json-repair)
+install: ## Install all host-side script dependencies (pinecone, neo4j, resemblyzer, sklearn, opencv...)
 	pip install -r scripts/requirements.txt
+
+install-diarization: ## Install speaker diarization deps only (resemblyzer + soundfile + sklearn)
+	pip install resemblyzer soundfile scikit-learn
 
 ##@ Docker
 
@@ -204,7 +207,7 @@ analyze-context: ## Full semantic video context — usage: make analyze-context 
 		--chunks $(CHUNKS) \
 		--planner $(PLANNER)
 
-pipeline: ## ONE CMD — full pipeline: cast→transcript→context→index — usage: make pipeline CAST=cast.json [CHUNKS=8] [WORKERS=24] [PLANNER=semantic]
+pipeline: ## ONE CMD — cast→transcript→diarize→context→index — usage: make pipeline CAST=cast.json [CHUNKS=8] [WORKERS=24] [PLANNER=semantic]
 	@python3 scripts/pipeline.py $(CAST) \
 		--backend http://localhost:$(BACKEND_PORT) \
 		--vllm http://localhost:$(VLLM_PORT)/v1/chat/completions \

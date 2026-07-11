@@ -7,3 +7,5 @@ numpy>=1.24.0,<2.0.0
 pandas>=2.0.0,<3.0.0
 opencv-python>=4.9.0
 scikit-learn>=1.4.0
+resemblyzer>=0.1.1.dev0
+soundfile>=0.12.1
