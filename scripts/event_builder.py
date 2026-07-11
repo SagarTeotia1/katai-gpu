@@ -97,7 +97,7 @@ PROFILES: dict[str, ProcessingProfile] = {
     ),
     "HIGH": ProcessingProfile(
         name="HIGH",
-        max_tokens=4096,
+        max_tokens=6144,  # raised from 4096: visual_description+delivery_notes add ~100tok/event × 8 events
         frames_hint="many",
         prompt_template="full",
         reasoning_depth="deep",

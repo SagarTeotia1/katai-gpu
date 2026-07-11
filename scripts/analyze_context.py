@@ -497,6 +497,130 @@ _CHUNK_SCHEMA_LOW = """\
   }}
 }}"""
 
+# HIGH-tier schema — extends COMMON with visual_description + delivery_notes per event.
+# These two prose fields are the key output for Brian: a unified human-readable description
+# of exactly what the camera sees and how the speaker delivers each moment.
+_CHUNK_SCHEMA_HIGH = """\
+{{
+  "chunk_id": {chunk_id},
+  "video_id": "{video_label}",
+  "window_start": {strict_start},
+  "window_end": {strict_end},
+  "active_people": ["P001"],
+  "timeline": [
+    {{
+      "id": "E{chunk_id:02d}_000",
+      "start": <float ≥ {strict_start:.2f}>,
+      "end": <float ≤ {strict_end:.2f}>,
+      "type": "<dialogue|reaction|laugh|joke|question|answer|transition>",
+      "moment": "<8 words max — what happens visually or verbally>",
+      "visual_description": "<3-4 sentences. Describe exactly: which people are visible and where in frame (left/center/right, foreground/midground/background). Their posture and body orientation. The exact expression on each face. What they are doing with their hands and arms. Lighting quality on their face (soft/harsh/warm/cool/underlit). Background details visible. What the shot composition communicates editorially — e.g. 'tight close-up isolates vulnerability', 'wide two-shot shows power balance'>",
+      "delivery_notes": "<how the speaker delivers this line: tone (confident/nervous/sarcastic/deadpan/excited/dismissive), pace (fast/slow/deliberate/trailing off), volume relative to their normal level, any emphasis or loaded pause, vocal tension or ease. Or 'silent event — no speech' if no dialogue>",
+      "visible_people": ["P001"],
+      "speaker": "<person_id or null>",
+      "transcript_text": "<exact quoted words spoken in this event — copy verbatim from transcript>",
+      "key_line": "<single most important phrase or sentence from transcript in this event — the line that defines the moment>",
+      "conversation_role": "<setup|punchline|callback|callback_payoff|question|answer|challenge|defense|escalation|deflection|tangent|reveal|running_joke|transition|observation|reaction_verbal>",
+      "speaker_confidence": "<high — mouth visibly moving|medium — voice matches but face not fully visible|low — guessed from context>",
+      "scene_setting": "<specific location/background description>",
+      "props_visible": ["<specific objects, logos, signs, text visible in frame>"],
+      "ocr_text": ["<any readable text visible in frame>"],
+      "caused_by": "<event_id this event was triggered by, or null>",
+      "importance_tags": ["<hook|punchline|setup|callback|conflict|resolution|reaction|surprise|laugh|topic_shift|speaker_change|new_person|prop_moment|eye_contact_camera>"],
+      "listener_reactions": [{{"person_id": "P002", "reaction": "<laughing|nodding|surprised|shocked|eye_roll|smirk|awkward_silence>"}}],
+      "expressions": [{{"person_id": "P001", "expression": "<laugh|smirk|eye_roll|shock|smile|neutral|confused|excited|bored|thinking>"}}],
+      "physical_actions": [{{"person_id": "P001", "action": "<points|stands|walks|claps|leans_in|leans_back|gestures|looks_away|looks_at_camera|touches_face>"}}],
+      "frame_people": [{{"person_id": "P001", "screen_position": "<left|center|right>", "depth": "<foreground|midground|background>", "occluded": false}}],
+      "camera": {{
+        "shot_type": "<wide|medium|close_up|extreme_close_up|two_shot|over_shoulder>",
+        "shot_size": "<ECU|CU|MCU|MS|WS|EWS>",
+        "motion": "<static|pan|tilt|zoom_in|zoom_out|handheld|cut>",
+        "camera_motion": "<static|push_in|pull_out|pan_left|pan_right|tilt_up|tilt_down|handheld>",
+        "composition": "<centered|rule_of_thirds|offscreen_subject|split_screen>",
+        "eye_contact": <true|false>,
+        "focus_person": "<person_id or null>"
+      }},
+      "comedy_timing": {{
+        "structure": "<setup|punchline|pause|reaction|callback|none>",
+        "pause_duration_s": <0.0>,
+        "setup_at": <float or null>,
+        "laugh_at": <float or null>,
+        "reaction_window_s": <0.0>,
+        "laugh_landed": <true|false>
+      }},
+      "audio_energy": {{
+        "level": "<silent|quiet|normal|loud|peak>",
+        "speech_rate": "<fast|normal|slow|silent>",
+        "silence_before_s": <0.0>,
+        "laugh_detected": <true|false>,
+        "audio_quality": "<clean|noisy|echo|muffled>",
+        "speech_clarity": "<clear|muffled|echo|noisy>",
+        "background_music": <true|false>,
+        "clipping": <true|false>
+      }},
+      "visual_tags": ["<close_up|wide_shot|two_shot|reaction_shot|pointing|laughing|clapping|standing|walking|whiteboard|laptop|phone|logo|eye_contact|broll_candidate|person_thinking|person_shocked|person_smiling|hand_gesture>"],
+      "scores": {{
+        "importance": <0-10>,
+        "hook": <0-10>,
+        "clip": <0-10>,
+        "viral": <0-10>,
+        "emotion": <0-10>,
+        "emotion_intensity": <0.0-1.0>,
+        "emotion_contagion": <true|false>,
+        "importance_reason": "<10 words max — why this score>"
+      }},
+      "energy": {{
+        "visual": <0-10>,
+        "audio": <0-10>,
+        "conversation": <0-10>,
+        "overall": <0-10>
+      }},
+      "viewer_attention": {{
+        "primary": "<person_id of main focus>",
+        "secondary": "<person_id of secondary focus or null>",
+        "reason": "<speaker|reaction|movement|expression>"
+      }},
+      "edit_hints": {{
+        "keep": <true|false>,
+        "start_trim": <0.0>,
+        "end_trim": <0.0>,
+        "speed": "<0.5x|0.75x|1x|1.25x|1.5x|2x>",
+        "transition": "<cut|dissolve|fade|none>",
+        "zoom_on": "<person_id or null>",
+        "caption_suggestion": "<short caption text or null>",
+        "music_mood": "<none|tense|funny|emotional|hype|calm>",
+        "reaction_cut_to": "<person_id or null>",
+        "audio_fade_in_s": <0.0>,
+        "audio_fade_out_s": <0.0>,
+        "editing_opportunities": ["<reaction_cut|zoom|jump_cut|speedup|caption|freeze_frame|punch_in|remove_silence|broll_insert|music_hit>"]
+      }},
+      "clip_worthy": <true|false>,
+      "thumbnail_worthy": <true|false>,
+      "broll_usable": <true|false>
+    }}
+  ],
+  "audio_events": [{{"start": <float>, "end": <float>, "type": "<laughter|music|silence|crosstalk>", "intensity": "<soft|medium|loud>", "audio_quality": "<clean|noisy|echo|muffled>"}}],
+  "world_state": {{
+    "story_stage": "<setup|conflict|explanation|punchline|resolution|transition>",
+    "scene_emotion": "<funny|tense|emotional|informative|awkward|excited|calm>",
+    "energy": {{
+      "overall": "<high|medium|low>",
+      "visual": "<high|medium|low>",
+      "audio": "<high|medium|low>",
+      "conversation": "<high|medium|low>"
+    }},
+    "current_topic": "<5 words max>",
+    "open_loops": ["<unresolved thread>"],
+    "callbacks": ["<recurring reference>"],
+    "last_moment": "<10 words>",
+    "visual_continuity": {{
+      "lighting": "<consistent|changed|poor>",
+      "camera_angle": "<consistent|changed>",
+      "background": "<clean|cluttered|changed>"
+    }}
+  }}
+}}"""
+
 
 def _build_quick_prompt(
     person_db: str, transcript_json: str, video_label: str,
@@ -662,7 +786,9 @@ RULES:
 - Max event duration: 8 seconds
 - Events per window: {n_min}-{n_max} — capture EVERY exchange, reaction, pause, punchline
 
-VISUAL SIGNALS (observe frames directly):
+VISUAL SIGNALS (observe frames directly — these are the highest-value fields for the editor):
+- visual_description: MANDATORY 3-4 sentences of rich visual prose. Describe EXACTLY: who is visible and where in frame (left/center/right, foreground/midground/background). Their posture and body orientation. The exact expression on each face in that moment. What they are doing with their hands and arms. Lighting quality on their face (soft/harsh/warm/cool/underlit). Background details. What the shot composition communicates editorially (tight close-up isolates emotion; wide shot shows power dynamic). This is what Brian reads to understand the shot without watching the video.
+- delivery_notes: MANDATORY — how the speaker delivers this specific line. Tone (confident/nervous/sarcastic/deadpan/excited/dismissive/ironic). Pace relative to their normal speech. Volume. Any emphasis, loaded pauses, trailing off, or vocal cracks. Write this as a directing note: "Delivers slowly with a wry smirk, pausing 0.5s before the punchline for comedic effect."
 - camera.shot_type: wide/medium/close_up/extreme_close_up/two_shot/over_shoulder — changes per cut
 - camera.motion: static/pan/tilt/zoom_in/zoom_out/handheld/cut — very important for pacing
 - camera.eye_contact: true when subject looks directly into lens — high viral signal
@@ -735,8 +861,8 @@ TRANSCRIPT ANALYSIS — MANDATORY before looking at frames:
 
 CRITICAL: Every timeline event MUST have all fields. Partial events with missing camera/expressions/frame_people are not acceptable.
 
-Return ONLY valid JSON (this is a HIGH-priority segment — complete ALL fields including camera, expressions, physical_actions, edit_hints):
-{_CHUNK_SCHEMA_COMMON.format(
+Return ONLY valid JSON (this is a HIGH-priority segment — complete ALL fields including visual_description, delivery_notes, camera, expressions, physical_actions, edit_hints):
+{_CHUNK_SCHEMA_HIGH.format(
     chunk_id=chunk_id, video_label=video_label,
     strict_start=strict_start, strict_end=strict_end,
 )}"""
@@ -979,6 +1105,14 @@ Based on this complete timeline, generate the editorial intelligence layer.
 Use color intelligence to inform editorial decisions (flag overexposed scenes, note color transitions).
 Use audio intelligence to find natural cut points (silences), identify high-energy moments (laughs), and flag speaker pacing.
 
+BRIAN_BRIEF RULES (this section is the most important output — Brian is the editor who will read this):
+- best_shots: For EACH person in the video, find their single best close-up timestamp (most expressive face), best reaction shot (clearest reaction to another person), and best delivery moment (most powerful line delivery). Write WHY each is their best — specific enough that Brian can scrub directly to it.
+- scene_color_grades: For EACH scene, identify any color issues visible in the data (underexposed, color cast, inconsistent temperature between cuts). Write grade_instruction as an actionable colorist note (what to adjust and by how much). Write ffmpeg_quick_fix as a ready-to-paste ffmpeg filter string.
+- audio_notes: List specific timestamps where there is dead air to cut, loud peaks to duck music under, trailing speech to trim, or audio quality problems. Be specific: "44.2s-46.8s: dead air, cut it", "72s: loud laugh — duck music here".
+- opening_hook: Tell Brian the exact timestamp and frame to open on and WHY it hooks in the first 2 seconds. Not vague — specific: "Open on P001 at 3.2s mid-close-up as they say X — the smirk hooks immediately".
+- closing_beat: Tell Brian exactly where and how to end the cut — specific timestamp, what's happening in frame, transition type, and why it lands emotionally.
+- editor_todo: Numbered list of the 5-10 most important specific editing actions. Start with cuts (dead air, filler), then timing adjustments, then color, then captions/music.
+
 SCENES RULES:
 - scenes: divide the video into 3-8 meaningful narrative scenes (not arbitrary 30s chunks)
 - title: a real descriptive title like "The Betrayal Accusation" or "Opening Banter" — NEVER "Scene 1"
@@ -1161,7 +1295,31 @@ Return ONLY valid JSON:
       "intensity": <0.0-1.0>,
       "speaker": "<person_id>"
     }}
-  ]
+  ],
+
+  "brian_brief": {{
+    "best_shots": {{
+      "P001": {{
+        "best_close_up": {{"timestamp_s": <float>, "event_id": "<E_id>", "why": "<exact expression and why it works visually>"}},
+        "best_reaction": {{"timestamp_s": <float>, "event_id": "<E_id>", "why": "<why this is their most usable reaction shot>"}},
+        "best_delivery": {{"timestamp_s": <float>, "event_id": "<E_id>", "why": "<their most powerful delivery moment and why it lands>"}}
+      }}
+    }},
+    "scene_color_grades": [
+      {{
+        "scene_id": "S001",
+        "color_issues": "<what is technically wrong: underexposed, green cast, inconsistent temp across cuts, blown highlights>",
+        "grade_instruction": "<actionable colorist instruction: 'lift shadows +15, warm shadows to 3200K, pull highlights -10, boost face saturation 20%'>",
+        "ffmpeg_quick_fix": "<ready-to-paste ffmpeg filter: eq=brightness=0.05:saturation=1.2,colortemperature=temperature=3200>"
+      }}
+    ],
+    "audio_notes": "<specific pacing issues: dead air timestamps to cut, loud sections to duck music under, timestamps where speaker trails off and needs trim, any echo/noise issues at specific moments>",
+    "opening_hook": "<exact instruction for the editor: start at Xs on [who doing what exact action], why this specific frame hooks the viewer in first 2 seconds>",
+    "closing_beat": "<exact instruction: end at Xs on [who/what], the transition type, why this specific moment lands as a closing beat emotionally>",
+    "editor_todo": [
+      "<numbered actionable task: e.g. '1. Cut dead air 45.2s-48.1s — silence with no visual change, score 0'>"
+    ]
+  }}
 }}"""
 
 
@@ -1191,7 +1349,7 @@ def _enrich_chunks_with_color(
                 video_url,
                 chunk.get("strict_start", chunk.get("window_start", 0)),
                 chunk.get("strict_end",   chunk.get("window_end",   30)),
-                n_frames=2,
+                n_frames=6,  # raised from 2: 3× more color samples catches lighting shifts mid-chunk
             )
             return id(chunk), result
         except Exception as ex:
@@ -1541,12 +1699,20 @@ def synthesize_merged(
         ct       = ev.get("comedy_timing") or {}
         comedy_s = f"comedy:{ct.get('structure','')} pause:{ct.get('pause_duration_s',0):.1f}s" if ct.get("structure","none") != "none" else ""
         ei       = scores.get("emotion_intensity", 0)
-        tl_lines.append(
+        line = (
             f"  {ev['id']} [{ev.get('start',0):.1f}s-{ev.get('end',0):.1f}s] "
             f"{ev.get('type','?')} | {cam.get('shot_type','')} | speaker:{speaker} | "
             f"clip:{ev.get('clip_worthy',False)} imp:{scores.get('importance',0)} ei:{ei:.1f} {keep} "
             f"tags:[{vtags}] {broll} {audio_s} {comedy_s} | \"{txt[:50]}\" | {imp_r}"
         )
+        tl_lines.append(line)
+        # Append rich visual prose when available (HIGH-tier chunks only)
+        vd = ev.get("visual_description", "")
+        dn = ev.get("delivery_notes", "")
+        if vd:
+            tl_lines.append(f"    visual: {vd[:200]}")
+        if dn:
+            tl_lines.append(f"    delivery: {dn[:120]}")
     timeline_text = "\n".join(tl_lines)
 
     system = build_synthesis_prompt(
@@ -1564,7 +1730,7 @@ def synthesize_merged(
             {"role": "user", "content":
              "/no_think\n\nGenerate the complete editorial intelligence layer for this video."},
         ],
-        "max_tokens": 12288,
+        "max_tokens": 16384,  # raised from 12288: brian_brief + scene_color_grades add ~3K tokens
         "temperature": 0.0,
         "response_format": {"type": "json_object"},
         "chat_template_kwargs": {"enable_thinking": False},
