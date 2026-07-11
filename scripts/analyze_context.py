@@ -315,8 +315,8 @@ def allocate_chunks(durations: dict[str, float], total_budget: int) -> dict[str,
 #
 # THREE templates — same output schema (merge logic stays identical), but
 # instruction depth scales with event importance:
-#   quick  (LOW profile, 1024 tok) — who/where/what, camera language, expressions
-#   rich   (MEDIUM,      2048 tok) — full timeline, scores, world_state
+#   quick  (LOW profile, 2048 tok) — who/where/what, camera language, expressions
+#   rich   (MEDIUM,      3072 tok) — full timeline, scores, world_state
 #   full   (HIGH,        4096 tok) — everything + editing hooks, retention, b-roll
 #
 # build_chunk_system_prompt_tiered() is the single entry point; callers pass

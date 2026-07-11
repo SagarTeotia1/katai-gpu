@@ -66,6 +66,18 @@ def _safe_str(v, limit: int = 0) -> str:
     return s[:limit] if limit else s
 
 
+_CONF_MAP = {"high": 0.9, "very_high": 1.0, "very high": 1.0,
+             "medium": 0.6, "low": 0.3, "very_low": 0.1, "unknown": 0.5}
+
+def _safe_float(v, default: float = 1.0) -> float:
+    """Coerce speaker_confidence and similar fields: float passthrough, string→mapped float."""
+    if v is None:
+        return default
+    if isinstance(v, (int, float)):
+        return float(v)
+    return _CONF_MAP.get(str(v).lower().strip(), default)
+
+
 def _coerce_eh(ev: dict) -> dict:
     """edit_hints can be a dict or a list — normalize to dict."""
     eh = ev.get("edit_hints")
@@ -885,7 +897,7 @@ class Neo4jGraphBuilder:
                     MERGE (p)-[r:SPEAKS_IN]->(e)
                     SET r.confidence=$conf, r.text=$text
                 """, {"pid": ev["speaker"], "eid": eid,
-                      "conf": float(ev.get("speaker_confidence",1.0)),
+                      "conf": _safe_float(ev.get("speaker_confidence"), 1.0),
                       "text": _safe_str(ev.get("transcript_text"),300)})
 
             # Visible people
