@@ -83,14 +83,14 @@ class ProcessingProfile:
 PROFILES: dict[str, ProcessingProfile] = {
     "LOW": ProcessingProfile(
         name="LOW",
-        max_tokens=1024,
+        max_tokens=2048,  # raised from 1024: schema+visual fields need ≥1800 per chunk
         frames_hint="few",
         prompt_template="quick",
         reasoning_depth="minimal",
     ),
     "MEDIUM": ProcessingProfile(
         name="MEDIUM",
-        max_tokens=2048,
+        max_tokens=3072,  # raised from 2048: 3-6 events × ~700tok each
         frames_hint="moderate",
         prompt_template="rich",
         reasoning_depth="standard",
