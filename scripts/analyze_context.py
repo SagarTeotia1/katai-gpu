@@ -30,6 +30,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from itertools import zip_longest as _zip_longest
 from pathlib import Path
 
 try:
@@ -113,7 +114,9 @@ def parse_robust(raw: str, ctx: str = "") -> dict:
     """
     raw = _THINK_RE.sub("", raw).strip()
     try:
-        return json.loads(raw)
+        result = json.loads(raw)
+        result = _validate_chunk_output(result, ctx)
+        return result
     except json.JSONDecodeError:
         pass
     m = _JSON_START.search(raw)
@@ -133,8 +136,37 @@ def parse_robust(raw: str, ctx: str = "") -> dict:
                     f"quality degraded",
                     flush=True,
                 )
-            return repaired
+            result = _validate_chunk_output(repaired, ctx)
+            return result
     raise ValueError(f"{ctx}: JSON parse failed. Preview: {fragment[:300]}")
+
+
+def _validate_chunk_output(data: dict, ctx: str) -> dict:
+    """Validate minimum required fields on parsed chunk output. Fill safe defaults for missing."""
+    if not isinstance(data.get("timeline"), list):
+        data["timeline"] = []
+    for ev in data.get("timeline", []):
+        if not isinstance(ev, dict):
+            continue
+        # Required numeric fields — coerce or default
+        for fld in ("start", "end", "importance", "energy_index"):
+            raw = ev.get(fld)
+            try:
+                ev[fld] = float(raw) if raw is not None else 0.0
+            except (TypeError, ValueError):
+                ev[fld] = 0.0
+        # Required string fields
+        for fld in ("type", "transcript_text", "speaker"):
+            if not isinstance(ev.get(fld), str):
+                ev[fld] = ""
+        # scores dict
+        if not isinstance(ev.get("scores"), dict):
+            ev["scores"] = {}
+    if not isinstance(data.get("world_state"), dict):
+        data["world_state"] = {}
+    if not isinstance(data.get("active_people"), list):
+        data["active_people"] = []
+    return data
 
 
 def post_vllm(payload: dict, vllm_url: str, timeout: int = 900,
@@ -629,7 +661,9 @@ def _build_quick_prompt(
     strict_start: float, strict_end: float, total_duration: float,
     prev_chunk_context: str = "",
 ) -> str:
-    """LOW profile — 5-6 events, stripped 15-field schema to fit 2048 token budget."""
+    """LOW profile — stripped 15-field schema to fit 2048 token budget."""
+    n_min = max(3, int((strict_end - strict_start) / 8))
+    n_max = max(n_min + 3, int((strict_end - strict_start) / 5))
     prev_ctx_block = ""
     if prev_chunk_context:
         prev_ctx_block = f"""PREVIOUS CHUNK CONTEXT (what happened just before this window):
@@ -646,7 +680,7 @@ Open loops from previous chunk should be tracked. Speaker identities carry forwa
 Video: {video_label} | Window: {strict_start:.2f}s→{strict_end:.2f}s of {total_duration:.2f}s
 
 RULES:
-- 5-6 events — capture every clear moment change, skip only pure silence/filler
+- {n_min}-{n_max} events — capture every clear moment change, skip only pure silence/filler
 - All timestamps ABSOLUTE from video start
 - "moment" field: 8 words max
 - Fill expressions[] if a face is clearly showing emotion
@@ -869,6 +903,62 @@ Return ONLY valid JSON (this is a HIGH-priority segment — complete ALL fields 
 )}"""
 
 
+def build_narrative_spine(
+    all_transcript_segments: list[dict],
+    total_duration_s: float,
+    video_label: str,
+) -> str:
+    """Build a compact narrative spine from the full video transcript.
+
+    Summarises the overall arc, key topic shifts, and running themes into a
+    short paragraph that every chunk prompt receives as shared context.  This
+    lets each VLM chunk know what the video is about *in total* — not just its
+    own window — so callbacks, recurring jokes, and cross-chunk references are
+    correctly identified.
+
+    Called ONCE before chunk dispatch; the returned string is injected verbatim
+    into every chunk system prompt via ``build_chunk_system_prompt_tiered``.
+
+    Returns an empty string (safe no-op) when no transcript data is available.
+    """
+    if not all_transcript_segments:
+        return ""
+
+    # Collect up to ~60 representative lines spread across the full duration.
+    # We sample every N-th segment so long transcripts don't blow the prompt.
+    n_segs = len(all_transcript_segments)
+    step   = max(1, n_segs // 60)
+    sampled = all_transcript_segments[::step]
+
+    # Build a compact timeline string: [ts] "text"
+    lines: list[str] = []
+    for s in sampled:
+        text = (s.get("text") or "").strip()
+        if not text:
+            continue
+        t = s.get("start", 0.0)
+        lines.append(f"[{t:.0f}s] \"{text}\"")
+
+    if not lines:
+        return ""
+
+    # Derive a rough topic-arc from the first / middle / last thirds
+    n = len(lines)
+    intro  = " | ".join(lines[: max(1, n // 4)])
+    middle = " | ".join(lines[n // 4 : max(n // 4 + 1, 3 * n // 4)])
+    outro  = " | ".join(lines[3 * n // 4 :])
+
+    spine = (
+        f"NARRATIVE SPINE — {video_label} ({total_duration_s:.0f}s total)\n"
+        f"This is the FULL video context. Use it to identify callbacks, running jokes, "
+        f"topic arcs, and recurring references across ALL chunks.\n"
+        f"OPENING ({lines[0] if lines else ''}): {intro[:300]}\n"
+        f"MIDDLE: {middle[:400]}\n"
+        f"CLOSING ({lines[-1] if lines else ''}): {outro[:300]}"
+    )
+    return spine
+
+
 def build_chunk_system_prompt_tiered(
     profile: str,
     person_db: str,
@@ -880,26 +970,31 @@ def build_chunk_system_prompt_tiered(
     strict_end: float,
     total_duration: float,
     prev_chunk_context: str = "",
+    narrative_spine: str = "",
 ) -> str:
     """Select prompt template based on processing profile name."""
     if profile == "HIGH":
-        return _build_full_prompt(
+        prompt = _build_full_prompt(
             person_db, transcript_json, video_label,
             chunk_id, total_chunks, strict_start, strict_end, total_duration,
             prev_chunk_context=prev_chunk_context,
         )
-    if profile == "LOW":
-        return _build_quick_prompt(
+    elif profile == "LOW":
+        prompt = _build_quick_prompt(
             person_db, transcript_json, video_label,
             chunk_id, total_chunks, strict_start, strict_end, total_duration,
             prev_chunk_context=prev_chunk_context,
         )
-    # MEDIUM (default)
-    return _build_rich_prompt(
-        person_db, transcript_json, video_label,
-        chunk_id, total_chunks, strict_start, strict_end, total_duration,
-        prev_chunk_context=prev_chunk_context,
-    )
+    else:
+        # MEDIUM (default)
+        prompt = _build_rich_prompt(
+            person_db, transcript_json, video_label,
+            chunk_id, total_chunks, strict_start, strict_end, total_duration,
+            prev_chunk_context=prev_chunk_context,
+        )
+    if narrative_spine:
+        prompt += f"\n\n{narrative_spine}"
+    return prompt
 
 
 def build_chunk_system_prompt(
@@ -1715,6 +1810,22 @@ def merge_chunks(
     all_events = _dedup_boundary_events(all_events)
     for i, ev in enumerate(all_events, 1):
         ev["id"] = f"E{i:03d}"
+
+    # Backfill empty defaults for fields absent in LOW-tier chunk schema
+    _LOW_DEFAULTS: dict = {
+        "camera":           {},
+        "visual_tags":      [],
+        "expressions":      [],
+        "physical_actions": [],
+        "comedy_timing":    {},
+        "importance_tags":  [],
+        "caused_by":        "",
+        "viewer_attention": "",
+    }
+    for ev in all_events:
+        for fld, default in _LOW_DEFAULTS.items():
+            if fld not in ev:
+                ev[fld] = type(default)()  # empty list/dict/str matching type
 
     # Callback linker: TF-IDF similarity on key_lines (no API needed)
     # _link_callbacks called in _finalize_video after speaker cross-validation
@@ -2689,15 +2800,18 @@ def _plan_video_chunks(
 
     person_db = build_person_database(cast_analysis, video_label)
 
+    # Extract transcript segments for this video once — used by planner and narrative spine.
+    _all_segs: list[dict] = []
+    for v in transcripts.get("videos", []):
+        if v.get("video") == video_label:
+            _all_segs = v.get("segments", [])
+            break
+
     # Per-event profile map (chunk_id → "LOW"|"MEDIUM"|"HIGH")
     event_profiles: dict[int, str] = {}
 
     if planner == "semantic":
-        segs: list[dict] = []
-        for v in transcripts.get("videos", []):
-            if v.get("video") == video_label:
-                segs = v.get("segments", [])
-                break
+        segs = _all_segs
         events = _eb.build_events(
             duration=total_duration,
             scene_cuts=None,
@@ -2742,6 +2856,16 @@ def _plan_video_chunks(
         log(video_label,
             f"Planned {n_planned} chunks (~{total_duration / n_planned:.0f}s each) queued into shared pool")
 
+    # Build narrative spine once — injected into every chunk prompt so all chunks
+    # share full-video context (callbacks, topics, overall arc).
+    _narrative_spine = build_narrative_spine(
+        all_transcript_segments=_all_segs,
+        total_duration_s=total_duration,
+        video_label=video_label,
+    )
+    if _narrative_spine:
+        log(video_label, f"Narrative spine built ({len(_narrative_spine)} chars) — injecting into all chunk prompts")
+
     # Build a fast lookup: chunk_id → (strict_start, strict_end) for prev-context lookups.
     chunk_window_by_id: dict[int, tuple[float, float]] = {
         ch.chunk_id: (ch.strict_start, ch.strict_end) for ch in chunks
@@ -2764,6 +2888,7 @@ def _plan_video_chunks(
             person_db, transcripts, total_duration,
             n_planned, model_id, max_tokens=tok_limit, profile=prof,
             prev_chunk_context=prev_ctx,
+            narrative_spine=_narrative_spine,
         )
 
     def label_fn(c: Chunk) -> str:
@@ -2945,7 +3070,10 @@ def _finalize_video(
     # ── PARSE + STUB ──────────────────────────────────────────────────────────
     chunk_results: list[dict] = []
     ok_chunks = 0
-    for chunk, res in zip(chunks, raw_results):
+    for chunk, res in _zip_longest(chunks, raw_results, fillvalue=None):
+        if chunk is None or res is None:
+            log(video_label, f"WARNING: chunk/result mismatch at position — skipping orphan entry")
+            continue
         lbl = label_fn(chunk)
         if not res["ok"] or res["response"] is None:
             slice_ = build_transcript_block(
@@ -3129,7 +3257,7 @@ def _build_payload(
     max_tokens: int,
     attempt: int,
 ) -> dict:
-    """Build vLLM payload. Forces JSON via assistant prefix { — model must continue as JSON."""
+    """Build vLLM payload. JSON output enforced via response_format only."""
     messages = [{"role": "system", "content": system}]
 
     user_content: list = [
@@ -3146,10 +3274,6 @@ def _build_payload(
 
     messages.append({"role": "user", "content": user_content})
 
-    # Assistant prefix { forces the model to continue as JSON — cannot output prose.
-    # add_generation_prompt=False tells vLLM not to append another <|im_start|>assistant header.
-    messages.append({"role": "assistant", "content": "{"})
-
     # NOTE: We use urllib/httpx directly — NOT the OpenAI Python SDK.
     # extra_body is an SDK abstraction that merges nested keys to top-level before sending.
     # When bypassing the SDK, all vLLM extensions must be at TOP LEVEL of the JSON body.
@@ -3160,7 +3284,6 @@ def _build_payload(
         "temperature": 0.0,
         "stream": False,
         "response_format": {"type": "json_object"},
-        "add_generation_prompt": False,
         "top_k": 20,
         "chat_template_kwargs": {"enable_thinking": False},
         "mm_processor_kwargs": {"fps": MM_FPS, "max_pixels": MM_MAX_PIXELS},
@@ -3418,6 +3541,7 @@ def _build_chunk_payload(
     max_tokens: int = 20480,
     profile: str = "MEDIUM",
     prev_chunk_context: str = "",
+    narrative_spine: str = "",
 ) -> dict:
     """Build a single vLLM /v1/chat/completions payload for one chunk.
 
@@ -3428,6 +3552,8 @@ def _build_chunk_payload(
     ``prev_chunk_context`` injects the last few transcript lines from chunk N-1
     so the VLM maintains narrative continuity without re-introducing established
     speakers or losing open loops.
+    ``narrative_spine`` is a pre-computed full-video context string injected into
+    every chunk so the VLM knows the overall arc, callbacks, and topic shifts.
 
     Kept as a plain helper (not a closure) so it stays independently testable and
     the closure passed to ChunkDispatcher is trivially thin.
@@ -3441,6 +3567,7 @@ def _build_chunk_payload(
         chunk.chunk_id, n_video_chunks,
         chunk.strict_start, chunk.strict_end, total_duration,
         prev_chunk_context=prev_chunk_context,
+        narrative_spine=narrative_spine,
     )
     user_text = (
         f"Output the JSON object for event {chunk.chunk_id + 1}/{n_video_chunks} of {video_label}. "
@@ -3464,7 +3591,7 @@ def _extract_chunk_json(response: dict, label: str) -> dict:
     if not raw.strip():
         finish = response["choices"][0].get("finish_reason")
         raise ValueError(f"Empty content (finish_reason={finish})")
-    # Assistant prefix { was injected — prepend it back so parse_robust gets valid JSON
+    # Safety: if model omitted leading {, parse_robust will locate it via _JSON_START regex
     if not raw.strip().startswith("{"):
         raw = "{" + raw
     return parse_robust(raw, label)
@@ -3633,7 +3760,10 @@ def analyze_video_chunked(
     # Merge sorts by (scene_id, part_idx) below, so LPT order here is fine.
     chunk_results: list[dict] = []
     ok_chunks = 0
-    for chunk, res in zip(chunks, raw_results):
+    for chunk, res in _zip_longest(chunks, raw_results, fillvalue=None):
+        if chunk is None or res is None:
+            log(video_label, f"WARNING: chunk/result mismatch at position — skipping orphan entry")
+            continue
         lbl = label_fn(chunk)
         if not res["ok"] or res["response"] is None:
             slice_ = build_transcript_block(

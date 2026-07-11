@@ -57,12 +57,12 @@ EMBED_MODEL      = os.getenv("EMBED_MODEL", "llama-text-embed-v2")
 
 # Per-entity_type top-k budget for the fan-out search passes
 _SEARCH_BUDGET = {
-    "timeline_event": 20,
-    "clip":           10,
-    "highlight":       5,
+    "timeline_event": 50,
+    "clip":           15,
+    "highlight":      10,
 }
 
-DEFAULT_TOP_K = 15  # final cap after scoring + merge
+DEFAULT_TOP_K = 25  # final cap after scoring + merge
 
 
 # ── Composite editing score ────────────────────────────────────────────────────
@@ -90,6 +90,32 @@ def editing_score(vector_sim: float, meta: dict) -> float:
         + 0.10 * viral
         + 0.10 * importance
     )
+
+
+def _dedup_by_time_overlap(events: list[dict], iou_threshold: float = 0.5) -> list[dict]:
+    """Remove lower-scored events that overlap >50% with a higher-scored event."""
+    if not events:
+        return events
+    # Already sorted by editing_score desc — keep first, drop overlapping lower ones
+    kept = []
+    for ev in events:
+        start = float(ev.get("start") or 0)
+        end   = float(ev.get("end")   or 0)
+        if end <= start:
+            kept.append(ev)
+            continue
+        overlap = False
+        for k in kept:
+            ks = float(k.get("start") or 0)
+            ke = float(k.get("end")   or 0)
+            inter = max(0.0, min(end, ke) - max(start, ks))
+            union = max(end, ke) - min(start, ks)
+            if union > 0 and inter / union >= iou_threshold:
+                overlap = True
+                break
+        if not overlap:
+            kept.append(ev)
+    return kept
 
 
 # ── Pinecone client ───────────────────────────────────────────────────────────
@@ -633,6 +659,13 @@ def retrieve(
         if "narrative" in hit:
             ev_dict["narrative"] = hit["narrative"]
         events_out.append(ev_dict)
+
+    # Dedup overlapping time windows (timeline_event / highlight / edit_sequence
+    # can return the same 3-second moment with different entity types).
+    events_out = _dedup_by_time_overlap(events_out)
+    # Re-rank after dedup so rank numbers stay contiguous
+    for i, ev in enumerate(events_out, start=1):
+        ev["rank"] = i
 
     clips_out: list[dict] = []
     for rank, hit in enumerate(raw_clips, start=1):

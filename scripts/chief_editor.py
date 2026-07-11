@@ -374,6 +374,20 @@ def build_executor_timeline(plan: dict, events: list[dict]) -> list[dict]:
         })
         output_cursor = out_end
 
+    # Validate: warn on zero-duration segments and collect missing event_ids
+    _bad = [seg for seg in timeline if seg.get("duration_s", 0) <= 0]
+    if _bad:
+        import logging as _log
+        for _seg in _bad:
+            _log.warning(
+                "executor_timeline: segment step=%s event=%s has duration=%.3fs "
+                "(source %.3f–%.3f) — likely missing event_id in retrieval context",
+                _seg.get("step"), _seg.get("event_id"),
+                _seg.get("duration_s", 0),
+                _seg.get("source_start_s", 0),
+                _seg.get("source_end_s", 0),
+            )
+
     return timeline
 
 
