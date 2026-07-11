@@ -125,7 +125,8 @@ def parse_robust(raw: str, ctx: str = "") -> dict:
         if isinstance(repaired, dict) and repaired:
             print(f"  [{ctx}] JSON was truncated — repaired successfully", flush=True)
             event_count = len(repaired.get("timeline", []))
-            if event_count == 0:
+            is_chunk = "_synthesis" not in ctx and "_reasoning" not in ctx and "_continuity" not in ctx
+            if event_count == 0 and is_chunk:
                 print(
                     f"  [{ctx}] WARN: 0 events after repair — chunk was severely truncated, "
                     f"quality degraded",
@@ -1563,7 +1564,7 @@ def synthesize_merged(
             {"role": "user", "content":
              "/no_think\n\nGenerate the complete editorial intelligence layer for this video."},
         ],
-        "max_tokens": 6144,
+        "max_tokens": 12288,
         "temperature": 0.0,
         "response_format": {"type": "json_object"},
         "chat_template_kwargs": {"enable_thinking": False},
@@ -1772,7 +1773,7 @@ JSON schema:
             {"role": "system",  "content": system},
             {"role": "user",    "content": user_msg},
         ],
-        "max_tokens":      4096,
+        "max_tokens":      8192,
         "temperature":     0.3,
         "response_format": {"type": "json_object"},
         "chat_template_kwargs": {"enable_thinking": False},
