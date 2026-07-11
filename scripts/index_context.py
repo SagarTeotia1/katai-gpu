@@ -640,6 +640,29 @@ class Neo4jGraphBuilder:
         with self.driver.session() as session:
             return list(session.run(cypher, params or {}))
 
+    def _index_reasoning_layers(self, video_id: str, ctx: dict) -> None:
+        """Store reasoning pass layers as JSON properties on the Video node."""
+        layers = {
+            "viewer_state_timeline": ctx.get("viewer_state_timeline"),
+            "relationship_graph":    ctx.get("relationship_graph"),
+            "character_model":       ctx.get("character_model"),
+            "story_graph":           ctx.get("story_graph"),
+            "belief_state_timeline": ctx.get("belief_state_timeline"),
+            "topic_graph":           ctx.get("topic_graph"),
+            "comedy_analysis":       ctx.get("comedy_analysis"),
+            "object_memory":         ctx.get("object_memory"),
+            "edit_intelligence":     ctx.get("edit_intelligence"),
+            "visual_world":          ctx.get("visual_world"),
+        }
+        props = {k: json.dumps(v) for k, v in layers.items() if v is not None}
+        if not props:
+            return
+        set_clauses = ", ".join(f"v.{k} = ${k}" for k in props)
+        self._run(
+            f"MATCH (v:Video {{id: $vid}}) SET {set_clauses}",
+            {"vid": video_id, **props},
+        )
+
     def setup_schema(self):
         stmts = [
             "CREATE CONSTRAINT IF NOT EXISTS FOR (v:Video)  REQUIRE v.id IS UNIQUE",
@@ -716,6 +739,9 @@ class Neo4jGraphBuilder:
               "fmt": meta.get("format",""), "lang": meta.get("language",""),
               "ctx": meta.get("overall_context","")})
         count += 1
+
+        # Reasoning layers — store as JSON properties on the Video node
+        self._index_reasoning_layers(video_id, ctx)
 
         # Per-speaker emotion arcs from merged output
         emotion_arcs = ctx.get("emotion_arcs") or {}
