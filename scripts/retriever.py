@@ -342,35 +342,40 @@ class TemporalEnricher:
     def get_narrative_chain(self, event_ids: list[str], depth: int = 2) -> dict[str, dict]:
         """
         For a list of event IDs, return their narrative dependencies and dependents.
-        Returns {event_id: {"role": str, "depends_on": [event_id], "enables": [event_id], "link_types": [str]}}
+        Returns {event_id: {"role": str, "depends_on": [event_id], "enables": [event_id]}}
+        Single batch Cypher replaces the previous per-event loop (N queries → 1).
         """
         if not event_ids:
             return {}
+        try:
+            records = self._run("""
+                UNWIND $eids AS eid
+                MATCH (e:Event {id: eid})
+                OPTIONAL MATCH (e)-[r:NARRATIVE_LINK]->(dep:Event)
+                OPTIONAL MATCH (upstream:Event)-[r2:NARRATIVE_LINK]->(e)
+                RETURN
+                  e.id AS eid,
+                  e.narrative_role AS role,
+                  e.edit_keep AS edit_keep,
+                  e.comedy_structure AS comedy_structure,
+                  collect(DISTINCT {id: dep.id, type: r.type}) AS depends_on,
+                  collect(DISTINCT {id: upstream.id, type: r2.type}) AS enables
+            """, {"eids": event_ids})
+        except Exception as exc:
+            print(f"  [neo4j] warn — narrative chain batch query failed: {exc}", file=sys.stderr, flush=True)
+            return {}
         result = {}
-        for eid in event_ids:
-            try:
-                records = self._run("""
-                    MATCH (e:Event {id: $eid})
-                    OPTIONAL MATCH (e)-[r:NARRATIVE_LINK]->(dep:Event)
-                    OPTIONAL MATCH (upstream:Event)-[r2:NARRATIVE_LINK]->(e)
-                    RETURN
-                      e.narrative_role AS role,
-                      e.edit_keep AS edit_keep,
-                      e.comedy_structure AS comedy_structure,
-                      collect(DISTINCT {id: dep.id, type: r.type}) AS depends_on,
-                      collect(DISTINCT {id: upstream.id, type: r2.type}) AS enables
-                """, {"eid": eid})
-                if records:
-                    row = records[0]
-                    result[eid] = {
-                        "role":            row.get("role") or "",
-                        "edit_keep":       row.get("edit_keep", True),
-                        "comedy_structure": row.get("comedy_structure") or "none",
-                        "depends_on":      [x for x in (row.get("depends_on") or []) if x.get("id")],
-                        "enables":         [x for x in (row.get("enables") or []) if x.get("id")],
-                    }
-            except Exception as exc:
-                print(f"  [neo4j] warn — narrative chain for {eid}: {exc}", file=sys.stderr, flush=True)
+        for row in records:
+            eid = row.get("eid")
+            if not eid:
+                continue
+            result[eid] = {
+                "role":             row.get("role") or "",
+                "edit_keep":        row.get("edit_keep", True),
+                "comedy_structure": row.get("comedy_structure") or "none",
+                "depends_on":       [x for x in (row.get("depends_on") or []) if x.get("id")],
+                "enables":          [x for x in (row.get("enables") or []) if x.get("id")],
+            }
         return result
 
     def get_broll_candidates(self, video_id: str, limit: int = 20) -> list[dict]:
@@ -391,22 +396,60 @@ class TemporalEnricher:
     def enrich_batch(self, events: list[dict]) -> dict[str, dict]:
         """
         Returns {event_id: neighbors_dict} for all events that have a neo4j id.
+        Single batch Cypher replaces the previous per-event loop (N+1 → 1 query).
         """
-        result: dict[str, dict] = {}
+        if not events:
+            return {}
+        # Build (eid, composite_eid) pairs — composite is what Neo4j stores as Event.id
+        pairs = []
+        raw_eids = []
         for ev in events:
             eid = ev.get("event_id") or ev.get("id", "")
             vid = ev.get("video_id", "")
-            if not eid or not vid:
+            if not eid:
                 print(f"  [neo4j] warn — enrich_batch skip: missing eid={eid!r} vid={vid!r}", file=sys.stderr, flush=True)
                 continue
-            try:
-                # get_neighbors accepts either short or composite ID — it resolves internally
-                result[eid] = self.get_neighbors(eid, vid)
-            except Exception as exc:
-                print(
-                    f"  [neo4j] warn — could not get neighbors for {eid}: {exc}",
-                    file=sys.stderr, flush=True,
-                )
+            composite = eid if (not vid or eid.startswith(f"{vid}_")) else f"{vid}_{eid}"
+            pairs.append({"eid": eid, "composite": composite})
+            raw_eids.append(eid)
+        if not pairs:
+            return {}
+        # Single batch query — get all neighbors at once
+        query = """
+        UNWIND $pairs AS pair
+        MATCH (e:Event {id: pair.composite})
+        OPTIONAL MATCH (e)-[:NEXT]->(nxt:Event)
+        OPTIONAL MATCH (prev:Event)-[:NEXT]->(e)
+        RETURN pair.eid AS eid,
+               nxt.id AS next_id, nxt.moment AS next_moment,
+               nxt.start AS next_start, nxt.type AS next_type,
+               prev.id AS prev_id, prev.moment AS prev_moment,
+               prev.start AS prev_start, prev.type AS prev_type
+        """
+        try:
+            rows = self._run(query, {"pairs": pairs})
+        except Exception as exc:
+            print(f"  [neo4j] warn — enrich_batch query failed: {exc}", file=sys.stderr, flush=True)
+            return {eid: {"prev": None, "next": None} for eid in raw_eids}
+        result: dict[str, dict] = {}
+        for row in rows:
+            result[row["eid"]] = {
+                "next": {
+                    "event_id": row["next_id"],
+                    "moment":   row["next_moment"],
+                    "start":    float(row["next_start"]) if row["next_start"] is not None else None,
+                    "type":     row["next_type"],
+                } if row["next_id"] else None,
+                "prev": {
+                    "event_id": row["prev_id"],
+                    "moment":   row["prev_moment"],
+                    "start":    float(row["prev_start"]) if row["prev_start"] is not None else None,
+                    "type":     row["prev_type"],
+                } if row["prev_id"] else None,
+            }
+        # Fill in any events that had no matching Neo4j node
+        for eid in raw_eids:
+            if eid not in result:
                 result[eid] = {"prev": None, "next": None}
         return result
 
