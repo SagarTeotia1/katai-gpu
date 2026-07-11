@@ -106,6 +106,29 @@ def build_event_text(event: dict, video_id: str, person_map: dict) -> str:
     scores  = event.get("scores") or {}
     eh      = _coerce_eh(event)
     ae      = event.get("audio_energy") or {}
+    # High-value fields for shot-level semantic search
+    key_line_text = event.get("key_line") or ""
+    conv_role     = event.get("conversation_role") or ""
+    vd            = (event.get("visual_description") or "")[:350]
+    dn            = (event.get("delivery_notes") or "")[:180]
+    ct_structure  = ct.get("structure") or ""
+    ct_pause      = ct.get("pause_duration_s") or 0
+    stub          = event.get("stub", False)
+    # Build optional suffix lines
+    extra_lines = []
+    if key_line_text:
+        extra_lines.append(f"Key quote: \"{key_line_text}\"")
+    if conv_role:
+        extra_lines.append(f"Conversation role: {conv_role}")
+    if vd and not stub:
+        extra_lines.append(f"Visual description: {vd}")
+    if dn and not stub:
+        extra_lines.append(f"Delivery: {dn}")
+    if ct_structure and ct_structure != "none":
+        extra_lines.append(f"Comedy: {ct_structure} pause:{ct_pause:.1f}s")
+    if stub:
+        extra_lines.append("[TRANSCRIPT ONLY — no visual analysis]")
+    extra = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
     return (
         f"Video:{video_id} Time:{event.get('start',0):.2f}s-{event.get('end',0):.2f}s "
         f"Type:{event.get('type','')} Shot:{cam.get('shot_type','')} Motion:{cam.get('motion','')}\n"
@@ -124,6 +147,7 @@ def build_event_text(event: dict, video_id: str, person_map: dict) -> str:
         f"Emotion: intensity={scores.get('emotion_intensity',0):.2f} contagion={'yes' if scores.get('emotion_contagion') else 'no'}\n"
         f"Why it matters: {scores.get('importance_reason','')} | importance:{scores.get('importance',0)}\n"
         f"Edit: keep={eh.get('keep',True)} speed={eh.get('speed','1x')} transition={eh.get('transition','cut')} caption={eh.get('caption_suggestion','')}"
+        f"{extra}"
     ).strip()
 
 
@@ -315,6 +339,8 @@ class PineconeIndexer:
 
         # Timeline events
         for ev in ctx.get("timeline", []):
+            if ev.get("stub"):
+                continue  # stubs have no visual data; don't pollute semantic search
             s = ev.get("scores") or {}
             er = ev.get("editing_reasoning") or {}
             records.append({
@@ -363,6 +389,11 @@ class PineconeIndexer:
                     "scene_setting":    _safe_str(ev.get("scene_setting", ""), 300),
                     "props_visible":    json.dumps(ev.get("props_visible") or []),
                     "ocr_text":         json.dumps(ev.get("ocr_text") or []),
+                    "visual_description": _safe_str(ev.get("visual_description") or "", 400),
+                    "delivery_notes":   _safe_str(ev.get("delivery_notes") or "", 200),
+                    "key_line":         _safe_str(ev.get("key_line") or "", 200),
+                    "conversation_role": _safe_str(ev.get("conversation_role") or ""),
+                    "stub":             bool(ev.get("stub", False)),
                 },
             })
 

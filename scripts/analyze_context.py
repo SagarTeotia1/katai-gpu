@@ -1527,6 +1527,152 @@ def build_emotion_arcs(
     return arcs
 
 
+def _crossvalidate_speakers(
+    timeline: list[dict],
+    transcripts: dict,
+    video_label: str,
+) -> None:
+    """
+    Cross-validate VLM speaker assignments against Whisper diarizer speaker_id.
+
+    For each timeline event: find transcript segments in [start, end].
+    Count diarizer speaker_id votes. If diarizer majority disagrees with VLM
+    and speaker_confidence != "high", override speaker and flag it.
+
+    Modifies timeline in-place. O(N*M) but M is small per event.
+    """
+    # Build transcript segments list for this video
+    segs: list[dict] = []
+    for v in transcripts.get("videos", []):
+        if v.get("video") == video_label:
+            segs = v.get("segments", [])
+            break
+
+    if not segs:
+        return
+
+    # Only cross-validate events where diarizer has speaker_id data
+    has_diarization = any(s.get("speaker_id") for s in segs)
+    if not has_diarization:
+        return
+
+    from collections import Counter
+
+    overridden = 0
+    for ev in timeline:
+        if ev.get("stub"):
+            continue
+        ev_start = float(ev.get("start") or 0)
+        ev_end   = float(ev.get("end")   or ev_start)
+
+        # Find overlapping transcript segments
+        overlap_segs = [
+            s for s in segs
+            if s.get("speaker_id")
+            and float(s.get("start", 0)) < ev_end
+            and float(s.get("end", ev_start)) > ev_start
+        ]
+        if not overlap_segs:
+            continue
+
+        # Vote: which diarizer speaker is dominant in this window?
+        votes = Counter(s["speaker_id"] for s in overlap_segs)
+        diarizer_speaker, vote_count = votes.most_common(1)[0]
+        total_votes = sum(votes.values())
+        diarizer_confidence = vote_count / max(total_votes, 1)
+
+        vlm_speaker = ev.get("speaker")
+        vlm_conf    = ev.get("speaker_confidence", "medium")
+
+        # Override if: diarizer is confident (>70%) AND VLM is not high-confidence
+        # AND they disagree (or VLM has no speaker)
+        if (diarizer_confidence >= 0.7
+                and vlm_conf != "high"
+                and diarizer_speaker != vlm_speaker):
+            ev["speaker_original_vlm"]  = vlm_speaker
+            ev["speaker"]               = diarizer_speaker
+            ev["speaker_confidence"]    = f"diarizer-override ({diarizer_confidence:.0%})"
+            overridden += 1
+
+    if overridden:
+        log(video_label, f"speaker cross-validation: overrode {overridden} events via diarizer")
+
+
+def _link_callbacks(timeline: list[dict], video_label: str) -> None:
+    """
+    Post-merge TF-IDF callback linker.
+
+    For each event tagged as callback (conversation_role contains 'callback'
+    or 'callback_payoff', or importance_tags contains 'callback'), find the
+    most likely original setup event by TF-IDF cosine similarity on key_line.
+
+    Adds 'callback_to' field: event_id of likely setup event.
+    Requires scikit-learn. Falls back silently if not installed.
+    Skips events with time gap < 30s (too close to be a callback).
+    """
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+    except ImportError:
+        return  # sklearn not installed — skip silently
+
+    if not timeline:
+        return
+
+    # Gather all key_lines for vectorization
+    texts = [(ev.get("key_line") or ev.get("transcript_text") or "")[:200]
+             for ev in timeline]
+
+    # Filter out events with empty text
+    valid_mask = [bool(t.strip()) for t in texts]
+    if sum(valid_mask) < 3:
+        return
+
+    try:
+        vec = TfidfVectorizer(ngram_range=(1, 2), min_df=1, max_features=5000)
+        tfidf_matrix = vec.fit_transform(texts)
+    except Exception:
+        return
+
+    linked = 0
+    for i, ev in enumerate(timeline):
+        role = ev.get("conversation_role") or ""
+        tags = ev.get("importance_tags") or []
+        is_callback = (
+            "callback" in role
+            or any("callback" in str(t) for t in tags)
+        )
+        if not is_callback or ev.get("stub"):
+            continue
+
+        ev_start = float(ev.get("start") or 0)
+
+        # Search only earlier events with >30s gap
+        candidates = [
+            j for j in range(i)
+            if valid_mask[j]
+            and ev_start - float(timeline[j].get("start") or 0) > 30.0
+            and not timeline[j].get("stub")
+        ]
+        if not candidates:
+            continue
+
+        # Cosine similarity between this event and all candidates
+        ev_vec = tfidf_matrix[i]
+        sims = cosine_similarity(ev_vec, tfidf_matrix[candidates]).flatten()
+
+        if len(sims) == 0 or sims.max() < 0.15:
+            continue  # no meaningful match
+
+        best_j = candidates[int(sims.argmax())]
+        ev["callback_to"] = timeline[best_j].get("id")
+        ev["callback_similarity"] = round(float(sims.max()), 3)
+        linked += 1
+
+    if linked:
+        log(video_label, f"callback linker: linked {linked} callback events to setups (TF-IDF)")
+
+
 def merge_chunks(
     chunk_results: list[dict],
     video_label: str,
@@ -1542,6 +1688,9 @@ def merge_chunks(
     all_events = _merge_sorted(chunk_results, "timeline")
     for i, ev in enumerate(all_events, 1):
         ev["id"] = f"E{i:03d}"
+
+    # Callback linker: TF-IDF similarity on key_lines (no API needed)
+    _link_callbacks(all_events, video_label)
 
     # Collect world_state entries from each successful chunk
     world_states = []
@@ -2843,6 +2992,9 @@ def _finalize_video(
         log(video_label, f"merge_chunks CRASHED — {e}")
         return {"ok": False, "error": f"merge failed: {e}",
                 "elapsed": round(time.time() - t0, 1), "attempts": 1}
+
+    # Cross-validate speaker assignments: diarizer beats VLM when VLM is not high-confidence
+    _crossvalidate_speakers(merged.get("timeline", []), transcripts, video_label)
 
     # ── SYNTH ─────────────────────────────────────────────────────────────────
     t_synth = time.time()

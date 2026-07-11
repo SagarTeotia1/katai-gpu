@@ -6,7 +6,8 @@
         install logs-vllm logs-backend logs-frontend \
         video video-chunk video-fast video-semantic video-bench vision-bench \
         cast-analysis whisper-up whisper-logs whisper-health \
-        neo4j-up neo4j-logs list-models status health-backend health-vllm gpu-info
+        neo4j-up neo4j-logs list-models status health-backend health-vllm gpu-info \
+        render render-dry
 
 ifneq (,$(wildcard .env))
   include .env
@@ -437,6 +438,23 @@ with ThreadPoolExecutor(max_workers=n) as ex: \
     print(f'[req {i+1:02d}] {elapsed:.1f}s | {preview}...'); \
 print('-' * 60); \
 print(f'All {n} done in {time.time()-t_start:.1f}s total')"
+
+##@ Render (L6 Executor)
+
+render: ## L6 Executor — editplan JSON → rendered MP4  (PLAN=path/to/editplan.json CAST=path/to/cast.json COLOR=1)
+	@python3 scripts/executor.py \
+		$(if $(PLAN),$(PLAN)) \
+		$(if $(CAST),--cast "$(CAST)") \
+		$(if $(COLOR),--apply-color) \
+		$(if $(OUT),--output "$(OUT)")
+
+render-dry: ## Dry-run — print ffmpeg commands without executing
+	@python3 scripts/executor.py \
+		$(if $(PLAN),$(PLAN)) \
+		$(if $(CAST),--cast "$(CAST)") \
+		$(if $(COLOR),--apply-color) \
+		$(if $(OUT),--output "$(OUT)") \
+		--dry-run
 
 ##@ Model
 

@@ -339,19 +339,21 @@ def build_executor_timeline(plan: dict, events: list[dict]) -> list[dict]:
             role = entry.get("role")
 
         ev = event_map.get(eid, {})
-        src_start = float(ev.get("start_s") or 0)
-        src_end   = float(ev.get("end_s")   or src_start)
+        ev_start  = float(ev.get("start_s") or 0)
+        src_start = ev_start
+        src_end   = float(ev.get("end_s")   or ev_start)
 
         # Apply TRIM override
         if eid in trim_map:
             t = trim_map[eid]
-            src_start = src_start + float(t.get("in_s") or 0)
+            src_start = ev_start + float(t.get("in_s") or 0)
             if t.get("out_s") is not None:
-                src_end = float(ev.get("start_s") or 0) + float(t["out_s"])
+                src_end = ev_start + float(t["out_s"])
+                src_end = min(src_end, float(ev.get("end_s") or src_end))
         elif in_s is not None:
-            src_start = float(ev.get("start_s") or 0) + float(in_s)
+            src_start = ev_start + float(in_s)
             if out_s is not None:
-                src_end = float(ev.get("start_s") or 0) + float(out_s)
+                src_end = ev_start + float(out_s)
 
         duration = max(0.0, src_end - src_start)
         out_start = output_cursor

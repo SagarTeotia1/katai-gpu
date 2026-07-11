@@ -807,20 +807,29 @@ def stub_failed_chunk(chunk: Chunk, transcript_slice: str) -> dict[str, Any]:
     for the failed window so downstream synthesis can still cite what was said,
     even without visual analysis.
     """
+    stub_event = {
+        "id":               f"E{chunk.chunk_id:02d}_stub",
+        "start_s":          chunk.strict_start,
+        "end_s":            chunk.strict_end,
+        "type":             "transcript_only",
+        "stub":             True,
+        "clip_worthy":      False,
+        "broll_usable":     False,
+        "importance":       1,
+        "energy_index":     0.0,
+        "transcript_text":  transcript_slice,
+        "note":             "NO VISUAL ANALYSIS — transcript only",
+    }
     return {
-        "ok":             False,
+        "ok":             True,
+        "stub":           True,
         "chunk_id":       chunk.chunk_id,
         "scene_id":       chunk.scene_id,
         "part_idx":       chunk.part_idx,
         "strict_start":   chunk.strict_start,
         "strict_end":     chunk.strict_end,
-        "timeline": [{
-            "t":          chunk.strict_start,
-            "kind":       "unanalyzed",
-            "note":       "NO VISUAL ANALYSIS AVAILABLE for this window; transcript only",
-            "transcript": transcript_slice,
-        }],
-        "active_people":    [],
-        "audio_events":     [],
-        "world_state":      {},
+        "timeline":       [stub_event],
+        "active_people":  [],
+        "audio_events":   [],
+        "world_state":    {},
     }
