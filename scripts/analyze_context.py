@@ -415,13 +415,63 @@ _CHUNK_SCHEMA_COMMON = """\
   }}
 }}"""
 
+# LOW-tier stripped schema — ~15 essential fields only (vs 50+ in _CHUNK_SCHEMA_COMMON).
+# Budget: 2048 tokens → fits 5-6 events. Drop camera, comedy_timing, frame_people,
+# scene_setting, props_visible, ocr_text, visual_tags, energy, viewer_attention,
+# listener_reactions, physical_actions, broll_usable, thumbnail_worthy, audio_events,
+# and all non-essential edit_hints / scores sub-fields.
+_CHUNK_SCHEMA_LOW = """\
+{{
+  "chunk_id": {chunk_id},
+  "video_id": "{video_label}",
+  "window_start": {strict_start},
+  "window_end": {strict_end},
+  "active_people": ["P001"],
+  "timeline": [
+    {{
+      "id": "E{chunk_id:02d}_000",
+      "start": <float ≥ {strict_start:.2f}>,
+      "end": <float ≤ {strict_end:.2f}>,
+      "type": "<dialogue|reaction|laugh|joke|question|answer|transition>",
+      "moment": "<8 words max — what happens visually or verbally>",
+      "speaker": "<person_id or null>",
+      "speaker_confidence": "<high — mouth visibly moving|medium — voice matches but face not fully visible|low — guessed from context>",
+      "transcript_text": "<exact quoted words spoken in this event — copy verbatim from transcript>",
+      "key_line": "<single most important phrase or sentence from transcript in this event>",
+      "conversation_role": "<setup|punchline|callback|callback_payoff|question|answer|challenge|defense|escalation|deflection|tangent|reveal|running_joke|transition|observation|reaction_verbal>",
+      "visible_people": ["P001"],
+      "expressions": [{{"person_id": "P001", "expression": "<laugh|smirk|eye_roll|shock|smile|neutral|confused|excited|bored|thinking>"}}],
+      "scores": {{
+        "importance": <0-10>,
+        "clip": <0-10>,
+        "emotion_intensity": <0.0-1.0 float — magnitude of emotion peak in this event>
+      }},
+      "edit_hints": {{
+        "keep": <true|false>,
+        "transition": "<cut|dissolve|fade|none>",
+        "caption_suggestion": "<short caption text or null>"
+      }},
+      "clip_worthy": <true|false>,
+      "audio_energy": {{
+        "level": "<silent|quiet|normal|loud|peak>",
+        "laugh_detected": <true|false>
+      }}
+    }}
+  ],
+  "world_state": {{
+    "scene_emotion": "<funny|tense|emotional|informative|awkward|calm>",
+    "open_loops": [],
+    "world_state_summary": "<10 words max>"
+  }}
+}}"""
+
 
 def _build_quick_prompt(
     person_db: str, transcript_json: str, video_label: str,
     chunk_id: int, total_chunks: int,
     strict_start: float, strict_end: float, total_duration: float,
 ) -> str:
-    """LOW profile — minimal reasoning, 2-4 events, basic who/where/what + camera/expression."""
+    """LOW profile — 5-6 events, stripped 15-field schema to fit 2048 token budget."""
     return f"""{_CHUNK_JSON_HEADER}
 
 You are a fast video metadata scanner. LOW-IMPORTANCE segment.
@@ -429,26 +479,18 @@ You are a fast video metadata scanner. LOW-IMPORTANCE segment.
 Video: {video_label} | Window: {strict_start:.2f}s→{strict_end:.2f}s of {total_duration:.2f}s
 
 RULES:
-- 2-4 events only — capture major moment changes, skip minor reactions
+- 5-6 events — capture every clear moment change, skip only pure silence/filler
 - All timestamps ABSOLUTE from video start
-- scores may all be 0 unless something is clearly clip-worthy
 - "moment" field: 8 words max
-- Fill camera.shot_type and camera.motion for every event — observe the frame
 - Fill expressions[] if a face is clearly showing emotion
-- broll_usable: true only if camera is static, no dialogue, clean background
-- visual_tags[]: 3-5 tags max — camera type first (close_up/wide_shot/two_shot), then observable actions (pointing/laughing/standing)
-- frame_people[]: fill screen_position (left/center/right) for each visible person
-- comedy_timing: structure="none" unless clearly a joke; pause_duration_s=0 for non-jokes
-- edit_hints.keep: false only if this event is filler/silence with score<2
-- edit_hints.speed: "1x" for normal, "slow_mo" only for peak reaction moments
-- edit_hints.transition: "cut" for most; "smash_cut" after punchlines
-- edit_hints: set start_trim/end_trim to 0.0, leave caption_suggestion null unless obvious
-- energy: set overall only; set visual/audio/conversation to same value
-- visual_continuity: observe lighting and background once per window, apply to world_state
+- edit_hints.keep: false only if this event is pure silence/filler with importance<2
+- edit_hints.transition: "cut" for most; "dissolve" after calm transitions
+- edit_hints.caption_suggestion: null unless an obvious hook/punchline line exists
 - audio_energy.level: observe loudness (silent/quiet/normal/loud/peak)
 - audio_energy.laugh_detected: true if audible laugh in this event
-- scores.emotion_intensity: 0.0 for flat events, 0.8-1.0 for clear peak
-- scores.emotion_contagion: true if second person visibly reacts to first person's emotion
+- scores.emotion_intensity: 0.0 for flat events, 0.8-1.0 for clear emotional peak
+- scores.clip: 0-10 — how worthy is this for a short clip
+- scores.importance: 0-10 — overall segment importance
 
 PEOPLE (SPEAKER RULE: assign speaker = person whose MOUTH IS MOVING at that timestamp. A smiling/reacting silent person is NOT the speaker. If unsure, set speaker_confidence="low"):
 {person_db}
@@ -465,10 +507,8 @@ TRANSCRIPT ANALYSIS — do this BEFORE looking at frames:
 
 Then use video frames to identify WHO says each line and HOW they deliver it (tone, expression, energy).
 
-CRITICAL: Every timeline event MUST have all fields. Partial events with missing camera/expressions/frame_people are not acceptable.
-
 Return ONLY valid JSON:
-{_CHUNK_SCHEMA_COMMON.format(
+{_CHUNK_SCHEMA_LOW.format(
     chunk_id=chunk_id, video_label=video_label,
     strict_start=strict_start, strict_end=strict_end,
 )}"""
