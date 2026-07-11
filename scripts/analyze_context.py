@@ -308,6 +308,9 @@ _CHUNK_SCHEMA_COMMON = """\
       "visible_people": ["P001"],
       "speaker": "<person_id or null>",
       "transcript_text": "<exact words or empty>",
+      "scene_setting": "<specific location/background description — e.g. 'Netflix office with red logo backdrop', 'outdoor stage', 'studio with green screen'>",
+      "props_visible": ["<specific objects, logos, signs, text visible in frame — e.g. 'Netflix logo', 'pineapple', 'whiteboard', 'coffee cup'>"],
+      "ocr_text": ["<any readable text visible in frame — logos, signs, lower thirds, t-shirts>"],
       "caused_by": "<event_id this event was triggered by, or null>",
       "importance_tags": ["<hook|punchline|setup|callback|conflict|resolution|reaction|surprise|laugh|topic_shift|speaker_change|new_person|prop_moment|eye_contact_camera>"],
       "listener_reactions": [{{"person_id": "P002", "reaction": "<laughing|nodding|surprised|shocked|eye_roll|smirk|awkward_silence>"}}],
@@ -1353,6 +1356,7 @@ def merge_chunks(
         "comedy_analysis":        {},
         "object_memory":          [],
         "edit_intelligence":      {},
+        "visual_world":           {},
     }
     return merged
 
@@ -1585,6 +1589,12 @@ JSON schema:
     "best_60s_clip": {{"start": float, "end": float, "event_ids": [], "why": "string"}},
     "hook_score_by_event": [{{"event_id": "E001", "hook_score": 0-10, "scroll_stop_probability": 0-1}}],
     "suggested_captions": [{{"event_id": "E003", "caption": "string", "style": "bold|minimal|meme|subtitles"}}]
+  }},
+  "visual_world": {{
+    "settings": [{{"setting": "<specific location description e.g. Netflix office with red logo backdrop>", "event_ids": ["E001"], "dominant_colors": ["#E50914"]}}],
+    "brand_elements": [{{"brand": "<brand name>", "logo_visible": true, "color_theme": "<e.g. red and white>", "first_event": "E001"}}],
+    "props_index": [{{"prop": "<object name>", "event_ids": ["E018"], "significance": "<punchline_prop|background|recurring|symbolic>"}}],
+    "ocr_index": [{{"text": "<visible text>", "event_ids": ["E001"], "type": "<logo|title_card|lower_third|sign>"}}]
   }}
 }}"""
 
@@ -1620,7 +1630,7 @@ JSON schema:
     reasoning_keys = [
         "viewer_state_timeline", "relationship_graph", "character_model",
         "story_graph", "belief_state_timeline", "topic_graph",
-        "comedy_analysis", "object_memory", "edit_intelligence",
+        "comedy_analysis", "object_memory", "edit_intelligence", "visual_world",
     ]
     for key in reasoning_keys:
         if key in reasoning_db:
