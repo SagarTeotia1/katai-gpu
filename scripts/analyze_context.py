@@ -1430,7 +1430,7 @@ def synthesize_merged(
     }
 
     log(video_label, "Synthesis pass — text-only LLM call for conversation/story/editorial...")
-    raw_resp = post_vllm(payload, vllm_url, timeout=360)
+    raw_resp = post_vllm(payload, vllm_url, timeout=600)
     usage = raw_resp.get("usage", {})
     merged["_synth_tokens_in"]  = usage.get("prompt_tokens", 0)
     merged["_synth_tokens_out"] = usage.get("completion_tokens", 0)
@@ -1640,7 +1640,7 @@ JSON schema:
 
     log(video_label, "Reasoning pass — building Editor Memory Database (viewer state, relationships, story graph)...")
     try:
-        raw_resp = post_vllm(payload, vllm_url, timeout=120)
+        raw_resp = post_vllm(payload, vllm_url, timeout=360)
         msg      = raw_resp["choices"][0]["message"]
         raw      = msg.get("content") or ""
         if not raw.strip():
@@ -1707,7 +1707,7 @@ OUTPUT ONLY VALID JSON — no markdown, no explanation:
 
     log(video_label, "Continuity pass — dedup people across chunk boundaries...")
     try:
-        raw_resp = post_vllm(payload, vllm_url, timeout=120)
+        raw_resp = post_vllm(payload, vllm_url, timeout=240)
         usage = raw_resp.get("usage", {})
         merged["_cont_tokens_in"]  = usage.get("prompt_tokens", 0)
         merged["_cont_tokens_out"] = usage.get("completion_tokens", 0)
