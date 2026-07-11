@@ -123,6 +123,7 @@ def parse_robust(raw: str, ctx: str = "") -> dict:
     if HAS_REPAIR:
         repaired = repair_json(fragment, return_objects=True)
         if isinstance(repaired, dict) and repaired:
+            repaired["_quality"] = "degraded"  # json-repair was needed — scores may be hallucinated
             print(f"  [{ctx}] JSON was truncated — repaired successfully", flush=True)
             event_count = len(repaired.get("timeline", []))
             is_chunk = "_synthesis" not in ctx and "_reasoning" not in ctx and "_continuity" not in ctx
@@ -1570,7 +1571,7 @@ def _crossvalidate_speakers(
             s for s in segs
             if s.get("speaker_id")
             and float(s.get("start", 0)) < ev_end
-            and float(s.get("end", ev_start)) > ev_start
+            and float(s.get("end", ev_end)) > ev_start
         ]
         if not overlap_segs:
             continue
@@ -1673,6 +1674,31 @@ def _link_callbacks(timeline: list[dict], video_label: str) -> None:
         log(video_label, f"callback linker: linked {linked} callback events to setups (TF-IDF)")
 
 
+def _dedup_boundary_events(events: list[dict], min_gap_s: float = 1.0) -> list[dict]:
+    """Drop near-duplicate events from chunk overlap zones using time+Jaccard dedup."""
+    if not events:
+        return events
+    keep: list[dict] = [events[0]]
+    for ev in events[1:]:
+        prev = keep[-1]
+        prev_end = float(prev.get("end") or prev.get("end_s") or 0)
+        ev_start  = float(ev.get("start") or ev.get("start_s") or 0)
+        if prev_end <= ev_start + min_gap_s:
+            keep.append(ev)
+            continue
+        a = set((ev.get("transcript_text") or ev.get("transcript") or "").lower().split())
+        b = set((prev.get("transcript_text") or prev.get("transcript") or "").lower().split())
+        if not a and not b:
+            keep.append(ev)
+            continue
+        jaccard = len(a & b) / max(len(a | b), 1)
+        if jaccard < 0.6:
+            keep.append(ev)
+        elif int(ev.get("importance") or 0) > int(prev.get("importance") or 0):
+            keep[-1] = ev
+    return keep
+
+
 def merge_chunks(
     chunk_results: list[dict],
     video_label: str,
@@ -1686,11 +1712,12 @@ def merge_chunks(
 
     # Merge and renumber timeline events
     all_events = _merge_sorted(chunk_results, "timeline")
+    all_events = _dedup_boundary_events(all_events)
     for i, ev in enumerate(all_events, 1):
         ev["id"] = f"E{i:03d}"
 
     # Callback linker: TF-IDF similarity on key_lines (no API needed)
-    _link_callbacks(all_events, video_label)
+    # _link_callbacks called in _finalize_video after speaker cross-validation
 
     # Collect world_state entries from each successful chunk
     world_states = []
@@ -1830,7 +1857,9 @@ def synthesize_merged(
             f"WARNING: Timeline truncated {len(_full_tl)}→600 events for synthesis "
             f"(coverage {600/len(_full_tl)*100:.1f}%). "
             f"Last event at {_full_tl[-1].get('end',0):.1f}s.")
-    events = _full_tl[:600]
+        mid_start = len(_full_tl) // 2 - 150
+        _full_tl = _full_tl[:150] + _full_tl[max(0, mid_start):mid_start + 300] + _full_tl[-150:]
+    events = _full_tl
     tl_lines = []
     for ev in events:
         speaker  = ev.get("speaker", "")
@@ -2995,6 +3024,7 @@ def _finalize_video(
 
     # Cross-validate speaker assignments: diarizer beats VLM when VLM is not high-confidence
     _crossvalidate_speakers(merged.get("timeline", []), transcripts, video_label)
+    _link_callbacks(merged.get("timeline", []), video_label)
 
     # ── SYNTH ─────────────────────────────────────────────────────────────────
     t_synth = time.time()

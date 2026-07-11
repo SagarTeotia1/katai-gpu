@@ -19,7 +19,6 @@ import json
 import os
 import sys
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -218,24 +217,27 @@ class EditingSearcher:
         print(f"  [embed] '{query[:60]}'", file=sys.stderr, flush=True)
         vec = self.embed(query)
 
-        # Three searches run in parallel — reduces latency vs sequential HTTP calls
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            f_ev = pool.submit(self._fan_out, vec, "timeline_event", _SEARCH_BUDGET["timeline_event"], video_filter)
-            f_cl = pool.submit(self._fan_out, vec, "clip", _SEARCH_BUDGET["clip"], video_filter)
-            f_hi = pool.submit(self._fan_out, vec, "highlight", _SEARCH_BUDGET["highlight"], video_filter)
-            ev_hits = f_ev.result()
-            cl_hits = f_cl.result()
-            hi_hits = f_hi.result()
+        # Three parallel-style passes (sequential is fine — each is fast)
+        print("  [search] timeline_event ...", file=sys.stderr, flush=True)
+        ev_hits = self._fan_out(
+            vec, "timeline_event", _SEARCH_BUDGET["timeline_event"], video_filter
+        )
+
+        print("  [search] clip ...", file=sys.stderr, flush=True)
+        cl_hits = self._fan_out(
+            vec, "clip", _SEARCH_BUDGET["clip"], video_filter
+        )
+
+        print("  [search] highlight ...", file=sys.stderr, flush=True)
+        hi_hits = self._fan_out(
+            vec, "highlight", _SEARCH_BUDGET["highlight"], video_filter
+        )
 
         # Merge timeline_event + highlight into one pool (dedupe by id, best score wins)
         event_pool: dict[str, dict] = {**ev_hits}
         for mid, hit in hi_hits.items():
             if mid not in event_pool or hit["score"] > event_pool[mid]["score"]:
                 event_pool[mid] = hit
-
-        # Drop stub events (transcript-only, VLM analysis failed) — no visual data
-        event_pool = {mid: hit for mid, hit in event_pool.items()
-                      if not hit.get("metadata", {}).get("stub")}
 
         print(
             f"  [search] {len(event_pool)} events+highlights, "
@@ -291,43 +293,50 @@ class TemporalEnricher:
     def get_neighbors(self, event_id: str, video_id: str) -> dict:
         """
         Return prev/next Event linked by NEXT relationships for the given event.
-        Uses a single query to fetch both neighbors at once.
         Falls back to empty dicts if no neighbor exists.
         """
         # Composite id is "{video_id}_{event_id}" — use prefix check, not underscore presence,
         # so short IDs like "hook_01" or "reaction_003" are correctly reconstructed.
         composite = event_id if event_id.startswith(f"{video_id}_") else f"{video_id}_{event_id}"
-
-        rows = self._run(
+        # Next neighbor
+        next_rows = self._run(
             """
-            MATCH (e:Event {id: $eid, video_id: $vid})
-            OPTIONAL MATCH (prev:Event)-[:NEXT]->(e)
-            OPTIONAL MATCH (e)-[:NEXT]->(nxt:Event)
-            RETURN
-              prev.id AS prev_id, prev.start AS prev_start, prev.end AS prev_end, prev.moment AS prev_moment,
-              nxt.id  AS nxt_id,  nxt.start  AS nxt_start,  nxt.end  AS nxt_end,  nxt.moment  AS nxt_moment
+            MATCH (e:Event {id: $eid, video_id: $vid})-[:NEXT]->(nxt:Event)
+            RETURN nxt.id AS event_id,
+                   nxt.start    AS start,
+                   nxt.end      AS end,
+                   nxt.moment   AS moment
+            LIMIT 1
+            """,
+            {"eid": composite, "vid": video_id},
+        )
+        # Previous neighbor
+        prev_rows = self._run(
+            """
+            MATCH (prev:Event)-[:NEXT]->(e:Event {id: $eid, video_id: $vid})
+            RETURN prev.id AS event_id,
+                   prev.start    AS start,
+                   prev.end      AS end,
+                   prev.moment   AS moment
+            LIMIT 1
             """,
             {"eid": composite, "vid": video_id},
         )
 
-        if not rows:
-            return {"prev": None, "next": None}
-
-        r = rows[0]
-
-        def _make_neighbor(id_key: str, start_key: str, end_key: str, moment_key: str) -> dict | None:
-            if not r.get(id_key):
+        def _row_to_dict(rows: list) -> dict | None:
+            if not rows:
                 return None
+            r = rows[0]
             return {
-                "event_id": r[id_key],
-                "start":    float(r[start_key]) if r.get(start_key) is not None else None,
-                "end":      float(r[end_key])   if r.get(end_key)   is not None else None,
-                "moment":   r.get(moment_key),
+                "event_id": r.get("event_id"),
+                "start":    float(r["start"]) if r.get("start") is not None else None,
+                "end":      float(r["end"])   if r.get("end")   is not None else None,
+                "moment":   r.get("moment"),
             }
 
         return {
-            "prev": _make_neighbor("prev_id", "prev_start", "prev_end", "prev_moment"),
-            "next": _make_neighbor("nxt_id",  "nxt_start",  "nxt_end",  "nxt_moment"),
+            "prev": _row_to_dict(prev_rows),
+            "next": _row_to_dict(next_rows),
         }
 
     def get_narrative_chain(self, event_ids: list[str], depth: int = 2) -> dict[str, dict]:
@@ -478,10 +487,6 @@ def _build_event(rank: int, hit: dict, neighbors: dict | None) -> dict:
         "clip_worthy":   bool(meta.get("clip_worthy") or False),
         "type":          meta.get("type", ""),
         "topic":         meta.get("topic", ""),
-        "visual_description": meta.get("visual_description", ""),
-        "delivery_notes":     meta.get("delivery_notes", ""),
-        "key_line":           meta.get("key_line", ""),
-        "conversation_role":  meta.get("conversation_role", ""),
         "neighbors":     neighbors or {"prev": None, "next": None},
     }
 

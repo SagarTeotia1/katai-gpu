@@ -88,7 +88,7 @@ def build_speed_filter(factor: float, keep_pitch: bool = True) -> tuple[str, str
             remaining /= 2.0
         while remaining < 0.5:
             af_steps.append("atempo=0.5")
-            remaining /= 0.5
+            remaining *= 2.0
         af_steps.append(f"atempo={remaining:.6f}")
         af = ",".join(af_steps)
     else:
@@ -104,7 +104,7 @@ def build_zoom_filter(zoom_factor: float, duration_s: float, fps: float = 30.0) 
     return (
         f"zoompan=z='min(zoom+{step:.6f},{zoom_factor:.3f})':"
         f"d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-        f"s=iw:ih:fps={fps}"
+        f"s=1920x1080:fps={fps}"
     )
 
 
@@ -128,7 +128,7 @@ def build_text_filter(text: str, position: str = "bottom", style: str = "",
     }
     y = y_map.get(position, "h-text_h-60")
     fontsize = 48 if "big" in style.lower() else 40
-    bold_flag = ":font_bold=1" if "bold" in style.lower() else ""
+    bold_flag = ":fontstyle=Bold" if "bold" in style.lower() else ""
     # Enable range is in clip-local time (t=0 at clip start) since each segment
     # is extracted as a standalone file. clip_start_s is informational only here;
     # we keep enable relative to clip's own t=0.
@@ -151,10 +151,13 @@ def build_freeze_filter(at_s: float, src_start: float, hold_s: float) -> str:
     is frame-accurate: freeze the frame at rel_s position regardless of speed.
     """
     rel_s = max(0.0, at_s - src_start)
-    loop_frames = max(1, int(hold_s * 30))  # 30fps assumption; good enough for freeze
+    loop_frames = max(1, int(hold_s * 30))  # 30fps assumption
+    # trim to 1 frame at rel_s, loop it N times, then reset PTS for concat
     return (
-        f"select='if(gte(t,{rel_s:.2f}),if(eq(n,0),1,prev_selected_n+1),1)',"
-        f"loop={loop_frames}:size=1:start=0"
+        f"trim=start={rel_s:.2f}:duration=0.042,"
+        f"setpts=PTS-STARTPTS,"
+        f"loop={loop_frames}:size=1:start=0,"
+        f"setpts=N/FR/TB"
     )
 
 
