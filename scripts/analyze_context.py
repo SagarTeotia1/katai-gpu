@@ -215,6 +215,33 @@ def build_transcript_block(transcripts: dict, video_label: str,
     return "(no transcript)"
 
 
+def _build_prev_transcript_context(
+    transcripts: dict,
+    video_label: str,
+    prev_start: float,
+    prev_end: float,
+) -> str:
+    """Return the last 3 transcript lines from the previous chunk's window.
+
+    Used to inject cheap, zero-GPU narrative context into the current chunk's
+    system prompt so the VLM doesn't start fresh with no knowledge of what
+    happened in chunk N-1.
+    """
+    for v in transcripts.get("videos", []):
+        if v.get("video") == video_label:
+            segs = [
+                s for s in v.get("segments", [])
+                if prev_start <= s["start"] <= prev_end and s.get("text", "").strip()
+            ]
+            if not segs:
+                return ""
+            last3 = segs[-3:]
+            return "\n".join(
+                f'  [{s["start"]:.1f}s] "{s["text"].strip()}"' for s in last3
+            )
+    return ""
+
+
 # ── Video duration via backend ffprobe ────────────────────────────────────────
 
 def get_video_duration(video_url: str, backend_url: str) -> float:
@@ -470,11 +497,21 @@ def _build_quick_prompt(
     person_db: str, transcript_json: str, video_label: str,
     chunk_id: int, total_chunks: int,
     strict_start: float, strict_end: float, total_duration: float,
+    prev_chunk_context: str = "",
 ) -> str:
     """LOW profile — 5-6 events, stripped 15-field schema to fit 2048 token budget."""
+    prev_ctx_block = ""
+    if prev_chunk_context:
+        prev_ctx_block = f"""PREVIOUS CHUNK CONTEXT (what happened just before this window):
+{prev_chunk_context}
+
+Use this to maintain narrative continuity. Don't re-introduce people already established.
+Open loops from previous chunk should be tracked. Speaker identities carry forward.
+
+"""
     return f"""{_CHUNK_JSON_HEADER}
 
-You are a fast video metadata scanner. LOW-IMPORTANCE segment.
+{prev_ctx_block}You are a fast video metadata scanner. LOW-IMPORTANCE segment.
 
 Video: {video_label} | Window: {strict_start:.2f}s→{strict_end:.2f}s of {total_duration:.2f}s
 
@@ -518,13 +555,23 @@ def _build_rich_prompt(
     person_db: str, transcript_json: str, video_label: str,
     chunk_id: int, total_chunks: int,
     strict_start: float, strict_end: float, total_duration: float,
+    prev_chunk_context: str = "",
 ) -> str:
     """MEDIUM profile — standard depth, full timeline + visual/editorial signals."""
     n_min = max(3, int((strict_end - strict_start) / 6))
     n_max = max(6, int((strict_end - strict_start) / 3))
+    prev_ctx_block = ""
+    if prev_chunk_context:
+        prev_ctx_block = f"""PREVIOUS CHUNK CONTEXT (what happened just before this window):
+{prev_chunk_context}
+
+Use this to maintain narrative continuity. Don't re-introduce people already established.
+Open loops from previous chunk should be tracked. Speaker identities carry forward.
+
+"""
     return f"""{_CHUNK_JSON_HEADER}
 
-You are a semantic video analysis engine. MEDIUM-IMPORTANCE segment.
+{prev_ctx_block}You are a semantic video analysis engine. MEDIUM-IMPORTANCE segment.
 
 Video: {video_label} | Window: {strict_start:.2f}s→{strict_end:.2f}s of {total_duration:.2f}s total
 
@@ -582,13 +629,23 @@ def _build_full_prompt(
     person_db: str, transcript_json: str, video_label: str,
     chunk_id: int, total_chunks: int,
     strict_start: float, strict_end: float, total_duration: float,
+    prev_chunk_context: str = "",
 ) -> str:
     """HIGH profile — maximum depth: camera language, expressions, comedy timing, edit hints."""
     n_min = max(4, int((strict_end - strict_start) / 5))
     n_max = max(8, int((strict_end - strict_start) / 2))
+    prev_ctx_block = ""
+    if prev_chunk_context:
+        prev_ctx_block = f"""PREVIOUS CHUNK CONTEXT (what happened just before this window):
+{prev_chunk_context}
+
+Use this to maintain narrative continuity. Don't re-introduce people already established.
+Open loops from previous chunk should be tracked. Speaker identities carry forward.
+
+"""
     return f"""{_CHUNK_JSON_HEADER}
 
-You are a senior video editor performing DEEP analysis. HIGH-IMPORTANCE segment — this window
+{prev_ctx_block}You are a senior video editor performing DEEP analysis. HIGH-IMPORTANCE segment — this window
 contains a significant editorial event (scene cut + topic shift, speaker change, high-energy
 action, or climax moment). Maximum depth required.
 
@@ -690,22 +747,26 @@ def build_chunk_system_prompt_tiered(
     strict_start: float,
     strict_end: float,
     total_duration: float,
+    prev_chunk_context: str = "",
 ) -> str:
     """Select prompt template based on processing profile name."""
     if profile == "HIGH":
         return _build_full_prompt(
             person_db, transcript_json, video_label,
             chunk_id, total_chunks, strict_start, strict_end, total_duration,
+            prev_chunk_context=prev_chunk_context,
         )
     if profile == "LOW":
         return _build_quick_prompt(
             person_db, transcript_json, video_label,
             chunk_id, total_chunks, strict_start, strict_end, total_duration,
+            prev_chunk_context=prev_chunk_context,
         )
     # MEDIUM (default)
     return _build_rich_prompt(
         person_db, transcript_json, video_label,
         chunk_id, total_chunks, strict_start, strict_end, total_duration,
+        prev_chunk_context=prev_chunk_context,
     )
 
 
@@ -2332,13 +2393,28 @@ def _plan_video_chunks(
         log(video_label,
             f"Planned {n_planned} chunks (~{total_duration / n_planned:.0f}s each) queued into shared pool")
 
+    # Build a fast lookup: chunk_id → (strict_start, strict_end) for prev-context lookups.
+    chunk_window_by_id: dict[int, tuple[float, float]] = {
+        ch.chunk_id: (ch.strict_start, ch.strict_end) for ch in chunks
+    }
+
     def build_payload(c: Chunk) -> dict:
         prof      = event_profiles.get(c.chunk_id, "MEDIUM")
         tok_limit = _eb.PROFILES[prof].max_tokens if prof in _eb.PROFILES else TOKEN_BUDGETS[0]
+        prev_ctx = ""
+        if c.chunk_id > 0:
+            prev_window = chunk_window_by_id.get(c.chunk_id - 1)
+            if prev_window:
+                prev_lines = _build_prev_transcript_context(
+                    transcripts, video_label, prev_window[0], prev_window[1]
+                )
+                if prev_lines:
+                    prev_ctx = f"Last lines before this window:\n{prev_lines}"
         return _build_chunk_payload(
             c, video_label, safe_url,
             person_db, transcripts, total_duration,
             n_planned, model_id, max_tokens=tok_limit, profile=prof,
+            prev_chunk_context=prev_ctx,
         )
 
     def label_fn(c: Chunk) -> str:
@@ -2988,6 +3064,7 @@ def _build_chunk_payload(
     model_id: str,
     max_tokens: int = 20480,
     profile: str = "MEDIUM",
+    prev_chunk_context: str = "",
 ) -> dict:
     """Build a single vLLM /v1/chat/completions payload for one chunk.
 
@@ -2995,6 +3072,9 @@ def _build_chunk_payload(
     instruction depth, event density requirements, and reasoning guidance.
     ``max_tokens`` should come from ``event_builder.PROFILES[profile].max_tokens``
     when using semantic event planning.
+    ``prev_chunk_context`` injects the last few transcript lines from chunk N-1
+    so the VLM maintains narrative continuity without re-introducing established
+    speakers or losing open loops.
 
     Kept as a plain helper (not a closure) so it stays independently testable and
     the closure passed to ChunkDispatcher is trivially thin.
@@ -3007,6 +3087,7 @@ def _build_chunk_payload(
         profile, person_db, transcript_seg, video_label,
         chunk.chunk_id, n_video_chunks,
         chunk.strict_start, chunk.strict_end, total_duration,
+        prev_chunk_context=prev_chunk_context,
     )
     user_text = (
         f"Output the JSON object for event {chunk.chunk_id + 1}/{n_video_chunks} of {video_label}. "
@@ -3151,13 +3232,28 @@ def analyze_video_chunked(
                 "elapsed": round(time.time() - t0, 1), "attempts": 1}
 
     # ── DISPATCH ──────────────────────────────────────────────────────────────
+    # Build a fast lookup: chunk_id → (strict_start, strict_end) for prev-context lookups.
+    chunk_window_by_id_chunked: dict[int, tuple[float, float]] = {
+        ch.chunk_id: (ch.strict_start, ch.strict_end) for ch in chunks
+    }
+
     def build_payload(c: Chunk) -> dict:
         prof      = event_profiles.get(c.chunk_id, "MEDIUM")
         tok_limit = _eb.PROFILES[prof].max_tokens if prof in _eb.PROFILES else TOKEN_BUDGETS[0]
+        prev_ctx = ""
+        if c.chunk_id > 0:
+            prev_window = chunk_window_by_id_chunked.get(c.chunk_id - 1)
+            if prev_window:
+                prev_lines = _build_prev_transcript_context(
+                    transcripts, video_label, prev_window[0], prev_window[1]
+                )
+                if prev_lines:
+                    prev_ctx = f"Last lines before this window:\n{prev_lines}"
         return _build_chunk_payload(
             c, video_label, safe_url,
             person_db, transcripts, total_duration,
             n_planned, model_id, max_tokens=tok_limit, profile=prof,
+            prev_chunk_context=prev_ctx,
         )
 
     def label_fn(c: Chunk) -> str:
