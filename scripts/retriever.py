@@ -72,23 +72,29 @@ def editing_score(vector_sim: float, meta: dict) -> float:
     Weighted composite score that favours editorially strong moments over
     pure semantic similarity.
 
-        editing_score = 0.35 * vector_sim
-                      + 0.25 * hook_score/10
-                      + 0.20 * clip_score/10
-                      + 0.10 * viral_score/10
-                      + 0.10 * importance_score/10
+    Degraded path (json-repair chunks): editorial scores may be hallucinated,
+    so weight collapses to 0.70*vsim + 0.30*importance.
+
+        normal: 0.35*vsim + 0.25*hook + 0.20*clip + 0.10*emotion + 0.05*viral + 0.05*importance
     """
-    hook       = float(meta.get("hook_score")       or 0) / 10.0
-    clip       = float(meta.get("clip_score")       or 0) / 10.0
-    viral      = float(meta.get("viral_score")      or 0) / 10.0
+    vsim       = float(vector_sim or 0)
     importance = float(meta.get("importance_score") or 0) / 10.0
 
+    if meta.get("quality") == "degraded":
+        return 0.70 * vsim + 0.30 * importance
+
+    hook    = float(meta.get("hook_score")    or 0) / 10.0
+    clip    = float(meta.get("clip_score")    or 0) / 10.0
+    emotion = float(meta.get("emotion_score") or 0) / 10.0
+    viral   = float(meta.get("viral_score")   or 0) / 10.0
+
     return (
-        0.35 * float(vector_sim or 0)
+        0.35 * vsim
         + 0.25 * hook
         + 0.20 * clip
-        + 0.10 * viral
-        + 0.10 * importance
+        + 0.10 * emotion
+        + 0.05 * viral
+        + 0.05 * importance
     )
 
 
@@ -243,21 +249,26 @@ class EditingSearcher:
         print(f"  [embed] '{query[:60]}'", file=sys.stderr, flush=True)
         vec = self.embed(query)
 
-        # Three parallel-style passes (sequential is fine — each is fast)
-        print("  [search] timeline_event ...", file=sys.stderr, flush=True)
-        ev_hits = self._fan_out(
-            vec, "timeline_event", _SEARCH_BUDGET["timeline_event"], video_filter
-        )
-
-        print("  [search] clip ...", file=sys.stderr, flush=True)
-        cl_hits = self._fan_out(
-            vec, "clip", _SEARCH_BUDGET["clip"], video_filter
-        )
-
-        print("  [search] highlight ...", file=sys.stderr, flush=True)
-        hi_hits = self._fan_out(
-            vec, "highlight", _SEARCH_BUDGET["highlight"], video_filter
-        )
+        # Three parallel fan-out passes — fire simultaneously
+        with ThreadPoolExecutor(max_workers=3) as _pool:
+            _f_ev = _pool.submit(self._fan_out, vec, "timeline_event",
+                                 _SEARCH_BUDGET["timeline_event"], video_filter)
+            _f_cl = _pool.submit(self._fan_out, vec, "clip",
+                                 _SEARCH_BUDGET["clip"], video_filter)
+            _f_hi = _pool.submit(self._fan_out, vec, "highlight",
+                                 _SEARCH_BUDGET["highlight"], video_filter)
+            try:
+                ev_hits = _f_ev.result()
+            except Exception:
+                ev_hits = {}
+            try:
+                cl_hits = _f_cl.result()
+            except Exception:
+                cl_hits = {}
+            try:
+                hi_hits = _f_hi.result()
+            except Exception:
+                hi_hits = {}
 
         # Merge timeline_event + highlight into one pool (dedupe by id, best score wins)
         event_pool: dict[str, dict] = {**ev_hits}

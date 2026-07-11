@@ -44,6 +44,24 @@ DEFAULT_MODEL = os.getenv("MODEL_ID", "Qwen/Qwen3.6-27B")
 TOP_K         = 60
 
 
+def _budget_trim_events(events: list[dict], char_budget: int = 28_000) -> list[dict]:
+    """Keep events fitting char_budget, importance>=4 first, then timeline order."""
+    if not events:
+        return events
+    high = [e for e in events if int(e.get("importance") or 0) >= 4]
+    low  = [e for e in events if int(e.get("importance") or 0) <  4]
+    low.sort(key=lambda e: float(e.get("start") or e.get("start_s") or 0))
+    kept, used = [], 0
+    for ev in high + low:
+        blob = json.dumps(ev, ensure_ascii=False)
+        if used + len(blob) > char_budget and kept:
+            break
+        kept.append(ev)
+        used += len(blob)
+    kept.sort(key=lambda e: float(e.get("start") or e.get("start_s") or 0))
+    return kept
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  L2 — Understanding Agents (Story + Humor + Emotion + Conversation)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -287,16 +305,23 @@ Rules:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def detect_edit_mode(prompt: str) -> str:
+    import re as _re
     lower = prompt.lower()
     full_words = ["complete","full video","entire","whole","reorder","play video",
                   "put first","comes first","then play","play all"]
     highlight_words = ["best moments","short","reel","60s","45s","30s","highlight",
                        "clip","viral","top","funniest","viral"]
+    mode = "NARRATIVE_EDIT"
     if any(w in lower for w in full_words):
-        return "FULL_VIDEO_REORDER"
+        mode = "FULL_VIDEO_REORDER"
     if any(w in lower for w in highlight_words):
-        return "HIGHLIGHT_CUT"
-    return "NARRATIVE_EDIT"
+        mode = "HIGHLIGHT_CUT"
+    # Duration target ("60s", "30 seconds", "2 minutes") overrides FULL_VIDEO_REORDER
+    if mode == "FULL_VIDEO_REORDER" and _re.search(
+        r'\b\d+\s*s(ec(ond)?s?)?\b|\b\d+\s*min(ute)?s?\b', lower
+    ):
+        mode = "HIGHLIGHT_CUT"
+    return mode
 
 
 def build_executor_timeline(plan: dict, events: list[dict]) -> list[dict]:
@@ -603,7 +628,7 @@ def main():
         sys.exit(2)
 
     # ── L2 Understanding + L4 Scoring — fire in PARALLEL (vLLM continuous batching) ─
-    events_json = json.dumps(events[:60], indent=2, ensure_ascii=False)
+    events_json = json.dumps(_budget_trim_events(events), indent=2, ensure_ascii=False)
     graph_json  = json.dumps(graph, indent=2, ensure_ascii=False)[:9000]
 
     edit_mode = detect_edit_mode(prompt)
@@ -659,6 +684,18 @@ def main():
         print(f"    ! Understanding pass errored: {understanding['__error__']}", flush=True)
     if "__error__" in scoring:
         print(f"    ! Scoring pass errored: {scoring['__error__']}", flush=True)
+
+    # Checkpoint L2+L4 before L5 — timeout on L5 won't require full restart
+    try:
+        _ckpt = Path(args.out).with_suffix("") if hasattr(args, "out") and args.out else Path("output/editplan_checkpoint")
+        _ckpt.parent.mkdir(parents=True, exist_ok=True)
+        (_ckpt.parent / (_ckpt.name + "_ckpt.json")).write_text(
+            json.dumps({"understanding": understanding, "scoring": scoring,
+                        "mode": edit_mode}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as _e:
+        print(f"    [checkpoint] save failed: {_e}", flush=True)
 
     # ── L5 Chief Editor — planning ───────────────────────────────────────────
     print("  [L5 Chief Editor] Planning primitive ops...", flush=True)

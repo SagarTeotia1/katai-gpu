@@ -809,6 +809,8 @@ def stub_failed_chunk(chunk: Chunk, transcript_slice: str) -> dict[str, Any]:
     """
     stub_event = {
         "id":               f"E{chunk.chunk_id:02d}_stub",
+        "start":            chunk.strict_start,   # _merge_sorted sorts on "start"
+        "end":              chunk.strict_end,
         "start_s":          chunk.strict_start,
         "end_s":            chunk.strict_end,
         "type":             "transcript_only",
