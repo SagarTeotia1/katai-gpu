@@ -308,28 +308,38 @@ _CHUNK_SCHEMA_COMMON = """\
       "visible_people": ["P001"],
       "speaker": "<person_id or null>",
       "transcript_text": "<exact words or empty>",
+      "caused_by": "<event_id this event was triggered by, or null>",
+      "importance_tags": ["<hook|punchline|setup|callback|conflict|resolution|reaction|surprise|laugh|topic_shift|speaker_change|new_person|prop_moment|eye_contact_camera>"],
       "listener_reactions": [{{"person_id": "P002", "reaction": "<laughing|nodding|surprised|shocked|eye_roll|smirk|awkward_silence>"}}],
       "expressions": [{{"person_id": "P001", "expression": "<laugh|smirk|eye_roll|shock|smile|neutral|confused|excited|bored|thinking>"}}],
       "physical_actions": [{{"person_id": "P001", "action": "<points|stands|walks|claps|leans_in|leans_back|gestures|looks_away|looks_at_camera|touches_face>"}}],
       "frame_people": [{{"person_id": "P001", "screen_position": "<left|center|right>", "depth": "<foreground|midground|background>", "occluded": false}}],
       "camera": {{
         "shot_type": "<wide|medium|close_up|extreme_close_up|two_shot|over_shoulder>",
+        "shot_size": "<ECU|CU|MCU|MS|WS|EWS>",
         "motion": "<static|pan|tilt|zoom_in|zoom_out|handheld|cut>",
+        "camera_motion": "<static|push_in|pull_out|pan_left|pan_right|tilt_up|tilt_down|handheld>",
         "composition": "<centered|rule_of_thirds|offscreen_subject|split_screen>",
-        "eye_contact": <true|false>
+        "eye_contact": <true|false>,
+        "focus_person": "<person_id or null>"
       }},
       "comedy_timing": {{
         "structure": "<setup|punchline|pause|reaction|callback|none>",
         "pause_duration_s": <0.0>,
         "setup_at": <float or null>,
-        "laugh_at": <float or null>
+        "laugh_at": <float or null>,
+        "reaction_window_s": <0.0 — seconds after punchline where laugh expected>,
+        "laugh_landed": <true|false — whether laugh actually occurred>
       }},
       "audio_energy": {{
         "level": "<silent|quiet|normal|loud|peak>",
         "speech_rate": "<fast|normal|slow|silent>",
         "silence_before_s": <0.0>,
         "laugh_detected": <true|false>,
-        "audio_quality": "<clean|noisy|echo|muffled>"
+        "audio_quality": "<clean|noisy|echo|muffled>",
+        "speech_clarity": "<clear|muffled|echo|noisy>",
+        "background_music": <true|false>,
+        "clipping": <true|false>
       }},
       "visual_tags": ["<one or more: close_up|wide_shot|two_shot|reaction_shot|pointing|laughing|clapping|standing|walking|whiteboard|laptop|phone|logo|eye_contact|broll_candidate|person_thinking|person_shocked|person_smiling|hand_gesture>"],
       "scores": {{
@@ -342,18 +352,30 @@ _CHUNK_SCHEMA_COMMON = """\
         "emotion_contagion": <true|false — did emotion visibly spread to other people>,
         "importance_reason": "<10 words max — why this score>"
       }},
+      "energy": {{
+        "visual": <0-10>,
+        "audio": <0-10>,
+        "conversation": <0-10>,
+        "overall": <0-10>
+      }},
+      "viewer_attention": {{
+        "primary": "<person_id of main focus>",
+        "secondary": "<person_id of secondary focus or null>",
+        "reason": "<speaker|reaction|movement|expression>"
+      }},
       "edit_hints": {{
         "keep": <true|false>,
         "start_trim": <0.0>,
         "end_trim": <0.0>,
-        "speed": "<0.5x|0.75x|1x|1.25x|1.5x|slow_mo>",
-        "transition": "<cut|dissolve|smash_cut|jump_cut|none>",
+        "speed": "<0.5x|0.75x|1x|1.25x|1.5x|2x>",
+        "transition": "<cut|dissolve|fade|none>",
         "zoom_on": "<person_id or null>",
         "caption_suggestion": "<short caption text or null>",
-        "music_mood": "<upbeat|dramatic|tense|funny|none>",
+        "music_mood": "<none|tense|funny|emotional|hype|calm>",
         "reaction_cut_to": "<person_id or null>",
         "audio_fade_in_s": <0.0>,
-        "audio_fade_out_s": <0.0>
+        "audio_fade_out_s": <0.0>,
+        "editing_opportunities": ["<reaction_cut|zoom|jump_cut|speedup|caption|freeze_frame|punch_in|remove_silence|broll_insert|music_hit>"]
       }},
       "clip_worthy": <true|false>,
       "thumbnail_worthy": <true|false>,
@@ -423,6 +445,8 @@ PEOPLE:
 TRANSCRIPT (this window only):
 {transcript_json}
 
+CRITICAL: Every timeline event MUST have all fields. Partial events with missing camera/expressions/frame_people are not acceptable.
+
 Return ONLY valid JSON:
 {_CHUNK_SCHEMA_COMMON.format(
     chunk_id=chunk_id, video_label=video_label,
@@ -477,6 +501,8 @@ PEOPLE:
 
 TRANSCRIPT:
 {transcript_json}
+
+CRITICAL: Every timeline event MUST have all fields. Partial events with missing camera/expressions/frame_people are not acceptable.
 
 Return ONLY valid JSON:
 {_CHUNK_SCHEMA_COMMON.format(
@@ -566,6 +592,8 @@ PEOPLE:
 
 TRANSCRIPT (full precision required for this window):
 {transcript_json}
+
+CRITICAL: Every timeline event MUST have all fields. Partial events with missing camera/expressions/frame_people are not acceptable.
 
 Return ONLY valid JSON (this is a HIGH-priority segment — complete ALL fields including camera, expressions, physical_actions, edit_hints):
 {_CHUNK_SCHEMA_COMMON.format(
@@ -807,9 +835,39 @@ Based on this complete timeline, generate the editorial intelligence layer.
 Use color intelligence to inform editorial decisions (flag overexposed scenes, note color transitions).
 Use audio intelligence to find natural cut points (silences), identify high-energy moments (laughs), and flag speaker pacing.
 
+SCENES RULES:
+- scenes: divide the video into 3-8 meaningful narrative scenes (not arbitrary 30s chunks)
+- title: a real descriptive title like "The Betrayal Accusation" or "Opening Banter" — NEVER "Scene 1"
+- description: 2-3 full sentences describing what happens, the emotional texture, who drives it — NO semicolons, NO lists
+- dominant_emotion: single strongest emotion for that scene
+- narrative_purpose: what role this scene plays in the overall arc (e.g. "establishes host credibility", "delivers climactic reveal")
+
+CAUSE_EFFECT_GRAPH RULES:
+- Map every meaningful causal link between events: what triggered what
+- relationship values: triggers_pause (A caused a moment of silence), triggers_reaction (A caused visible response), setup_for (A is the setup that makes B land), resolves (A resolves tension from B), callbacks (A refers back to earlier event B)
+- Every highlight, key moment, and punchline should have at least one incoming cause
+
+CHARACTER_STATES RULES:
+- For every event_id that has a significant moment (emotion peak, speaker turn, reaction), record per-person states
+- confidence: how self-assured the person appears (0=nervous, 1=commanding)
+- dominance: how much they control the interaction at that moment (0=passive, 1=leading)
+- energy: physical/vocal energy level (0=subdued, 1=very animated)
+- attention_target: who/what they are focused on (person_id or null if looking at camera)
+
+EMOTIONAL_GRAPH RULES:
+- emotional_graph: sample every significant event — do NOT limit to one sample per 30s
+- t: absolute timestamp in seconds
+- dominant_emotion: the strongest emotion visible/audible at that moment
+- intensity: 0.0-1.0 float (not a string)
+- speaker: which person_id is most emotionally active at this timestamp
+
 EDIT SEQUENCE RULES:
-- edit_sequence: ordered list of events that form the BEST standalone clip from this video
+- edit_sequence: ordered list of events that form the BEST 60-second standalone highlight cut
 - Include 8-15 events max — this is the final cut, not the full timeline
+- order: 1-based output order for the 60s cut (can differ from source timeline — reorder for narrative punch)
+- instruction: specific visual instruction for the editor (e.g. "zoom on P002 face", "wide shot", "reaction cut to P001")
+- caption: short punchy on-screen text (question, quote, or null)
+- transition: cut|dissolve|smash_cut|jump_cut
 - action=cut: drop this event entirely (use for filler, dead air, off-topic)
 - action=keep: include as-is at normal speed
 - action=speed_ramp: include but speed up (1.25x for talking-head padding, slow_mo for peak reaction)
@@ -894,28 +952,70 @@ Return ONLY valid JSON:
     "editor_notes": "<3-5 specific editing recommendations>"
   }},
 
-  "emotional_graph": [
-    {{"t": <float>, "emotion": "<happy|surprised|laughing|tense|sad|angry|calm|excited>", "intensity": "<low|medium|high>", "trigger": "<event_id>"}}
-  ],
-
   "narrative_flow": [
     {{"event_id": "<E_id>", "role": "<hook|setup|conflict|escalation|punchline|resolution|callback|transition>", "links_to": ["<E_id>"], "link_type": "<answers|triggers|calls_back|interrupts>"}}
   ],
 
+  "scenes": [
+    {{
+      "scene_id": "S001",
+      "start": <float>,
+      "end": <float>,
+      "title": "<descriptive scene title — NOT 'Scene 1'>",
+      "description": "<2-3 sentence narrative description of what happens in this scene and its emotional texture. NO semicolons.>",
+      "dominant_emotion": "<happy|tense|curious|excited|sad|angry|calm|shocked>",
+      "narrative_purpose": "<what this scene does for the overall story — e.g. 'establishes stakes', 'delivers punchline', 'introduces conflict'>",
+      "event_ids": ["<E_id>"]
+    }}
+  ],
+
+  "cause_effect_graph": [
+    {{
+      "from_event": "<E_id>",
+      "to_events": ["<E_id>"],
+      "relationship": "<triggers_pause|triggers_reaction|setup_for|resolves|callbacks>"
+    }}
+  ],
+
+  "character_states": {{
+    "<event_id>": {{
+      "<person_id>": {{
+        "confidence": <0.0-1.0>,
+        "dominance": <0.0-1.0>,
+        "energy": <0.0-1.0>,
+        "attention_target": "<person_id or null>"
+      }}
+    }}
+  }},
+
   "edit_sequence": [
     {{
-      "seq": 1,
+      "order": 1,
       "event_id": "<E_id>",
+      "start": <float>,
+      "end": <float>,
+      "instruction": "<specific visual instruction: zoom on P002 face|wide shot|reaction cut to P001>",
+      "caption": "<short on-screen caption text or null>",
+      "transition": "<cut|dissolve|smash_cut|jump_cut>",
+      "seq": 1,
       "action": "<keep|cut|speed_ramp|reaction_cut|broll_insert>",
       "source_start": <float>,
       "source_end": <float>,
       "trim_start": <0.0>,
       "trim_end": <0.0>,
       "speed": "<0.5x|0.75x|1x|1.25x|slow_mo>",
-      "caption": "<null or short caption>",
       "music_change": "<null or mood: upbeat|dramatic|tense|funny|none>",
       "transition_in": "<cut|dissolve|smash_cut|jump_cut>",
       "reason": "<5 words: why this event is in the sequence>"
+    }}
+  ],
+
+  "emotional_graph": [
+    {{
+      "t": <float>,
+      "dominant_emotion": "<happy|surprised|laughing|tense|sad|angry|calm|excited|curious|shocked>",
+      "intensity": <0.0-1.0>,
+      "speaker": "<person_id>"
     }}
   ]
 }}"""
@@ -1241,6 +1341,18 @@ def merge_chunks(
         "emotional_graph":      [],
         "narrative_flow":       [],
         "edit_sequence":        [],
+        "cause_effect_graph":   [],
+        "character_states":     {},
+        # Reasoning pass layers — filled in by build_reasoning_pass()
+        "viewer_state_timeline":  [],
+        "relationship_graph":     {},
+        "character_model":        {},
+        "story_graph":            {},
+        "belief_state_timeline":  [],
+        "topic_graph":            {},
+        "comedy_analysis":        {},
+        "object_memory":          [],
+        "edit_intelligence":      {},
     }
     return merged
 
@@ -1329,13 +1441,15 @@ def synthesize_merged(
     except Exception as e:
         log(video_label, f"Synthesis parse FAILED: {e}")
         log(video_label, f"Synthesis raw (first 500): {raw[:500]!r}")
+        log(video_label, f"Synthesis raw (last 200): {raw[-200:]!r}")
         return merged
 
     # Merge synthesis fields into the combined dict
     for key in ("video_metadata", "conversation", "story", "highlights",
                 "clip_candidates", "thumbnail_candidates", "ocr_results",
                 "editorial_summary", "emotional_graph", "narrative_flow",
-                "edit_sequence"):
+                "edit_sequence", "cause_effect_graph", "character_states",
+                "scenes"):
         if key in synth:
             merged[key] = synth[key]
 
@@ -1343,6 +1457,176 @@ def synthesize_merged(
     if not merged.get("scenes"):
         merged["scenes"] = _scenes_from_timeline(merged["timeline"])
 
+    # Post-process: fix scenes with empty or semicolon-only descriptions
+    _fix_scene_descriptions(merged)
+
+    return merged
+
+
+def build_reasoning_pass(
+    merged: dict,
+    vllm_url: str,
+    model_id: str,
+) -> dict:
+    """
+    Third LLM pass — text only, ~30-90s.
+    Builds the Editor Memory Database: viewer psychology, relationship graph,
+    character models, story structure, belief state, topic graph, comedy
+    analysis, object memory, and edit intelligence layers.
+    """
+    video_label = merged.get("video_id", "unknown")
+    timeline    = merged.get("timeline", [])
+    known_people = merged.get("known_people", [])
+
+    # Build compact event summary for prompt (avoid token explosion)
+    event_summary = []
+    for e in timeline:
+        if not isinstance(e, dict):
+            continue
+        event_summary.append({
+            "id":          e.get("id"),
+            "t":           f"{e.get('start', 0):.1f}-{e.get('end', 0):.1f}",
+            "type":        e.get("type"),
+            "speaker":     e.get("speaker"),
+            "moment":      e.get("moment", ""),
+            "transcript":  (e.get("transcript_text", "") or "")[:80],
+            "expressions": [x.get("expression") for x in (e.get("expressions") or []) if isinstance(x, dict)],
+            "reactions":   [x.get("reaction") for x in (e.get("listener_reactions") or []) if isinstance(x, dict)],
+            "laugh":       (e.get("audio_energy") or {}).get("laugh_detected", False),
+            "score_importance": (e.get("scores") or {}).get("importance", 0),
+        })
+
+    people_list = [f"{p.get('person_id')} = {p.get('display_name')}" for p in known_people]
+
+    system = f"""You are an expert video editor and narrative analyst building an Editor Memory Database.
+Given a timeline of events from a video, produce a structured JSON analysis that captures:
+- How the AUDIENCE feels at each moment (viewer psychology)
+- How RELATIONSHIPS between people evolve
+- What each person's CHARACTER is doing
+- How the STORY is structured into acts/beats
+- What BELIEFS the audience holds and how they change
+- The TOPICS and how they connect
+
+Video has these people: {", ".join(people_list)}
+Total events: {len(event_summary)}
+
+Respond with ONLY valid JSON. No markdown. No explanation.
+JSON schema:
+{{
+  "viewer_state_timeline": [
+    {{"t": float, "event_id": "E001", "curiosity": 0-1, "tension": 0-1, "expectation": "string describing what viewer expects next", "surprise_level": 0-1, "laugh_probability": 0-1, "boredom_risk": 0-1, "engagement": 0-1}}
+  ],
+  "relationship_graph": {{
+    "P001": {{
+      "P002": {{"sentiment": -1_to_1, "trust": 0-1, "dynamic": "friendly|hostile|playful|mentor|subordinate|neutral", "evolves": [{{"at_event": "E003", "change": "became hostile", "delta_sentiment": -0.3}}]}}
+    }}
+  }},
+  "character_model": {{
+    "P001": {{
+      "dominant_trait": "string",
+      "humor_style": "self-deprecating|observational|absurd|deadpan|sarcastic|none",
+      "intent_arc": [{{"event_id": "E001", "intent": "deflect|promote|attack|justify|joke|tease|mock|stall|sell|explain|question|agree|disagree"}}],
+      "confidence_arc": [{{"event_id": "E001", "confidence": 0-1}}],
+      "running_jokes": ["string"],
+      "peak_moment": "E018"
+    }}
+  }},
+  "story_graph": {{
+    "acts": [
+      {{
+        "id": "A1",
+        "title": "descriptive title",
+        "start": float,
+        "end": float,
+        "narrative_purpose": "string",
+        "dominant_emotion": "string",
+        "beats": [
+          {{
+            "id": "B1",
+            "title": "descriptive",
+            "start": float,
+            "end": float,
+            "beat_type": "setup|conflict|escalation|reveal|punchline|resolution|callback|transition",
+            "event_ids": ["E001"]
+          }}
+        ]
+      }}
+    ]
+  }},
+  "belief_state_timeline": [
+    {{
+      "after_event": "E001",
+      "t": float,
+      "audience_knows": ["fact the audience now knows"],
+      "open_questions": ["what audience is wondering"],
+      "tension_sources": ["what is creating tension"],
+      "expectations": ["what audience expects to happen"]
+    }}
+  ],
+  "topic_graph": {{
+    "nodes": [{{"id": "T1", "topic": "Netflix", "first_mentioned_event": "E001", "mention_count": 5}}],
+    "edges": [{{"from": "T1", "to": "T2", "relationship": "leads_to|contradicts|explains|callbacks"}}]
+  }},
+  "comedy_analysis": {{
+    "structures_used": ["rule_of_three", "callback", "misdirection", "absurdity", "deadpan", "visual_gag"],
+    "best_joke": {{"setup_event": "E003", "punchline_event": "E018", "type": "misdirection", "why_funny": "string"}},
+    "timing_analysis": [{{"event_id": "E018", "pause_before_s": 1.5, "reaction_after_s": 0.8, "timing_quality": "perfect|good|rushed|slow"}}]
+  }},
+  "object_memory": [
+    {{
+      "object": "pineapple",
+      "lifecycle": [{{"event_id": "E018", "state": "introduced|handled|passed|dropped|referenced", "by_person": "P001"}}],
+      "narrative_role": "punchline prop"
+    }}
+  ],
+  "edit_intelligence": {{
+    "recommended_cold_open": {{"event_id": "E003", "why": "string"}},
+    "best_30s_clip": {{"start": float, "end": float, "event_ids": ["E003", "E006", "E007"], "why": "string"}},
+    "best_60s_clip": {{"start": float, "end": float, "event_ids": [], "why": "string"}},
+    "hook_score_by_event": [{{"event_id": "E001", "hook_score": 0-10, "scroll_stop_probability": 0-1}}],
+    "suggested_captions": [{{"event_id": "E003", "caption": "string", "style": "bold|minimal|meme|subtitles"}}]
+  }}
+}}"""
+
+    user_msg = (
+        "Analyze this video event timeline and produce the Editor Memory Database JSON:\n\n"
+        + json.dumps(event_summary, ensure_ascii=False)
+    )
+
+    payload = {
+        "model": model_id,
+        "messages": [
+            {"role": "system",  "content": system},
+            {"role": "user",    "content": user_msg},
+        ],
+        "max_tokens":      4096,
+        "temperature":     0.3,
+        "response_format": {"type": "json_object"},
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+    log(video_label, "Reasoning pass — building Editor Memory Database (viewer state, relationships, story graph)...")
+    try:
+        raw_resp = post_vllm(payload, vllm_url, timeout=120)
+        msg      = raw_resp["choices"][0]["message"]
+        raw      = msg.get("content") or ""
+        if not raw.strip():
+            raw = msg.get("reasoning_content") or ""
+        reasoning_db = parse_robust(raw, f"{video_label}_reasoning")
+    except Exception as e:
+        log(video_label, f"Reasoning pass FAILED: {e}")
+        return merged
+
+    reasoning_keys = [
+        "viewer_state_timeline", "relationship_graph", "character_model",
+        "story_graph", "belief_state_timeline", "topic_graph",
+        "comedy_analysis", "object_memory", "edit_intelligence",
+    ]
+    for key in reasoning_keys:
+        if key in reasoning_db:
+            merged[key] = reasoning_db[key]
+
+    log(video_label, f"Reasoning pass complete — {len([k for k in reasoning_keys if k in reasoning_db])} layers added")
     return merged
 
 
@@ -1456,6 +1740,88 @@ def _make_scene(existing: list, events: list[dict]) -> dict:
         "narrative_purpose": "",
         "event_ids":        [e.get("id","") for e in events],
     }
+
+
+def _fix_scene_descriptions(merged: dict) -> None:
+    """
+    Post-processing: replace empty or semicolon-only scene descriptions with
+    a narrative description assembled from the event data already in merged.
+    Operates in-place on merged["scenes"].
+    """
+    scenes = merged.get("scenes")
+    if not scenes:
+        return
+
+    # Build a fast event lookup by id
+    event_by_id: dict[str, dict] = {
+        ev.get("id", ""): ev
+        for ev in merged.get("timeline", [])
+        if ev.get("id")
+    }
+
+    for scene in scenes:
+        desc = scene.get("description", "")
+        # Consider description bad if empty or composed entirely of semicolons/whitespace
+        is_bad = (
+            not desc
+            or not desc.strip()
+            or all(c in "; \t\n" for c in desc)
+        )
+        if not is_bad:
+            continue
+
+        # Build a replacement description from the events in this scene
+        event_ids = scene.get("event_ids", [])
+        scene_events = [event_by_id[eid] for eid in event_ids if eid in event_by_id]
+
+        if not scene_events:
+            # Fallback: use timestamps and dominant emotion
+            start = scene.get("start", 0)
+            end   = scene.get("end", 0)
+            emo   = scene.get("dominant_emotion", "")
+            scene["description"] = (
+                f"Scene from {start:.1f}s to {end:.1f}s."
+                + (f" Emotional tone is {emo}." if emo else "")
+            ).strip()
+            continue
+
+        # Extract useful text fragments from the events
+        speakers: list[str] = []
+        texts: list[str] = []
+        emotions: list[str] = []
+        for ev in scene_events[:6]:  # cap to first 6 events for brevity
+            sp = ev.get("speaker", "")
+            if sp and sp not in speakers:
+                speakers.append(sp)
+            txt = ev.get("transcript_text", "") or ev.get("description", "")
+            if txt:
+                texts.append(txt[:80].strip())
+            emo = ev.get("emotion", "")
+            if emo and emo not in emotions:
+                emotions.append(emo)
+
+        start   = scene.get("start", 0)
+        end     = scene.get("end", 0)
+        dur     = end - start
+        spk_str = " and ".join(speakers[:3]) if speakers else "participants"
+        emo_str = emotions[0] if emotions else scene.get("dominant_emotion", "")
+        # First sentence: who + what time span
+        sentence1 = (
+            f"{spk_str.capitalize()} {'interact' if len(speakers) > 1 else 'speaks'} "
+            f"from {start:.1f}s to {end:.1f}s ({dur:.0f}s)."
+        )
+        # Second sentence: leading content
+        if texts:
+            joined = " ".join(texts[:2])
+            sentence2 = f"Key content: \"{joined[:120]}\"."
+        else:
+            sentence2 = "No transcribed speech detected in this segment."
+        # Third sentence: emotion
+        sentence3 = f"Dominant emotional tone is {emo_str}." if emo_str else ""
+
+        scene["description"] = " ".join(
+            s for s in [sentence1, sentence2, sentence3] if s
+        )
 
 
 def build_system_prompt(person_db: str, transcript_json: str, video_label: str) -> str:
@@ -2117,6 +2483,12 @@ def _finalize_video(
         synth_wall_s = time.time() - t_synth
         log(video_label,
             f"Synthesis failed ({e}) — saving merged timeline without editorial")
+
+    # ── REASONING PASS ───────────────────────────────────────────────────────
+    try:
+        merged = build_reasoning_pass(merged, vllm_url, model_id)
+    except Exception as e:
+        log(video_label, f"Reasoning pass failed ({e}) — saving without reasoning layers")
 
     # ── CONTINUITY PASS (optional) ────────────────────────────────────────────
     if context_mode == "continuity":
@@ -2782,6 +3154,12 @@ def analyze_video_chunked(
         log(video_label,
             f"Synthesis failed ({e}) — saving merged timeline without editorial")
 
+    # ── REASONING PASS ───────────────────────────────────────────────────────
+    try:
+        merged = build_reasoning_pass(merged, vllm_url, model_id)
+    except Exception as e:
+        log(video_label, f"Reasoning pass failed ({e}) — saving without reasoning layers")
+
     # Rebuild emotion arcs with stable post-synthesis person IDs
     merged["emotion_arcs"] = build_emotion_arcs(merged.get("timeline", []), window_s=30.0)
 
@@ -2881,8 +3259,11 @@ def main() -> None:
     ca_path = (Path(args.cast_analysis) if args.cast_analysis
                else latest_file("output/cast_analysis_*.json"))
     if not ca_path or not ca_path.exists():
-        print("ERROR: no cast_analysis JSON. Run: make cast-analysis CAST=cast.json"); sys.exit(1)
-    cast_analysis: dict = json.loads(ca_path.read_text(encoding="utf-8"))
+        print("  [WARN] No cast_analysis JSON found — continuing without person descriptions.", flush=True)
+        print("         Run 'make cast-analysis CAST=cast.json' for richer person tracking.", flush=True)
+        cast_analysis: dict = {}
+    else:
+        cast_analysis: dict = json.loads(ca_path.read_text(encoding="utf-8"))
 
     tr_path = (Path(args.transcripts) if args.transcripts
                else latest_file("output/transcripts_*.json"))

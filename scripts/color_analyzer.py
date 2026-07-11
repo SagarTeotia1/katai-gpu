@@ -237,7 +237,8 @@ def extract_dominant_colors(frame_bgr: np.ndarray, n_colors: int = 5) -> list[st
     return hexcolors
 
 
-def detect_skin_tone(frame_bgr: np.ndarray) -> dict:
+def _detect_skin_tone_frame(frame_bgr: np.ndarray) -> dict:
+    """Per-frame skin tone helper (internal use). Returns per-frame stats."""
     hsv = _bgr_to_hsv(frame_bgr)
     h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
     # Skin hue range in HSV (0-180 scale used by OpenCV): ~0-25
@@ -262,6 +263,231 @@ def detect_skin_tone(frame_bgr: np.ndarray) -> dict:
         "consistent":  consistent,
         "hue_std":     round(hue_std, 2),
     }
+
+
+def detect_skin_tone(frames_bgr: list) -> dict:
+    """
+    Multi-frame skin tone detection.
+
+    Parameters
+    ----------
+    frames_bgr : list of np.ndarray
+        BGR frames to analyse (e.g. output of extract_frames).
+
+    Returns
+    -------
+    dict with keys:
+        hue, saturation, brightness  — float or None
+        consistent                   — bool (True if hue std across frames < 8.0)
+    """
+    if not frames_bgr:
+        return {"hue": None, "saturation": None, "brightness": None, "consistent": True}
+
+    per_frame_hues: list[float] = []
+    all_h: list[float] = []
+    all_s: list[float] = []
+    all_v: list[float] = []
+
+    for frame_bgr in frames_bgr:
+        hsv = _bgr_to_hsv(frame_bgr)
+        h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        # OpenCV HSV: H in [0, 180], S/V in [0, 255]
+        skin_mask = (
+            (h >= 0) & (h <= 25) &
+            (s >= 30) & (s <= 170) &
+            (v >= 80) & (v <= 255)
+        )
+        if not skin_mask.any():
+            continue
+        frame_h = h[skin_mask]
+        frame_s = s[skin_mask]
+        frame_v = v[skin_mask]
+        per_frame_hues.append(float(np.mean(frame_h)))
+        all_h.extend(frame_h.tolist())
+        all_s.extend(frame_s.tolist())
+        all_v.extend(frame_v.tolist())
+
+    if not all_h:
+        return {"hue": None, "saturation": None, "brightness": None, "consistent": True}
+
+    # Normalise to [0, 1] range for saturation and brightness
+    mean_h = float(np.mean(all_h))
+    mean_s = float(np.mean(all_s)) / 255.0
+    mean_v = float(np.mean(all_v)) / 255.0
+    hue_std_across_frames = float(np.std(per_frame_hues)) if len(per_frame_hues) > 1 else 0.0
+    consistent = bool(hue_std_across_frames < 8.0)
+
+    return {
+        "hue":        round(mean_h, 2),
+        "saturation": round(mean_s, 3),
+        "brightness": round(mean_v, 3),
+        "consistent": consistent,
+    }
+
+
+def analyze_waveform(frames_bgr: list) -> dict:
+    """
+    Compute waveform statistics across a list of BGR frames.
+
+    Uses the standard luma formula: Y = 0.114*B + 0.587*G + 0.299*R
+
+    Returns
+    -------
+    dict:
+        black_level  — int 0-100  (2nd-percentile luma × 100)
+        white_level  — int 0-100  (98th-percentile luma × 100)
+        clipping     — bool       (white_level > 95 or black_level < 3)
+        luma_mean    — float
+    """
+    if not frames_bgr:
+        return {"black_level": 0, "white_level": 100, "clipping": False, "luma_mean": 0.5}
+
+    luma_values: list[np.ndarray] = []
+    for frame in frames_bgr:
+        b = frame[:, :, 0].astype(np.float32) / 255.0
+        g = frame[:, :, 1].astype(np.float32) / 255.0
+        r = frame[:, :, 2].astype(np.float32) / 255.0
+        luma = 0.114 * b + 0.587 * g + 0.299 * r
+        luma_values.append(luma.ravel())
+
+    all_luma = np.concatenate(luma_values)
+    black_level = int(np.percentile(all_luma, 2) * 100)
+    white_level = int(np.percentile(all_luma, 98) * 100)
+    clipping = bool(white_level > 95 or black_level < 3)
+    luma_mean = float(np.mean(all_luma))
+
+    return {
+        "black_level": black_level,
+        "white_level": white_level,
+        "clipping":    clipping,
+        "luma_mean":   round(luma_mean, 4),
+    }
+
+
+def classify_mood(a: dict) -> str:
+    """
+    Classify the cinematic/editorial mood from a flat analysis dict.
+
+    Expected keys (all optional with sensible defaults):
+        brightness, contrast, saturation, temperature_k, look
+    """
+    brightness = a.get("brightness", 0.5)
+    contrast   = a.get("contrast",   1.0)
+    sat        = a.get("saturation", 0.5)
+    temp_k     = a.get("temperature_k", 5500)
+    look       = a.get("look", "natural")
+
+    if look in ("flat_log",):                                           return "flat_log"
+    if look == "cinematic":                                             return "cinematic"
+    if brightness > 0.75 and sat > 0.55:                               return "vibrant_vlog"
+    if temp_k > 6500 and brightness > 0.65:                            return "golden_hour"
+    if temp_k < 4500 and contrast > 1.2:                               return "cold_corporate"
+    if brightness < 0.35 and contrast > 1.3:                           return "dark_dramatic"
+    if sat < 0.25 and contrast < 1.1:                                  return "desaturated_moody"
+    if brightness > 0.6 and sat < 0.4 and contrast < 1.1:             return "soft_lifestyle"
+    if temp_k > 6000 and sat > 0.5 and contrast > 1.15:               return "warm_interview"
+    if brightness < 0.5 and sat > 0.6:                                 return "neon_saturated"
+    return "natural"
+
+
+def compute_grade_suggestions(a: dict) -> dict:
+    """
+    Compute DaVinci/ffmpeg-style correction values needed to reach
+    editorial targets (brightness 0.55, contrast 1.2, saturation 0.5, temp 5500 K).
+
+    Parameters
+    ----------
+    a : dict
+        Flat analysis dict with keys: brightness, contrast, saturation,
+        temperature_k, look (all optional).
+
+    Returns
+    -------
+    dict:
+        lift, gamma, gain          — float  (in stops, roughly -3 … +3)
+        temperature_correction_k   — int    (positive = add warmth)
+        saturation_correction      — float  (positive = add saturation)
+        contrast_correction        — float  (positive = add contrast)
+        target_look                — str
+        needs_grade                — bool
+    """
+    brightness = a.get("brightness", 0.55)
+    contrast   = a.get("contrast",   1.0)
+    sat        = a.get("saturation", 0.5)
+    temp_k     = a.get("temperature_k", 5500)
+
+    lift  = round((0.40 - min(brightness, 0.40)) * 10, 1)     # shadow lift
+    gamma = round((0.55 - brightness) * 8, 1)                  # midtone
+    gain  = round((0.85 - max(brightness, 0.85)) * -5, 1)      # highlight
+
+    temp_correction     = round(5500 - temp_k)
+    sat_correction      = round((0.5 - sat) * 20, 1)
+    contrast_correction = round((1.2 - contrast) * 15, 1)
+
+    look        = a.get("look", "natural")
+    target_look = "cinematic" if contrast < 1.1 else look
+
+    needs_grade = bool(
+        abs(gamma) > 0.5 or abs(temp_correction) > 300 or abs(sat_correction) > 5
+    )
+
+    return {
+        "lift":                    lift,
+        "gamma":                   gamma,
+        "gain":                    gain,
+        "temperature_correction_k": temp_correction,
+        "saturation_correction":   sat_correction,
+        "contrast_correction":     contrast_correction,
+        "target_look":             target_look,
+        "needs_grade":             needs_grade,
+    }
+
+
+def compute_scene_consistency(color_timeline: list) -> list:
+    """
+    Compare adjacent colour analysis dicts and flag discontinuities.
+
+    Parameters
+    ----------
+    color_timeline : list of dict
+        Flat analysis dicts sorted by time (each entry is the ``color_analysis``
+        sub-dict returned by analyze_chunk, or a similar flat dict with keys
+        temperature_k / brightness / contrast).
+
+    Returns
+    -------
+    list of dict — one entry per adjacent pair:
+        from_chunk, to_chunk      — int indices
+        temp_diff_k               — float
+        brightness_diff           — float
+        contrast_diff             — float
+        needs_color_match         — bool
+        severity                  — "high" | "medium" | "ok"
+    """
+    result: list[dict] = []
+    for i in range(1, len(color_timeline)):
+        prev = color_timeline[i - 1]
+        curr = color_timeline[i]
+        temp_diff     = abs(curr.get("temperature_k", 5500) - prev.get("temperature_k", 5500))
+        bright_diff   = abs(curr.get("brightness", 0.5)     - prev.get("brightness", 0.5))
+        contrast_diff = abs(curr.get("contrast", 1.0)       - prev.get("contrast", 1.0))
+        needs_match   = bool(temp_diff > 500 or bright_diff > 0.15 or contrast_diff > 0.2)
+        if temp_diff > 1000 or bright_diff > 0.3:
+            severity = "high"
+        elif needs_match:
+            severity = "medium"
+        else:
+            severity = "ok"
+        result.append({
+            "from_chunk":         i - 1,
+            "to_chunk":           i,
+            "temp_diff_k":        temp_diff,
+            "brightness_diff":    round(bright_diff, 3),
+            "contrast_diff":      round(contrast_diff, 3),
+            "needs_color_match":  needs_match,
+            "severity":           severity,
+        })
+    return result
 
 
 def estimate_noise(frame_bgr: np.ndarray) -> dict:
@@ -551,12 +777,12 @@ def analyze_chunk(
     if not frames:
         return {"error": "no frames extracted"}
 
-    exposures    = [analyze_exposure(f)     for f in frames]
-    contrasts    = [analyze_contrast(f)     for f in frames]
-    saturations  = [analyze_saturation(f)   for f in frames]
-    temperatures = [estimate_color_temperature(f) for f in frames]
-    noises       = [estimate_noise(f)        for f in frames]
-    skin_tones   = [detect_skin_tone(f)      for f in frames]
+    exposures    = [analyze_exposure(f)            for f in frames]
+    contrasts    = [analyze_contrast(f)            for f in frames]
+    saturations  = [analyze_saturation(f)          for f in frames]
+    temperatures = [estimate_color_temperature(f)  for f in frames]
+    noises       = [estimate_noise(f)              for f in frames]
+    skin_tones   = [_detect_skin_tone_frame(f)     for f in frames]
 
     # Use first frame for palette (representative enough)
     palette = extract_dominant_colors(frames[0])
@@ -594,19 +820,39 @@ def analyze_chunk(
     )
     grade = suggest_grade(exp_avg, {"level": con_level}, sat_avg, temp_avg)
 
+    # ── New editorial intelligence ────────────────────────────────────────────
+    waveform    = analyze_waveform(frames)
+    multi_skin  = detect_skin_tone(frames)
+
+    # Build a flat analysis dict for classify_mood / compute_grade_suggestions.
+    # temperature_k is the primary scalar key both functions expect.
+    flat_analysis = {
+        "brightness":    round(mean_luma, 3),
+        "contrast":      con_avg.get("ratio", 1.0),
+        "saturation":    sat_avg.get("mean", 0.5),
+        "temperature_k": temp_k,
+        "look":          look,
+    }
+    mood             = classify_mood(flat_analysis)
+    grade_suggestions = compute_grade_suggestions(flat_analysis)
+
     return {
         "color_analysis": {
-            "brightness":   round(mean_luma, 3),
-            "contrast":     con_avg,
-            "saturation":   sat_avg,
-            "temperature":  temp_avg,
-            "exposure":     exp_avg,
-            "noise":        noise_avg,
-            "skin_tone":    skin_avg,
-            "palette":      palette,
-            "look":         look,
-            "grade":        grade,
-            "ffmpeg_filter": build_ffmpeg_filter(grade),
+            "brightness":      round(mean_luma, 3),
+            "contrast":        con_avg,
+            "saturation":      sat_avg,
+            "temperature":     temp_avg,
+            "temperature_k":   temp_k,   # scalar alias for consistency functions
+            "exposure":        exp_avg,
+            "noise":           noise_avg,
+            "skin_tone":       multi_skin,
+            "palette":         palette,
+            "look":            look,
+            "grade":           grade,
+            "ffmpeg_filter":   build_ffmpeg_filter(grade),
+            "waveform":        waveform,
+            "mood":            mood,
+            "grade_suggestions": grade_suggestions,
         },
         "_color_ms": round((time.time() - t0) * 1000),
     }
