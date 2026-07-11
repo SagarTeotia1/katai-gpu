@@ -1,4 +1,12 @@
-.PHONY: up down logs build shell-backend shell-vllm restart clean test chat analyze parallel help
+.PHONY: up down logs build shell-backend shell-vllm restart clean test chat analyze parallel help \
+        pipeline pipeline-context pipeline-reindex pipeline-status \
+        transcribe transcribe-urls analyze-context index-context index-pinecone index-neo4j \
+        color-grade export-lut grade-apply emotion-arcs \
+        query retrieve edit edit2 direct \
+        install logs-vllm logs-backend logs-frontend \
+        video video-chunk video-fast video-semantic video-bench vision-bench \
+        cast-analysis whisper-up whisper-logs whisper-health \
+        neo4j-up neo4j-logs list-models status health-backend health-vllm gpu-info
 
 ifneq (,$(wildcard .env))
   include .env
@@ -196,14 +204,15 @@ analyze-context: ## Full semantic video context — usage: make analyze-context 
 		--chunks $(CHUNKS) \
 		--planner $(PLANNER)
 
-pipeline: ## ONE CMD — full pipeline: cast→transcript→context→index — usage: make pipeline CAST=cast.json [CHUNKS=8] [WORKERS=24] [WHISPER_WORKERS=0=auto]
+pipeline: ## ONE CMD — full pipeline: cast→transcript→context→index — usage: make pipeline CAST=cast.json [CHUNKS=8] [WORKERS=24] [PLANNER=semantic]
 	@python3 scripts/pipeline.py $(CAST) \
 		--backend http://localhost:$(BACKEND_PORT) \
 		--vllm http://localhost:$(VLLM_PORT)/v1/chat/completions \
 		--whisper http://localhost:$(WHISPER_PORT) \
 		--chunks $(CHUNKS) \
 		--workers $(WORKERS) \
-		--whisper-workers $(WHISPER_WORKERS)
+		--whisper-workers $(WHISPER_WORKERS) \
+		--planner $(PLANNER)
 
 pipeline-context: ## Skip cast+transcribe, run context+index only — usage: make pipeline-context CAST=cast.json
 	@python3 scripts/pipeline.py $(CAST) \
@@ -212,6 +221,7 @@ pipeline-context: ## Skip cast+transcribe, run context+index only — usage: mak
 		--vllm http://localhost:$(VLLM_PORT)/v1/chat/completions \
 		--whisper http://localhost:$(WHISPER_PORT) \
 		--chunks $(CHUNKS) \
+		--workers $(WORKERS) \
 		--planner $(PLANNER)
 
 pipeline-reindex: ## Re-run indexing only (skip all analysis) — usage: make pipeline-reindex CAST=cast.json
@@ -237,6 +247,111 @@ index-pinecone: ## Index to Pinecone only (skip Neo4j)
 
 index-neo4j: ## Index to Neo4j only (skip Pinecone)
 	@python3 scripts/index_context.py --no-pinecone $(FILES)
+
+color-grade: ## Generate per-scene color grade plan — usage: make color-grade CAST=cast.json [STYLE="Netflix documentary"]
+	@python3 - <<'EOF'
+import json, sys, os, glob
+from pathlib import Path
+style = os.environ.get("STYLE", "cinematic")
+files = sorted(glob.glob("output/context_*.json"), key=os.path.getmtime)
+if not files:
+    print("ERROR: no context_*.json in output/ — run make analyze-context first"); sys.exit(1)
+sys.path.insert(0, "scripts")
+import analyze_context as ac
+import urllib.request, json as _json
+for f in files:
+    ctx = json.loads(Path(f).read_text())
+    prompt = ac.build_color_grade_prompt(ctx, style_request=style)
+    payload = {"model": ac.MODEL_ID, "messages": [{"role":"system","content":prompt},{"role":"user","content":"/no_think\n\nGenerate the color grade plan."}], "max_tokens":4096, "temperature":0.0, "response_format":{"type":"json_object"}, "chat_template_kwargs":{"enable_thinking":False}}
+    req = urllib.request.Request(f"http://localhost:$(VLLM_PORT)/v1/chat/completions", data=_json.dumps(payload).encode(), headers={"Content-Type":"application/json"})
+    resp = _json.loads(urllib.request.urlopen(req, timeout=300).read())
+    raw = resp["choices"][0]["message"].get("content","")
+    out = Path("output") / f"color_grade_{Path(f).stem}_{ac.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    out.write_text(raw, encoding="utf-8")
+    print(f"  [{ctx.get('video_id','')}] color grade → {out}")
+EOF
+
+export-lut: ## Export .cube LUT for each color chunk — usage: make export-lut [SIZE=17]
+	@python3 - <<'EOF'
+import json, sys, glob, os
+from pathlib import Path
+sys.path.insert(0, "scripts")
+import color_analyzer as ca
+size = int(os.environ.get("SIZE", "17"))
+files = sorted(glob.glob("output/context_*.json"), key=os.path.getmtime)
+if not files:
+    print("ERROR: no context_*.json in output/ — run make analyze-context first"); sys.exit(1)
+for f in files:
+    ctx = json.loads(Path(f).read_text())
+    vid = ctx.get("video_id", "unknown")
+    for i, ct in enumerate(ctx.get("color_timeline", [])):
+        grade = ct.get("grade") or {}
+        if not grade.get("grade_needed", False):
+            continue
+        slug = f"{vid}_chunk{i:02d}_{ct.get('look','')}"
+        out  = str(Path("output") / f"grade_{slug}.cube")
+        lut_path = ca.export_lut(grade, lut_size=size, out_path=out, title=slug)
+        print(f"  [{vid} chunk{i}] LUT → {lut_path}  filter: {ca.build_ffmpeg_filter(grade)}")
+EOF
+
+grade-apply: ## Print ready ffmpeg commands to apply color grade — usage: make grade-apply VID="input.mp4"
+	@python3 - <<'EOF'
+import json, sys, glob, os
+from pathlib import Path
+sys.path.insert(0, "scripts")
+import color_analyzer as ca
+vid_input = os.environ.get("VID", "")
+if not vid_input:
+    print("ERROR: specify VID=input.mp4"); sys.exit(1)
+files = sorted(glob.glob("output/context_*.json"), key=os.path.getmtime)
+if not files:
+    print("ERROR: no context_*.json in output/ — run make analyze-context first"); sys.exit(1)
+ctx = json.loads(Path(files[-1]).read_text())
+color_tl = ctx.get("color_timeline", [])
+if not color_tl:
+    print("No color_timeline found — re-run make analyze-context with opencv installed"); sys.exit(1)
+print(f"\n# Color grade ffmpeg commands for: {ctx.get('video_id', 'unknown')}")
+print(f"# Input: {vid_input}\n")
+for i, ct in enumerate(color_tl):
+    grade = ct.get("grade") or {}
+    vf = ca.build_ffmpeg_filter(grade)
+    t_start = ct.get("start", 0)
+    t_end   = ct.get("end", 0)
+    look    = ct.get("look", "unknown")
+    needed  = grade.get("grade_needed", False)
+    flag    = "GRADE NEEDED" if needed else "ok"
+    print(f"# Chunk {i}: {t_start:.1f}s-{t_end:.1f}s  look={look}  [{flag}]")
+    if needed:
+        stem = Path(vid_input).stem
+        print(f'ffmpeg -ss {t_start:.1f} -to {t_end:.1f} -i "{vid_input}" -vf "{vf}" -c:a copy output/graded_{stem}_chunk{i:02d}.mp4')
+    print()
+EOF
+
+emotion-arcs: ## Print per-speaker emotion intensity arcs — usage: make emotion-arcs [FILES="output/context_*.json"]
+	@python3 - <<'EOF'
+import json, sys, glob
+from pathlib import Path
+files = sorted(glob.glob("output/context_*.json"), key=lambda p: Path(p).stat().st_mtime)
+if not files:
+    print("ERROR: no context_*.json in output/"); sys.exit(1)
+for f in files:
+    ctx  = json.loads(Path(f).read_text())
+    vid  = ctx.get("video_id", "unknown")
+    arcs = ctx.get("emotion_arcs") or {}
+    if not arcs:
+        print(f"[{vid}] No emotion_arcs — re-index after re-running analyze-context"); continue
+    print(f"\n[{vid}] Per-speaker emotion intensity (30s windows):")
+    for pid, windows in sorted(arcs.items()):
+        if not windows:
+            print(f"  {pid}: no windows"); continue
+        peak = max(windows, key=lambda w: w.get("peak_intensity", 0))
+        print(f"  {pid}: peak at {peak['t_start']:.0f}s (intensity={peak['peak_intensity']:.2f}, laughs={peak['laugh_count']})")
+        bar = ""
+        for w in windows:
+            lvl = w.get("mean_intensity", 0)
+            bar += "█" if lvl > 0.7 else "▓" if lvl > 0.4 else "░" if lvl > 0.1 else " "
+        print(f"    arc: [{bar}] (each char = 30s)")
+EOF
 
 query: ## Natural language Q&A over indexed video — usage: make query Q="who laughed hardest and when"
 	@python3 scripts/query_context.py "$(Q)" --vllm http://localhost:$(VLLM_PORT)/v1/chat/completions

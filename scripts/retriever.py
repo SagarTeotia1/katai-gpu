@@ -53,7 +53,7 @@ NEO4J_URI        = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER       = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD   = os.getenv("NEO4J_PASSWORD", "katai_neo4j_2026")
 VLLM_URL         = os.getenv("VLLM_URL", "http://localhost:8000")
-EMBED_MODEL      = "llama-text-embed-v2"
+EMBED_MODEL      = os.getenv("EMBED_MODEL", "llama-text-embed-v2")
 
 # Per-entity_type top-k budget for the fan-out search passes
 _SEARCH_BUDGET = {
@@ -160,7 +160,8 @@ class EditingSearcher:
                 }
                 for m in resp.matches
             ]
-        except Exception:
+        except Exception as exc:
+            print(f"  [pinecone] warn — search failed ({type(exc).__name__}): {exc}", file=sys.stderr, flush=True)
             return []
 
     # ── fan-out across all namespaces for one entity_type ─────────────────────
@@ -294,29 +295,32 @@ class TemporalEnricher:
         Return prev/next Event linked by NEXT relationships for the given event.
         Falls back to empty dicts if no neighbor exists.
         """
+        # Composite id is "{video_id}_{event_id}" — use prefix check, not underscore presence,
+        # so short IDs like "hook_01" or "reaction_003" are correctly reconstructed.
+        composite = event_id if event_id.startswith(f"{video_id}_") else f"{video_id}_{event_id}"
         # Next neighbor
         next_rows = self._run(
             """
-            MATCH (e:Event {event_id: $eid, video_id: $vid})-[:NEXT]->(nxt:Event)
-            RETURN nxt.event_id AS event_id,
+            MATCH (e:Event {id: $eid, video_id: $vid})-[:NEXT]->(nxt:Event)
+            RETURN nxt.id AS event_id,
                    nxt.start    AS start,
                    nxt.end      AS end,
                    nxt.moment   AS moment
             LIMIT 1
             """,
-            {"eid": event_id, "vid": video_id},
+            {"eid": composite, "vid": video_id},
         )
         # Previous neighbor
         prev_rows = self._run(
             """
-            MATCH (prev:Event)-[:NEXT]->(e:Event {event_id: $eid, video_id: $vid})
-            RETURN prev.event_id AS event_id,
+            MATCH (prev:Event)-[:NEXT]->(e:Event {id: $eid, video_id: $vid})
+            RETURN prev.id AS event_id,
                    prev.start    AS start,
                    prev.end      AS end,
                    prev.moment   AS moment
             LIMIT 1
             """,
-            {"eid": event_id, "vid": video_id},
+            {"eid": composite, "vid": video_id},
         )
 
         def _row_to_dict(rows: list) -> dict | None:
@@ -335,6 +339,55 @@ class TemporalEnricher:
             "next": _row_to_dict(next_rows),
         }
 
+    def get_narrative_chain(self, event_ids: list[str], depth: int = 2) -> dict[str, dict]:
+        """
+        For a list of event IDs, return their narrative dependencies and dependents.
+        Returns {event_id: {"role": str, "depends_on": [event_id], "enables": [event_id], "link_types": [str]}}
+        """
+        if not event_ids:
+            return {}
+        result = {}
+        for eid in event_ids:
+            try:
+                records = self._run("""
+                    MATCH (e:Event {id: $eid})
+                    OPTIONAL MATCH (e)-[r:NARRATIVE_LINK]->(dep:Event)
+                    OPTIONAL MATCH (upstream:Event)-[r2:NARRATIVE_LINK]->(e)
+                    RETURN
+                      e.narrative_role AS role,
+                      e.edit_keep AS edit_keep,
+                      e.comedy_structure AS comedy_structure,
+                      collect(DISTINCT {id: dep.id, type: r.type}) AS depends_on,
+                      collect(DISTINCT {id: upstream.id, type: r2.type}) AS enables
+                """, {"eid": eid})
+                if records:
+                    row = records[0]
+                    result[eid] = {
+                        "role":            row.get("role") or "",
+                        "edit_keep":       row.get("edit_keep", True),
+                        "comedy_structure": row.get("comedy_structure") or "none",
+                        "depends_on":      [x for x in (row.get("depends_on") or []) if x.get("id")],
+                        "enables":         [x for x in (row.get("enables") or []) if x.get("id")],
+                    }
+            except Exception as exc:
+                print(f"  [neo4j] warn — narrative chain for {eid}: {exc}", file=sys.stderr, flush=True)
+        return result
+
+    def get_broll_candidates(self, video_id: str, limit: int = 20) -> list[dict]:
+        """Return events flagged as broll_usable=true for a given video."""
+        try:
+            records = self._run("""
+                MATCH (e:Event {video_id: $vid, broll_usable: true})
+                RETURN e.id AS id, e.start AS start, e.end AS end,
+                       e.shot_type AS shot_type, e.moment AS moment,
+                       e.importance_score AS importance_score
+                ORDER BY e.importance_score DESC
+                LIMIT $limit
+            """, {"vid": video_id, "limit": limit})
+            return [dict(r) for r in records]
+        except Exception:
+            return []
+
     def enrich_batch(self, events: list[dict]) -> dict[str, dict]:
         """
         Returns {event_id: neighbors_dict} for all events that have a neo4j id.
@@ -344,8 +397,10 @@ class TemporalEnricher:
             eid = ev.get("event_id") or ev.get("id", "")
             vid = ev.get("video_id", "")
             if not eid or not vid:
+                print(f"  [neo4j] warn — enrich_batch skip: missing eid={eid!r} vid={vid!r}", file=sys.stderr, flush=True)
                 continue
             try:
+                # get_neighbors accepts either short or composite ID — it resolves internally
                 result[eid] = self.get_neighbors(eid, vid)
             except Exception as exc:
                 print(
@@ -466,57 +521,75 @@ def retrieve(
         file=sys.stderr, flush=True,
     )
 
-    # ── Step 4: Neo4j temporal enrichment ──────────────────────────────────────
+    # ── Step 4: Neo4j temporal + narrative enrichment (single connection) ─────
     neighbors_map: dict[str, dict] = {}
 
-    if not skip_graph and raw_events:
-        if not HAS_NEO4J:
-            print(
-                "  [neo4j] skipping — package not installed "
-                "(pip install neo4j to enable)",
-                file=sys.stderr, flush=True,
-            )
-        elif not NEO4J_URI:
-            print(
-                "  [neo4j] skipping — NEO4J_URI not configured",
-                file=sys.stderr, flush=True,
-            )
-        else:
-            print(
-                f"  [neo4j] enriching {len(raw_events)} events with neighbors ...",
-                file=sys.stderr, flush=True,
-            )
-            try:
-                enricher = TemporalEnricher()
-                # Build lightweight event dicts for the enricher (only needs ids)
-                slim = [
-                    {
-                        "event_id": h["metadata"].get("event_id") or h["id"],
-                        "video_id": h["metadata"].get("video_id", ""),
-                    }
-                    for h in raw_events
-                ]
-                neighbors_map = enricher.enrich_batch(slim)
-                enricher.close()
-                print(
-                    f"  [neo4j] {len(neighbors_map)} events enriched",
-                    file=sys.stderr, flush=True,
-                )
-            except Exception as exc:
-                print(
-                    f"  [neo4j] failed (continuing without graph): {exc}",
-                    file=sys.stderr, flush=True,
-                )
+    if skip_graph:
+        print("  [neo4j] skipped (--no-graph)", file=sys.stderr, flush=True)
+    elif not raw_events:
+        pass
+    elif not HAS_NEO4J:
+        print(
+            "  [neo4j] skipping — package not installed "
+            "(pip install neo4j to enable)",
+            file=sys.stderr, flush=True,
+        )
+    elif not NEO4J_URI:
+        print(
+            "  [neo4j] skipping — NEO4J_URI not configured",
+            file=sys.stderr, flush=True,
+        )
     else:
-        if skip_graph:
-            print("  [neo4j] skipped (--no-graph)", file=sys.stderr, flush=True)
+        print(
+            f"  [neo4j] enriching {len(raw_events)} events (neighbors + narrative) ...",
+            file=sys.stderr, flush=True,
+        )
+        try:
+            enricher = TemporalEnricher()
+
+            # 4a: temporal neighbors
+            slim = [
+                {
+                    "event_id": h["metadata"].get("event_id") or h["id"],
+                    "video_id": h["metadata"].get("video_id", ""),
+                    "id":       h["id"],  # composite Pinecone vector ID as fallback
+                }
+                for h in raw_events
+            ]
+            neighbors_map = enricher.enrich_batch(slim)
+            print(
+                f"  [neo4j] {len(neighbors_map)} events enriched with neighbors",
+                file=sys.stderr, flush=True,
+            )
+
+            # 4b: narrative chains — use composite Pinecone vector id (matches Neo4j Event.id)
+            event_ids = [h.get("id", "") for h in raw_events]
+            narrative_map = enricher.get_narrative_chain([eid for eid in event_ids if eid])
+            for ev in raw_events:
+                eid = ev.get("id", "")
+                if eid in narrative_map:
+                    ev["narrative"] = narrative_map[eid]
+            print(
+                f"  [neo4j] {len(narrative_map)} events with narrative chains",
+                file=sys.stderr, flush=True,
+            )
+
+            enricher.close()
+        except Exception as exc:
+            print(
+                f"  [neo4j] failed (continuing without graph): {exc}",
+                file=sys.stderr, flush=True,
+            )
 
     # ── Step 5: Build output ───────────────────────────────────────────────────
     events_out: list[dict] = []
     for rank, hit in enumerate(raw_events, start=1):
         eid = hit["metadata"].get("event_id") or hit["id"]
         nb  = neighbors_map.get(eid)
-        events_out.append(_build_event(rank, hit, nb))
+        ev_dict = _build_event(rank, hit, nb)
+        if "narrative" in hit:
+            ev_dict["narrative"] = hit["narrative"]
+        events_out.append(ev_dict)
 
     clips_out: list[dict] = []
     for rank, hit in enumerate(raw_clips, start=1):
@@ -543,7 +616,7 @@ def main():
         )
     )
     parser.add_argument(
-        "--query", "-q", required=True,
+        "--query", "-q", required=False, default=None,
         help='Natural language editing query, e.g. "energetic hook moment"',
     )
     parser.add_argument(
@@ -574,7 +647,33 @@ def main():
         "--no-graph", action="store_true",
         help="Skip Neo4j temporal enrichment (Pinecone only)",
     )
+    parser.add_argument(
+        "--broll", action="store_true",
+        help="List b-roll candidates instead of query",
+    )
     args = parser.parse_args()
+
+    # ── B-roll listing mode ────────────────────────────────────────────────────
+    if args.broll:
+        if not HAS_NEO4J or not NEO4J_URI:
+            print("ERROR: Neo4j required for b-roll listing (--no-graph not supported)")
+            sys.exit(1)
+        try:
+            neo4j_client = TemporalEnricher()
+        except Exception as exc:
+            print(f"ERROR: Neo4j required for b-roll listing (--no-graph not supported)")
+            sys.exit(1)
+        video_id = args.video or ""
+        candidates = neo4j_client.get_broll_candidates(video_id, limit=30)
+        neo4j_client.close()
+        print(f"\nB-roll candidates ({len(candidates)}):")
+        for c in candidates:
+            print(f"  [{c.get('start',0):.1f}s-{c.get('end',0):.1f}s] {c.get('shot_type','')} — {c.get('moment','')}")
+        sys.exit(0)
+
+    # ── Require --query for non-broll mode ─────────────────────────────────────
+    if not args.query:
+        parser.error("--query / -q is required unless --broll is specified")
 
     # ── Validate Pinecone prerequisites early ──────────────────────────────────
     if not HAS_PINECONE:

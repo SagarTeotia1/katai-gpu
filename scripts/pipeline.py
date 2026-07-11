@@ -410,7 +410,7 @@ def main() -> None:
         "semantic": (
             cyan("semantic") + "  ←  signal-weighted variable-length events\n"
             "              Signals: scene_cut(5) speaker(5) topic(5) silence(4) density(3) motion(2)\n"
-            "              Profiles: " + red("HIGH") + f"(4096tok)  " + yellow("MEDIUM") + f"(2048tok)  " + dim("LOW") + "(512tok)\n"
+            "              Profiles: " + red("HIGH") + f"(4096tok)  " + yellow("MEDIUM") + f"(2048tok)  " + dim("LOW") + "(1024tok)\n"
             f"              ~{magenta('60%')} fewer tokens vs all-HIGH  |  every event analyzed"
         ),
         "scene":  dim("scene   — PySceneDetect content-aware cut boundaries"),
@@ -430,8 +430,8 @@ def main() -> None:
         (3, "Index → Pinecone + Neo4j", args.no_index,   est_index),
     ]
     if not both_parallel:
-        steps_info.insert(1, (2, "Whisper Transcription", args.skip_transcribe is not None, est_trans))
-        steps_info = [(n if n < 2 else n+1, *rest) for n, *rest in steps_info[1:]]
+        # Renumber existing steps to make room for separate Whisper row
+        steps_info = [(n if n < 2 else n+1, *rest) for n, *rest in steps_info]
         steps_info.insert(1, (2, "Whisper Transcription", args.skip_transcribe is not None, est_trans))
 
     for num, name, skipped, est in steps_info:
@@ -562,7 +562,7 @@ def main() -> None:
         if planner == "semantic":
             print(f"  {cyan('Planner:')} SemanticEventBuilder", flush=True)
             print(f"    Signals fuse → variable-length events → tiered VLM budgets", flush=True)
-            print(f"    {red('HIGH')}(4096tok) {yellow('MEDIUM')}(2048tok) {dim('LOW')}(512tok) — every event analyzed", flush=True)
+            print(f"    {red('HIGH')}(4096tok) {yellow('MEDIUM')}(2048tok) {dim('LOW')}(1024tok) — every event analyzed", flush=True)
         elif planner == "scene":
             print(f"  {cyan('Planner:')} scene-aligned (PySceneDetect + equal-width)", flush=True)
         else:

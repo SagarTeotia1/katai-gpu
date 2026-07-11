@@ -29,7 +29,7 @@ Score thresholds:
   ≥ 7   → HIGH profile  (lowered from 9: scene_cuts=None caps max score at ~8)
 
 Processing profiles (control the full analysis strategy, not just token count):
-  LOW    — 512 tok  | few frames    | quick template    | minimal reasoning
+  LOW    — 1024 tok | few frames    | quick template    | minimal reasoning
   MEDIUM — 2048 tok | moderate frames | rich template   | standard reasoning
   HIGH   — 4096 tok | many frames   | full template     | deep reasoning
 
@@ -83,7 +83,7 @@ class ProcessingProfile:
 PROFILES: dict[str, ProcessingProfile] = {
     "LOW": ProcessingProfile(
         name="LOW",
-        max_tokens=512,
+        max_tokens=1024,
         frames_hint="few",
         prompt_template="quick",
         reasoning_depth="minimal",

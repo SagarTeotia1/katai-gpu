@@ -72,23 +72,38 @@ def build_event_text(event: dict, video_id: str, person_map: dict) -> str:
         f"{person_map.get(r.get('person_id',''), r.get('person_id','?'))} {r.get('reaction','')}"
         for r in event.get("listener_reactions", [])
     )
-    er  = event.get("editing_reasoning") or {}
-    aud = event.get("audio") or {}
-    bl  = event.get("body_language") or {}
-    bl_summary = " | ".join(
-        f"{pid}: {d.get('facial','')} {d.get('gesture','')}"
-        for pid, d in bl.items() if isinstance(d, dict)
+    expressions = " ".join(
+        f"{person_map.get(x.get('person_id',''), x.get('person_id','?'))} {x.get('expression','')}"
+        for x in event.get("expressions", [])
     )
+    actions = " ".join(
+        f"{person_map.get(a.get('person_id',''), a.get('person_id','?'))} {a.get('action','')}"
+        for a in event.get("physical_actions", [])
+    )
+    vtags   = " ".join(event.get("visual_tags") or [])
+    cam     = event.get("camera") or {}
+    ct      = event.get("comedy_timing") or {}
+    scores  = event.get("scores") or {}
+    eh      = event.get("edit_hints") or {}
+    ae      = event.get("audio_energy") or {}
     return (
         f"Video:{video_id} Time:{event.get('start',0):.2f}s-{event.get('end',0):.2f}s "
-        f"Type:{event.get('type','')} Emotion:{event.get('emotion','')} Topic:{event.get('topic','')}\n"
+        f"Type:{event.get('type','')} Shot:{cam.get('shot_type','')} Motion:{cam.get('motion','')}\n"
         f"Speaker:{speaker_name}\n"
-        f"What happens: {event.get('description','')}\n"
+        f"What happens: {event.get('moment','')}\n"
         f"Said: \"{event.get('transcript_text','')}\"\n"
         f"Reactions: {reactions}\n"
-        f"Body language: {bl_summary}\n"
-        f"Audio: {aud.get('type','')} — {aud.get('notable','')}\n"
-        f"Why it matters: {er.get('why','')} | Hook: {er.get('hook','')}"
+        f"Expressions: {expressions}\n"
+        f"Actions: {actions}\n"
+        f"Visual tags: {vtags}\n"
+        f"Eye contact: {cam.get('eye_contact','')}\n"
+        f"Comedy: {ct.get('structure','')} pause:{ct.get('pause_duration_s',0):.1f}s\n"
+        f"B-roll usable: {event.get('broll_usable',False)}\n"
+        f"Audio: level={ae.get('level','')} speech={ae.get('speech_rate','')} "
+        f"laugh={'yes' if ae.get('laugh_detected') else 'no'} silence_before={ae.get('silence_before_s',0):.1f}s\n"
+        f"Emotion: intensity={scores.get('emotion_intensity',0):.2f} contagion={'yes' if scores.get('emotion_contagion') else 'no'}\n"
+        f"Why it matters: {scores.get('importance_reason','')} | importance:{scores.get('importance',0)}\n"
+        f"Edit: keep={eh.get('keep',True)} speed={eh.get('speed','1x')} transition={eh.get('transition','cut')} caption={eh.get('caption_suggestion','')}"
     ).strip()
 
 
@@ -184,7 +199,6 @@ def build_person_text(person: dict, video_id: str) -> str:
 def build_world_state_text(ws: dict, video_id: str) -> str:
     loops = ws.get("open_loops") or []
     cbs   = ws.get("callbacks") or []
-    # stored as json.dumps string in Neo4j; raw list in context JSON
     if isinstance(loops, str):
         try:
             loops = json.loads(loops)
@@ -195,10 +209,16 @@ def build_world_state_text(ws: dict, video_id: str) -> str:
             cbs = json.loads(cbs)
         except Exception:
             cbs = [cbs] if cbs else []
+    energy = ws.get("energy", "")
+    if isinstance(energy, dict):
+        energy = (
+            f"overall={energy.get('overall','?')} visual={energy.get('visual','?')} "
+            f"audio={energy.get('audio','?')} conv={energy.get('conversation','?')}"
+        )
     return (
         f"Video:{video_id} World State Time:{_f(ws.get('start')):.1f}s-{_f(ws.get('end')):.1f}s\n"
         f"Story stage:{ws.get('story_stage','')} Emotion:{ws.get('scene_emotion','')} "
-        f"Energy:{ws.get('energy','')} Topic:{ws.get('current_topic','')}\n"
+        f"Energy:{energy} Topic:{ws.get('current_topic','')}\n"
         f"Open loops: {'; '.join(str(l) for l in loops)}\n"
         f"Callbacks/recurring: {'; '.join(str(c) for c in cbs)}"
     ).strip()
@@ -302,6 +322,24 @@ class PineconeIndexer:
                     "importance_score": _f(s.get("importance")),
                     "should_keep":      bool(er.get("should_keep", True) if isinstance(er, dict) else True),
                     "depends_on":       json.dumps(ev.get("depends_on", [])),
+                    "shot_type":        _safe_str((ev.get("camera") or {}).get("shot_type", "")),
+                    "camera_motion":    _safe_str((ev.get("camera") or {}).get("motion", "")),
+                    "eye_contact":      bool((ev.get("camera") or {}).get("eye_contact", False)),
+                    "broll_usable":     bool(ev.get("broll_usable", False)),
+                    "visual_tags":      json.dumps(ev.get("visual_tags") or []),
+                    "importance_reason": _safe_str((ev.get("scores") or {}).get("importance_reason", ""), 200),
+                    "edit_keep":        bool((ev.get("edit_hints") or {}).get("keep", True)),
+                    "edit_speed":       _safe_str((ev.get("edit_hints") or {}).get("speed", "1x")),
+                    "edit_transition":  _safe_str((ev.get("edit_hints") or {}).get("transition", "cut")),
+                    "edit_caption":     _safe_str((ev.get("edit_hints") or {}).get("caption_suggestion", ""), 200),
+                    "comedy_structure": _safe_str((ev.get("comedy_timing") or {}).get("structure", "none")),
+                    "audio_level":      _safe_str((ev.get("audio_energy") or {}).get("level", "")),
+                    "speech_rate":      _safe_str((ev.get("audio_energy") or {}).get("speech_rate", "")),
+                    "laugh_detected":   bool((ev.get("audio_energy") or {}).get("laugh_detected", False)),
+                    "audio_quality":    _safe_str((ev.get("audio_energy") or {}).get("audio_quality", "")),
+                    "silence_before_s": _f((ev.get("audio_energy") or {}).get("silence_before_s", 0)),
+                    "emotion_intensity": _f((ev.get("scores") or {}).get("emotion_intensity", 0)),
+                    "emotion_contagion": bool((ev.get("scores") or {}).get("emotion_contagion", False)),
                 },
             })
 
@@ -402,20 +440,78 @@ class PineconeIndexer:
             })
 
         # Person descriptions (1 vector per person — answers "who is X")
+        emotion_arcs = ctx.get("emotion_arcs") or {}
         for p in known_people:
             if p.get("display_name") or p.get("role_in_video") or p.get("appearance"):
-                pid = p["person_id"]
+                pid  = p["person_id"]
+                arc  = emotion_arcs.get(pid, [])
+                # Build arc summary string for semantic search
+                arc_text = ""
+                if arc:
+                    peak_window = max(arc, key=lambda w: w.get("peak_intensity", 0))
+                    arc_text = (
+                        f"Emotion arc: peak at {peak_window['t_start']:.0f}s-{peak_window['t_end']:.0f}s "
+                        f"(intensity={peak_window['peak_intensity']:.2f} laughs={peak_window['laugh_count']}). "
+                        f"Windows: " + " ".join(
+                            f"[{w['t_start']:.0f}s mean={w['mean_intensity']:.2f}"
+                            f"{' laugh' if w['laugh_count'] else ''}]"
+                            for w in arc
+                        )
+                    )
                 records.append({
                     "id": f"{video_id}_person_{pid}",
-                    "text": build_person_text(p, video_id),
+                    "text": build_person_text(p, video_id) + ("\n" + arc_text if arc_text else ""),
+                    "metadata": {
+                        "video_id":          video_id,
+                        "entity_type":       "person",
+                        "person_id":         _safe_str(pid),
+                        "person_name":       _safe_str(p.get("display_name", pid)),
+                        "role":              _safe_str(p.get("role_in_video"), 200),
+                        "screen_time_s":     float(p.get("screen_time_s") or 0),
+                        "speaking_time_s":   float(p.get("speaking_time_s") or 0),
+                        "emotion_arc_peaks": json.dumps([
+                            {"t": w["t_start"], "mean": w["mean_intensity"], "peak": w["peak_intensity"]}
+                            for w in arc if w.get("mean_intensity", 0) > 0
+                        ]),
+                        "total_laughs":      sum(w.get("laugh_count", 0) for w in arc),
+                        "mean_emotion":      round(
+                            sum(w["mean_intensity"] for w in arc) / len(arc), 3
+                        ) if arc else 0.0,
+                        "peak_emotion":      round(
+                            max((w["peak_intensity"] for w in arc), default=0.0), 3
+                        ),
+                    },
+                })
+
+        # Emotion arc windows — answer "when was Samay most emotional?" per window
+        for pid, arc in emotion_arcs.items():
+            person_name = next(
+                (p.get("display_name", pid) for p in known_people if p["person_id"] == pid),
+                pid,
+            )
+            for i, w in enumerate(arc):
+                if w.get("mean_intensity", 0) < 0.05:
+                    continue  # skip flat windows — not searchable
+                records.append({
+                    "id": f"{video_id}_arc_{pid}_{i:04d}",
+                    "text": (
+                        f"Video:{video_id} Person:{person_name} "
+                        f"Time:{w['t_start']:.0f}s-{w['t_end']:.0f}s\n"
+                        f"Emotion intensity: mean={w['mean_intensity']:.2f} "
+                        f"peak={w['peak_intensity']:.2f} events={w['event_count']} "
+                        f"laughs={w['laugh_count']}"
+                    ),
                     "metadata": {
                         "video_id":       video_id,
-                        "entity_type":    "person",
+                        "entity_type":    "emotion_arc",
                         "person_id":      _safe_str(pid),
-                        "person_name":    _safe_str(p.get("display_name", pid)),
-                        "role":           _safe_str(p.get("role_in_video"), 200),
-                        "screen_time_s":  float(p.get("screen_time_s") or 0),
-                        "speaking_time_s": float(p.get("speaking_time_s") or 0),
+                        "person_name":    _safe_str(person_name),
+                        "start":          _f(w["t_start"]),
+                        "end":            _f(w["t_end"]),
+                        "mean_intensity": _f(w["mean_intensity"]),
+                        "peak_intensity": _f(w["peak_intensity"]),
+                        "event_count":    int(w["event_count"]),
+                        "laugh_count":    int(w["laugh_count"]),
                     },
                 })
 
@@ -452,6 +548,68 @@ class PineconeIndexer:
                 },
             })
 
+        # Color timeline (answer "find underexposed scenes", "where is white balance warm")
+        for i, ct in enumerate(ctx.get("color_timeline", [])):
+            palette_str = " ".join(ct.get("palette") or [])
+            grade = ct.get("grade") or {}
+            ffmpeg_filter = _safe_str(ct.get("ffmpeg_filter", "null"), 500)
+            records.append({
+                "id": f"{video_id}_color_{i:04d}",
+                "text": (
+                    f"Video:{video_id} Color Scene {i+1} "
+                    f"Time:{ct.get('start',0):.1f}s-{ct.get('end',0):.1f}s\n"
+                    f"Look:{ct.get('look','')} Temperature:{ct.get('temp_label','')} "
+                    f"({ct.get('temp_k',0)}K) Brightness:{ct.get('brightness',0):.2f} "
+                    f"Saturation:{ct.get('saturation',0):.2f} "
+                    f"Exposure:{ct.get('exposure_status','')}\n"
+                    f"Palette: {palette_str}\n"
+                    f"Grade needed:{grade.get('grade_needed',False)} "
+                    f"Filter:{ffmpeg_filter}"
+                ).strip(),
+                "metadata": {
+                    "video_id":       video_id,
+                    "entity_type":    "color_scene",
+                    "start":          _f(ct.get("start")),
+                    "end":            _f(ct.get("end")),
+                    "look":           _safe_str(ct.get("look")),
+                    "temp_k":         _f(ct.get("temp_k")),
+                    "temp_label":     _safe_str(ct.get("temp_label")),
+                    "brightness":     _f(ct.get("brightness")),
+                    "saturation":     _f(ct.get("saturation")),
+                    "exposure_status": _safe_str(ct.get("exposure_status")),
+                    "grade_needed":   bool(grade.get("grade_needed", False)),
+                    "palette":        json.dumps(ct.get("palette") or []),
+                    "ffmpeg_filter":  ffmpeg_filter,
+                },
+            })
+
+        # Edit sequence entries — the final cut ordered list
+        for seq_item in ctx.get("edit_sequence", []):
+            records.append({
+                "id": f"{video_id}_seq_{seq_item.get('seq',0):04d}",
+                "text": (
+                    f"Video:{video_id} EditSequence seq={seq_item.get('seq')} "
+                    f"Event:{seq_item.get('event_id','')} Action:{seq_item.get('action','keep')}\n"
+                    f"Time:{seq_item.get('source_start',0):.1f}s-{seq_item.get('source_end',0):.1f}s "
+                    f"Speed:{seq_item.get('speed','1x')} Transition:{seq_item.get('transition_in','cut')}\n"
+                    f"Caption:{seq_item.get('caption','')}\n"
+                    f"Why:{seq_item.get('reason','')}"
+                ).strip(),
+                "metadata": {
+                    "video_id":      video_id,
+                    "entity_type":   "edit_sequence",
+                    "seq":           int(seq_item.get("seq", 0)),
+                    "event_id":      _safe_str(seq_item.get("event_id","")),
+                    "action":        _safe_str(seq_item.get("action","keep")),
+                    "start":         _f(seq_item.get("source_start")),
+                    "end":           _f(seq_item.get("source_end")),
+                    "speed":         _safe_str(seq_item.get("speed","1x")),
+                    "caption":       _safe_str(seq_item.get("caption",""), 200),
+                    "transition":    _safe_str(seq_item.get("transition_in","cut")),
+                    "reason":        _safe_str(seq_item.get("reason",""), 200),
+                },
+            })
+
         self.upsert(records, namespace=video_id)
         return len(records)
 
@@ -483,17 +641,40 @@ class Neo4jGraphBuilder:
             # WorldState: composite uniqueness on (video_id, start) prevents duplicate
             # nodes when the same context file is re-indexed.
             "CREATE CONSTRAINT IF NOT EXISTS FOR (ws:WorldState) REQUIRE (ws.video_id, ws.start) IS NODE KEY",
+            "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.id)",
             "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.start)",
             "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.clip_worthy)",
             "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.clip_score)",
             "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.video_id)",
             "CREATE INDEX IF NOT EXISTS FOR (ws:WorldState) ON (ws.video_id)",
+            "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.broll_usable)",
+            "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.shot_type)",
+            "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.comedy_structure)",
+            "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.edit_keep)",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (vt:VisualTag) REQUIRE vt.name IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (cs:ColorScene) REQUIRE cs.id IS UNIQUE",
+            "CREATE INDEX IF NOT EXISTS FOR (cs:ColorScene) ON (cs.video_id)",
+            "CREATE INDEX IF NOT EXISTS FOR (cs:ColorScene) ON (cs.grade_needed)",
+            "CREATE INDEX IF NOT EXISTS FOR (cs:ColorScene) ON (cs.look)",
+            "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.laugh_detected)",
+            "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.audio_level)",
+            "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.emotion_intensity)",
+            "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.emotion_contagion)",
+            "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.event_id)",
+            "CREATE INDEX IF NOT EXISTS FOR (e:Event) ON (e.video_id)",
+            "CREATE INDEX IF NOT EXISTS FOR (p:Person) ON (p.mean_emotion)",
+            "CREATE INDEX IF NOT EXISTS FOR (p:Person) ON (p.peak_emotion)",
+            "CREATE INDEX IF NOT EXISTS FOR (p:Person) ON (p.video_id)",
+            "CREATE INDEX IF NOT EXISTS FOR (c:Clip) ON (c.video_id)",
+            "CREATE INDEX IF NOT EXISTS FOR (s:Scene) ON (s.video_id)",
+            "CREATE INDEX IF NOT EXISTS FOR (cs:ColorScene) ON (cs.start)",
+            "CREATE INDEX IF NOT EXISTS FOR (cs:ColorScene) ON (cs.end)",
         ]
         for s in stmts:
             try:
                 self._run(s)
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"  [neo4j] warn — schema stmt failed: {exc}\n    {s[:120]}", flush=True)
 
     def index_context(self, ctx: dict) -> int:
         video_id     = ctx.get("video_id", "unknown")
@@ -525,10 +706,17 @@ class Neo4jGraphBuilder:
               "ctx": meta.get("overall_context","")})
         count += 1
 
+        # Per-speaker emotion arcs from merged output
+        emotion_arcs = ctx.get("emotion_arcs") or {}
+
         # Person nodes — iterate only dict entries (guard against plain-string IDs
         # that chunks emit in active_people before synthesis).
         for p in known_people:
             app = p.get("appearance") or {}
+            pid = p["person_id"]
+            arc = emotion_arcs.get(pid, [])
+            mean_em = round(sum(w["mean_intensity"] for w in arc) / len(arc), 3) if arc else 0.0
+            peak_em = round(max((w["peak_intensity"] for w in arc), default=0.0), 3)
             self._run("""
                 MERGE (p:Person {id:$id})
                 SET p.name=$name, p.role=$role,
@@ -536,10 +724,13 @@ class Neo4jGraphBuilder:
                     p.facial_hair=$facial_hair,
                     p.accessories=$accessories,
                     p.screen_time_s=$screen, p.speaking_time_s=$speak,
-                    p.mood_arc=$mood, p.voice=$voice
+                    p.mood_arc=$mood, p.voice=$voice,
+                    p.emotion_arc=$emotion_arc,
+                    p.mean_emotion=$mean_em,
+                    p.peak_emotion=$peak_em
                 WITH p MATCH (v:Video {id:$vid})
                 MERGE (p)-[:APPEARS_IN]->(v)
-            """, {"id": p["person_id"], "name": p.get("display_name",""),
+            """, {"id": pid, "name": p.get("display_name",""),
                   "role": p.get("role_in_video",""),
                   "clothing": _safe_str(app.get("clothing")),
                   "hair": _safe_str(app.get("hair")),
@@ -549,6 +740,9 @@ class Neo4jGraphBuilder:
                   "speak": float(p.get("speaking_time_s") or 0),
                   "mood": _safe_str(p.get("mood_arc")),
                   "voice": _safe_str(p.get("voice_characteristics")),
+                  "emotion_arc": json.dumps(arc),
+                  "mean_em": mean_em,
+                  "peak_em": peak_em,
                   "vid": video_id})
             count += 1
 
@@ -586,28 +780,49 @@ class Neo4jGraphBuilder:
                 MERGE (e:Event {id:$id})
                 SET e.event_id=$eid, e.video_id=$vid,
                     e.start=$start, e.end=$end,
-                    e.type=$type, e.description=$desc,
-                    e.transcript=$tr, e.topic=$topic, e.emotion=$emotion,
+                    e.type=$type, e.moment=$moment,
+                    e.transcript=$tr,
                     e.clip_worthy=$cw, e.thumbnail_worthy=$tw,
                     e.clip_score=$cs, e.viral_score=$vs,
                     e.hook_score=$hs, e.importance_score=$imp,
-                    e.camera_shot=$shot, e.audio_type=$aud,
-                    e.editing_why=$why, e.should_keep=$keep
+                    e.importance_reason=$imp_reason,
+                    e.shot_type=$shot_type, e.camera_motion=$cam_motion,
+                    e.eye_contact=$eye_contact,
+                    e.broll_usable=$broll,
+                    e.comedy_structure=$comedy_struct,
+                    e.edit_keep=$edit_keep, e.edit_speed=$edit_speed,
+                    e.edit_transition=$edit_trans,
+                    e.caption_suggestion=$caption,
+                    e.visual_tags=$vtags,
+                    e.audio_level=$audio_level,
+                    e.laugh_detected=$laugh_detected,
+                    e.emotion_intensity=$emotion_intensity,
+                    e.emotion_contagion=$emotion_contagion
                 WITH e MATCH (v:Video {id:$vid})
                 MERGE (e)-[:PART_OF]->(v)
             """, {
                 "id": eid, "eid": ev.get("id",""), "vid": video_id,
                 "start": ev_start, "end": _f(ev.get("end")),
-                "type": ev.get("type",""), "desc": _safe_str(ev.get("description"), 500),
+                "type": ev.get("type",""), "moment": _safe_str(ev.get("moment",""), 200),
                 "tr": _safe_str(ev.get("transcript_text"), 500),
-                "topic": _safe_str(ev.get("topic"), 200), "emotion": _safe_str(ev.get("emotion")),
                 "cw": bool(ev.get("clip_worthy",False)), "tw": bool(ev.get("thumbnail_worthy",False)),
                 "cs": _f(s.get("clip")), "vs": _f(s.get("viral")),
                 "hs": _f(s.get("hook")), "imp": _f(s.get("importance")),
-                "shot": _safe_str(cam.get("shot_type") if isinstance(cam,dict) else ""),
-                "aud": _safe_str(aud.get("type") if isinstance(aud,dict) else ""),
-                "why": _safe_str(er.get("why") if isinstance(er,dict) else ""),
-                "keep": bool(er.get("should_keep",True) if isinstance(er,dict) else True),
+                "imp_reason": _safe_str(s.get("importance_reason",""), 200),
+                "shot_type": _safe_str(cam.get("shot_type","") if isinstance(cam,dict) else ""),
+                "cam_motion": _safe_str(cam.get("motion","") if isinstance(cam,dict) else ""),
+                "eye_contact": bool(cam.get("eye_contact",False) if isinstance(cam,dict) else False),
+                "broll": bool(ev.get("broll_usable",False)),
+                "comedy_struct": _safe_str((ev.get("comedy_timing") or {}).get("structure","none")),
+                "edit_keep": bool((ev.get("edit_hints") or {}).get("keep", True)),
+                "edit_speed": _safe_str((ev.get("edit_hints") or {}).get("speed","1x")),
+                "edit_trans": _safe_str((ev.get("edit_hints") or {}).get("transition","cut")),
+                "caption": _safe_str((ev.get("edit_hints") or {}).get("caption_suggestion",""), 200),
+                "vtags": json.dumps(ev.get("visual_tags") or []),
+                "audio_level": _safe_str((ev.get("audio_energy") or {}).get("level", "")),
+                "laugh_detected": bool((ev.get("audio_energy") or {}).get("laugh_detected", False)),
+                "emotion_intensity": _f((ev.get("scores") or {}).get("emotion_intensity", 0)),
+                "emotion_contagion": bool((ev.get("scores") or {}).get("emotion_contagion", False)),
             })
             count += 1
 
@@ -647,6 +862,37 @@ class Neo4jGraphBuilder:
                         SET r.reaction=$rx
                     """, {"pid": rpid, "eid": eid, "rx": rx.get("reaction","")})
 
+            # VisualTag nodes + HAS_VISUAL_TAG edges
+            for tag in (ev.get("visual_tags") or []):
+                if tag:
+                    self._run("""
+                        MERGE (vt:VisualTag {name:$tag})
+                        WITH vt MATCH (e:Event {id:$eid})
+                        MERGE (e)-[:HAS_VISUAL_TAG]->(vt)
+                    """, {"tag": str(tag)[:50], "eid": eid})
+
+            # Expression edges
+            for xp in ev.get("expressions", []):
+                xpid = xp.get("person_id","")
+                expr = xp.get("expression","")
+                if xpid and expr:
+                    self._run("""
+                        MATCH (p:Person {id:$pid}),(e:Event {id:$eid})
+                        MERGE (p)-[r:SHOWS_EXPRESSION]->(e)
+                        SET r.expression=$expr
+                    """, {"pid": xpid, "eid": eid, "expr": expr})
+
+            # Physical action edges
+            for ac in ev.get("physical_actions", []):
+                acpid = ac.get("person_id","")
+                action = ac.get("action","")
+                if acpid and action:
+                    self._run("""
+                        MATCH (p:Person {id:$pid}),(e:Event {id:$eid})
+                        MERGE (p)-[r:PERFORMS]->(e)
+                        SET r.action=$action
+                    """, {"pid": acpid, "eid": eid, "action": action})
+
             # Topic + Emotion nodes
             for topic in [t for t in [ev.get("topic")] if t]:
                 self._run("""
@@ -670,6 +916,19 @@ class Neo4jGraphBuilder:
                     MATCH (e:Event {id:$eid}),(d:Event {id:$did})
                     MERGE (e)-[:DEPENDS_ON]->(d)
                 """, {"eid": eid, "did": dep_eid})
+
+        # NEXT edges — chronological chain for temporal context in retriever
+        sorted_evs = sorted(
+            [e for e in ctx.get("timeline", []) if e.get("id")],
+            key=lambda e: _f(e.get("start")),
+        )
+        for i in range(len(sorted_evs) - 1):
+            cur_eid = f"{video_id}_{sorted_evs[i]['id']}"
+            nxt_eid = f"{video_id}_{sorted_evs[i+1]['id']}"
+            self._run("""
+                MATCH (a:Event {id:$aid}),(b:Event {id:$bid})
+                MERGE (a)-[:NEXT]->(b)
+            """, {"aid": cur_eid, "bid": nxt_eid})
 
         # Conversation relationships
         conv = ctx.get("conversation") or {}
@@ -771,6 +1030,14 @@ class Neo4jGraphBuilder:
 
         # WorldState nodes from world_state_timeline — linked to their Video node.
         for ws in ctx.get("world_state_timeline", []):
+            ws_energy = ws.get("energy", "")
+            if isinstance(ws_energy, (dict, list)):
+                ws_energy_str = json.dumps(ws_energy)
+            elif isinstance(ws_energy, str):
+                ws_energy_str = ws_energy
+            else:
+                ws_energy_str = str(ws_energy) if ws_energy is not None else ""
+            ws_energy = ws_energy_str
             self._run("""
                 MERGE (ws:WorldState {video_id: $vid, start: $start})
                 SET ws.end=$end, ws.story_stage=$stage, ws.scene_emotion=$emotion,
@@ -785,10 +1052,83 @@ class Neo4jGraphBuilder:
                 "end":      _f(ws.get("end")),
                 "stage":    ws.get("story_stage", ""),
                 "emotion":  ws.get("scene_emotion", ""),
-                "energy":   ws.get("energy", ""),
+                "energy":   ws_energy,
                 "topic":    ws.get("current_topic", ""),
                 "loops":    json.dumps(ws.get("open_loops", [])),
                 "callbacks": json.dumps(ws.get("callbacks", [])),
+            })
+            count += 1
+
+        # Emotional graph nodes — timestamped emotion curve
+        for eg in ctx.get("emotional_graph", []):
+            t = _f(eg.get("t"))
+            emotion = _safe_str(eg.get("emotion",""))
+            if not emotion:
+                continue
+            self._run("""
+                MERGE (em:Emotion {name:$name})
+                WITH em MATCH (v:Video {id:$vid})
+                MERGE (em)-[r:FELT_IN]->(v)
+                SET r.at_s=$t, r.intensity=$intensity
+            """, {
+                "name": emotion,
+                "vid": video_id,
+                "t": t,
+                "intensity": _safe_str(eg.get("intensity","medium")),
+            })
+
+        # Narrative flow edges
+        for nf in ctx.get("narrative_flow", []):
+            src_eid = f"{video_id}_{nf.get('event_id','')}"
+            role    = _safe_str(nf.get("role",""))
+            if role:
+                self._run("""
+                    MATCH (e:Event {id:$eid})
+                    SET e.narrative_role=$role
+                """, {"eid": src_eid, "role": role})
+            for tgt_id in nf.get("links_to", []):
+                tgt_eid = f"{video_id}_{tgt_id}"
+                link_type = _safe_str(nf.get("link_type","LINKS_TO")).upper().replace(" ","_")
+                self._run(f"""
+                    MATCH (a:Event {{id:$aid}}),(b:Event {{id:$bid}})
+                    MERGE (a)-[r:NARRATIVE_LINK {{type:$lt}}]->(b)
+                """, {"aid": src_eid, "bid": tgt_eid, "lt": link_type})
+
+        # Color scene nodes — one per chunk color analysis
+        for i, ct in enumerate(ctx.get("color_timeline", [])):
+            cs_id = f"{video_id}_color_{i:04d}"
+            grade = ct.get("grade") or {}
+            self._run("""
+                MERGE (cs:ColorScene {id:$id})
+                SET cs.video_id=$vid, cs.start=$start, cs.end=$end,
+                    cs.look=$look, cs.temp_k=$temp_k, cs.temp_label=$temp_label,
+                    cs.brightness=$brightness, cs.saturation=$saturation,
+                    cs.exposure_status=$exposure,
+                    cs.grade_needed=$grade_needed,
+                    cs.lift=$lift, cs.gamma=$gamma, cs.gain=$gain,
+                    cs.temp_adjust=$temp_adj, cs.sat_adjust=$sat_adj,
+                    cs.palette=$palette, cs.ffmpeg_filter=$ffmpeg_filter
+                WITH cs MATCH (v:Video {id:$vid})
+                MERGE (cs)-[:COLOR_OF]->(v)
+            """, {
+                "id":           cs_id,
+                "vid":          video_id,
+                "start":        _f(ct.get("start")),
+                "end":          _f(ct.get("end")),
+                "look":         _safe_str(ct.get("look")),
+                "temp_k":       _f(ct.get("temp_k")),
+                "temp_label":   _safe_str(ct.get("temp_label")),
+                "brightness":   _f(ct.get("brightness")),
+                "saturation":   _f(ct.get("saturation")),
+                "exposure":     _safe_str(ct.get("exposure_status")),
+                "grade_needed": bool(grade.get("grade_needed", False)),
+                "lift":         int(grade.get("lift", 0)),
+                "gamma":        int(grade.get("gamma", 0)),
+                "gain":         int(grade.get("gain", 0)),
+                "temp_adj":     int(grade.get("temperature", 0)),
+                "sat_adj":      int(grade.get("saturation", 0)),
+                "palette":      json.dumps(ct.get("palette") or []),
+                "ffmpeg_filter": _safe_str(ct.get("ffmpeg_filter", "null"), 500),
             })
             count += 1
 

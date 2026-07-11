@@ -52,12 +52,26 @@ from chunk_dispatch import (
 # Semantic event builder — replaces fixed-width chunking as the default planner.
 import event_builder as _eb
 
+# Color intelligence — classical CV, zero GPU. Optional: skip gracefully if opencv absent.
+try:
+    import color_analyzer as _ca
+    HAS_COLOR = True
+except ImportError:
+    HAS_COLOR = False
+
+# Audio energy — CPU ffmpeg+numpy, zero GPU. Optional: skip gracefully if numpy absent.
+try:
+    import audio_analyzer as _aa
+    HAS_AUDIO = True
+except ImportError:
+    HAS_AUDIO = False
+
 VLLM_URL    = "http://localhost:8000/v1/chat/completions"
 MODEL_ID    = "Qwen/Qwen3.6-27B"
 MAX_TOKENS  = 32768
 MAX_RETRIES    = 3               # per-chunk retry attempts (single-video path only)
 RETRY_DELAYS   = [5, 15]         # seconds before attempt 2, 3
-TOKEN_BUDGETS  = [4096, 2048, 1024]     # schema fills ~2-3K naturally; 4096 ceiling is enough
+TOKEN_BUDGETS  = [4096, 2048, 1024]     # enriched schema ~3-4K naturally; 4096 ceiling is enough
 TIMEOUTS       = [900, 1200, 1500]      # timeout per chunk attempt (s)
 CHUNK_OVERLAP  = 3.0             # seconds of frame overlap each side for visual context
 DEFAULT_CHUNKS = 8               # chunks per video when --chunks not specified
@@ -143,7 +157,7 @@ def post_vllm(payload: dict, vllm_url: str, timeout: int = 900,
                 raise
             last_exc = e
         wait = 2 ** attempt
-        log(f"post_vllm attempt {attempt} failed ({last_exc}); retry in {wait}s")
+        log("post_vllm", f"attempt {attempt} failed ({last_exc}); retry in {wait}s")
         time.sleep(wait)
     raise RuntimeError("post_vllm: exhausted retries")
 
@@ -264,8 +278,8 @@ def allocate_chunks(durations: dict[str, float], total_budget: int) -> dict[str,
 #
 # THREE templates — same output schema (merge logic stays identical), but
 # instruction depth scales with event importance:
-#   quick  (LOW profile,  512 tok) — who/where/what, minimal scoring
-#   rich   (MEDIUM,      1500 tok) — full timeline, scores, world_state
+#   quick  (LOW profile, 1024 tok) — who/where/what, camera language, expressions
+#   rich   (MEDIUM,      2048 tok) — full timeline, scores, world_state
 #   full   (HIGH,        4096 tok) — everything + editing hooks, retention, b-roll
 #
 # build_chunk_system_prompt_tiered() is the single entry point; callers pass
@@ -290,25 +304,81 @@ _CHUNK_SCHEMA_COMMON = """\
       "start": <float ≥ {strict_start:.2f}>,
       "end": <float ≤ {strict_end:.2f}>,
       "type": "<dialogue|reaction|laugh|joke|question|answer|transition>",
-      "moment": "<8 words max>",
+      "moment": "<8 words max — what happens visually or verbally>",
       "visible_people": ["P001"],
       "speaker": "<person_id or null>",
       "transcript_text": "<exact words or empty>",
-      "listener_reactions": [{{"person_id": "P002", "reaction": "<laughing|nodding|surprised|shocked>"}}],
-      "scores": {{"importance": <0-10>, "hook": <0-10>, "clip": <0-10>, "viral": <0-10>, "emotion": <0-10>}},
+      "listener_reactions": [{{"person_id": "P002", "reaction": "<laughing|nodding|surprised|shocked|eye_roll|smirk|awkward_silence>"}}],
+      "expressions": [{{"person_id": "P001", "expression": "<laugh|smirk|eye_roll|shock|smile|neutral|confused|excited|bored|thinking>"}}],
+      "physical_actions": [{{"person_id": "P001", "action": "<points|stands|walks|claps|leans_in|leans_back|gestures|looks_away|looks_at_camera|touches_face>"}}],
+      "frame_people": [{{"person_id": "P001", "screen_position": "<left|center|right>", "depth": "<foreground|midground|background>", "occluded": false}}],
+      "camera": {{
+        "shot_type": "<wide|medium|close_up|extreme_close_up|two_shot|over_shoulder>",
+        "motion": "<static|pan|tilt|zoom_in|zoom_out|handheld|cut>",
+        "composition": "<centered|rule_of_thirds|offscreen_subject|split_screen>",
+        "eye_contact": <true|false>
+      }},
+      "comedy_timing": {{
+        "structure": "<setup|punchline|pause|reaction|callback|none>",
+        "pause_duration_s": <0.0>,
+        "setup_at": <float or null>,
+        "laugh_at": <float or null>
+      }},
+      "audio_energy": {{
+        "level": "<silent|quiet|normal|loud|peak>",
+        "speech_rate": "<fast|normal|slow|silent>",
+        "silence_before_s": <0.0>,
+        "laugh_detected": <true|false>,
+        "audio_quality": "<clean|noisy|echo|muffled>"
+      }},
+      "visual_tags": ["<one or more: close_up|wide_shot|two_shot|reaction_shot|pointing|laughing|clapping|standing|walking|whiteboard|laptop|phone|logo|eye_contact|broll_candidate|person_thinking|person_shocked|person_smiling|hand_gesture>"],
+      "scores": {{
+        "importance": <0-10>,
+        "hook": <0-10>,
+        "clip": <0-10>,
+        "viral": <0-10>,
+        "emotion": <0-10>,
+        "emotion_intensity": <0.0-1.0 float — magnitude of emotion peak in this event>,
+        "emotion_contagion": <true|false — did emotion visibly spread to other people>,
+        "importance_reason": "<10 words max — why this score>"
+      }},
+      "edit_hints": {{
+        "keep": <true|false>,
+        "start_trim": <0.0>,
+        "end_trim": <0.0>,
+        "speed": "<0.5x|0.75x|1x|1.25x|1.5x|slow_mo>",
+        "transition": "<cut|dissolve|smash_cut|jump_cut|none>",
+        "zoom_on": "<person_id or null>",
+        "caption_suggestion": "<short caption text or null>",
+        "music_mood": "<upbeat|dramatic|tense|funny|none>",
+        "reaction_cut_to": "<person_id or null>",
+        "audio_fade_in_s": <0.0>,
+        "audio_fade_out_s": <0.0>
+      }},
       "clip_worthy": <true|false>,
-      "thumbnail_worthy": <true|false>
+      "thumbnail_worthy": <true|false>,
+      "broll_usable": <true|false>
     }}
   ],
-  "audio_events": [{{"start": <float>, "end": <float>, "type": "<laughter|music|silence|crosstalk>", "intensity": "<soft|medium|loud>"}}],
+  "audio_events": [{{"start": <float>, "end": <float>, "type": "<laughter|music|silence|crosstalk>", "intensity": "<soft|medium|loud>", "audio_quality": "<clean|noisy|echo|muffled>"}}],
   "world_state": {{
     "story_stage": "<setup|conflict|explanation|punchline|resolution|transition>",
     "scene_emotion": "<funny|tense|emotional|informative|awkward|excited|calm>",
-    "energy": "<high|medium|low>",
+    "energy": {{
+      "overall": "<high|medium|low>",
+      "visual": "<high|medium|low>",
+      "audio": "<high|medium|low>",
+      "conversation": "<high|medium|low>"
+    }},
     "current_topic": "<5 words max>",
     "open_loops": ["<unresolved thread>"],
     "callbacks": ["<recurring reference>"],
-    "last_moment": "<10 words>"
+    "last_moment": "<10 words>",
+    "visual_continuity": {{
+      "lighting": "<consistent|changed|poor>",
+      "camera_angle": "<consistent|changed>",
+      "background": "<clean|cluttered|changed>"
+    }}
   }}
 }}"""
 
@@ -318,7 +388,7 @@ def _build_quick_prompt(
     chunk_id: int, total_chunks: int,
     strict_start: float, strict_end: float, total_duration: float,
 ) -> str:
-    """LOW profile — minimal reasoning, 2-4 events, basic who/where/what."""
+    """LOW profile — minimal reasoning, 2-4 events, basic who/where/what + camera/expression."""
     return f"""{_CHUNK_JSON_HEADER}
 
 You are a fast video metadata scanner. LOW-IMPORTANCE segment.
@@ -330,6 +400,22 @@ RULES:
 - All timestamps ABSOLUTE from video start
 - scores may all be 0 unless something is clearly clip-worthy
 - "moment" field: 8 words max
+- Fill camera.shot_type and camera.motion for every event — observe the frame
+- Fill expressions[] if a face is clearly showing emotion
+- broll_usable: true only if camera is static, no dialogue, clean background
+- visual_tags[]: 3-5 tags max — camera type first (close_up/wide_shot/two_shot), then observable actions (pointing/laughing/standing)
+- frame_people[]: fill screen_position (left/center/right) for each visible person
+- comedy_timing: structure="none" unless clearly a joke; pause_duration_s=0 for non-jokes
+- edit_hints.keep: false only if this event is filler/silence with score<2
+- edit_hints.speed: "1x" for normal, "slow_mo" only for peak reaction moments
+- edit_hints.transition: "cut" for most; "smash_cut" after punchlines
+- edit_hints: set start_trim/end_trim to 0.0, leave caption_suggestion null unless obvious
+- energy: set overall only; set visual/audio/conversation to same value
+- visual_continuity: observe lighting and background once per window, apply to world_state
+- audio_energy.level: observe loudness (silent/quiet/normal/loud/peak)
+- audio_energy.laugh_detected: true if audible laugh in this event
+- scores.emotion_intensity: 0.0 for flat events, 0.8-1.0 for clear peak
+- scores.emotion_contagion: true if second person visibly reacts to first person's emotion
 
 PEOPLE:
 {person_db}
@@ -349,7 +435,7 @@ def _build_rich_prompt(
     chunk_id: int, total_chunks: int,
     strict_start: float, strict_end: float, total_duration: float,
 ) -> str:
-    """MEDIUM profile — standard depth, full timeline + scores + world_state."""
+    """MEDIUM profile — standard depth, full timeline + visual/editorial signals."""
     n_min = max(3, int((strict_end - strict_start) / 6))
     n_max = max(6, int((strict_end - strict_start) / 3))
     return f"""{_CHUNK_JSON_HEADER}
@@ -365,6 +451,26 @@ RULES:
 - Events per window: {n_min}-{n_max} (keep all clear dialogue exchanges, reactions, topic shifts)
 - Keep ALL spoken exchanges with clear transcript text. Skip only truly silent gaps.
 - "moment" field: 8 words max — what happens visually or verbally
+- camera: observe shot type (wide/medium/close_up/two_shot) and motion (static/pan/zoom_in/cut) per event
+- expressions[]: fill for every person with a visible face change; use eye_roll/smirk/laugh/shock etc.
+- physical_actions[]: note points/stands/leans_in/gestures — these signal energy and edit points
+- scores.importance_reason: 10 words why this event matters (or "routine dialogue" if low)
+- edit_hints: suggest start_trim/end_trim in seconds to tighten clip; caption_suggestion for viral potential
+- broll_usable: true if static camera, background clean, no speech — pure reaction or environment shot
+- energy: break down visual/audio/conversation separately — a quiet verbal punchline can be low visual, high audio
+- audio_events.audio_quality: clean/noisy/echo/muffled — one per event where audio matters
+- visual_continuity: note lighting/camera_angle/background consistency across the window
+- visual_tags[]: 4-8 tags per event — shot type + observable elements (pointing/laughing/whiteboard/logo/reaction_shot)
+- frame_people[]: screen_position (left/center/right) + depth (foreground/midground/background) for each visible person
+- comedy_timing: fill structure (setup/punchline/pause/reaction/callback/none); estimate pause_duration_s from gap before next event; setup_at/laugh_at are absolute timestamps
+- edit_hints.keep: false for filler events (silence, off-topic tangent, score<2); true for everything clip-worthy
+- edit_hints.speed: "slow_mo" for strong reaction shots; "1.25x" for padding/slow talkers; "1x" default
+- edit_hints.transition: "smash_cut" after punchlines; "dissolve" for topic shifts; "cut" default
+- edit_hints.reaction_cut_to: person_id of the best reaction face visible during this event (not the speaker)
+- audio_energy: observe loudness level; silence_before_s = gap in speech before this event starts; laugh_detected = audible laugh
+- scores.emotion_intensity: continuous 0.0-1.0 float — 0.0 flat dialogue, 0.5 mild reaction, 0.9 loud laugh peak, 1.0 contagious laugh burst
+- scores.emotion_contagion: true only when emotion visibly spreads (P001 laughs → P002 also starts laughing)
+- edit_hints.audio_fade_in_s/audio_fade_out_s: 0.0 for hard cuts; 0.2-0.5 for smooth transitions
 
 PEOPLE:
 {person_db}
@@ -384,7 +490,7 @@ def _build_full_prompt(
     chunk_id: int, total_chunks: int,
     strict_start: float, strict_end: float, total_duration: float,
 ) -> str:
-    """HIGH profile — maximum depth: editing hooks, retention, b-roll, continuity."""
+    """HIGH profile — maximum depth: camera language, expressions, comedy timing, edit hints."""
     n_min = max(4, int((strict_end - strict_start) / 5))
     n_max = max(8, int((strict_end - strict_start) / 2))
     return f"""{_CHUNK_JSON_HEADER}
@@ -400,11 +506,60 @@ RULES:
 - All timestamps ABSOLUTE from video start
 - Max event duration: 8 seconds
 - Events per window: {n_min}-{n_max} — capture EVERY exchange, reaction, pause, punchline
-- Score every event honestly: importance/hook/clip/viral/emotion are 0-10
-- Flag retention hooks: first-frame hooks, pattern interrupts, emotional peaks
-- Note b-roll opportunities in "moment" (e.g. "reaction shot", "cutaway needed")
-- Identify transition quality: abrupt cut vs smooth vs motivated
-- "moment" field: 8 words max but be specific about WHAT and WHO
+
+VISUAL SIGNALS (observe frames directly):
+- camera.shot_type: wide/medium/close_up/extreme_close_up/two_shot/over_shoulder — changes per cut
+- camera.motion: static/pan/tilt/zoom_in/zoom_out/handheld/cut — very important for pacing
+- camera.eye_contact: true when subject looks directly into lens — high viral signal
+- expressions[]: every person every event — laugh/smirk/eye_roll/shock/smile/neutral/confused/excited/bored
+- physical_actions[]: points/stands/walks/claps/leans_in/leans_back/gestures/looks_away/looks_at_camera
+
+EDITORIAL SIGNALS:
+- scores.importance_reason: exactly WHY this moment scores high — "punchline lands", "topic shift", "laugh peak"
+- edit_hints.start_trim / end_trim: seconds to cut from event edges to tighten the clip
+- edit_hints.caption_suggestion: short text for TikTok/Reels caption if moment is viral-worthy; null otherwise
+- edit_hints.zoom_on: which person_id to zoom in post-production; null if wide is better
+- edit_hints.music_mood: upbeat/dramatic/tense/funny/none — what music fits this moment
+- broll_usable: true only if static camera, clean background, NO dialogue — reaction/environment shot
+
+COMEDY TIMING (when type=joke|laugh|reaction):
+- For setup moments: note the open question in open_loops
+- For punchlines: note how long the pause was before laugh in end-start seconds
+- listener_reactions[]: fill for ALL visible people, not just the main subject
+
+ENERGY BREAKDOWN:
+- energy.visual: high if lots of movement, gesture, expression change
+- energy.audio: high if loud, fast speech, laughter, music
+- energy.conversation: high if rapid back-and-forth, interruptions, overlapping
+
+AUDIO QUALITY:
+- audio_events[].audio_quality: clean/noisy/echo/muffled — flag for editor
+- If laughter: capture which person, how loud (intensity), whether contagious
+
+VISUAL CONTINUITY:
+- visual_continuity.lighting: consistent/changed/poor — flag scene transitions
+- visual_continuity.camera_angle: changed if cut to different position
+- visual_continuity.background: clean/cluttered/changed — b-roll usability signal
+
+VISUAL SEARCH TAGS + COMEDY STRUCTURE:
+- visual_tags[]: 5-10 specific tags — these are used for visual search queries; be precise about what is VISIBLE in frame (close_up/wide_shot/two_shot/over_shoulder/pointing/laughing/clapping/standing/walking/whiteboard/laptop/phone/logo/eye_contact/reaction_shot/broll_candidate/person_thinking/person_shocked/person_smiling/hand_gesture)
+- frame_people[]: for EVERY visible person: screen_position (left/center/right), depth (foreground/midground/background), occluded (true if partially cut off)
+- comedy_timing: CRITICAL for joke/laugh/reaction events — setup_at=timestamp of setup, laugh_at=timestamp when laugh peaks, pause_duration_s=silence gap between setup and punchline. Editors cut on the pause, not the punchline.
+- edit_hints.keep: false for dead air, filler, off-topic ramble, score<3; true for everything else
+- edit_hints.speed: "slow_mo" for the exact laugh peak or shock moment (even 0.5-1s window); "1.25x" to tighten padding; "1x" for natural pacing
+- edit_hints.transition: "smash_cut" for surprise/punchline; "jump_cut" to remove filler mid-sentence; "dissolve" for topic changes; "cut" for natural edits; "none" if this event flows into next
+- edit_hints.reaction_cut_to: person_id of the best visible reaction face (not speaker) — this is the cutaway target
+- edit_hints.caption_suggestion: TikTok/Reels-style caption for viral clips — punchy, includes emoji if funny; null if not viral
+
+EMOTION MAGNITUDE + AUDIO ENERGY:
+- scores.emotion_intensity: 0.0-1.0 continuous float — this is the MAGNITUDE of the emotion, not just its presence. 0.0=none, 0.3=smile, 0.6=laugh, 0.9=loud burst, 1.0=contagious room laugh. Editors use this for cut timing.
+- scores.emotion_contagion: true only when one person's emotion demonstrably causes another person's reaction within this event window
+- audio_energy.level: silent/quiet/normal/loud/peak — observe the room energy
+- audio_energy.speech_rate: fast speech = excitement; slow = emphasis; silent = pregnant pause
+- audio_energy.silence_before_s: estimate seconds of silence/pause before this event (even 0.3s pause before punchline is significant)
+- audio_energy.laugh_detected: true if audible laughter (not just smile)
+- edit_hints.audio_fade_in_s: 0.0 for hard in; 0.2 for pickup mid-sentence; 0.5 for music fade-in moment
+- edit_hints.audio_fade_out_s: 0.0 for hard out; 0.3 to fade laugh tail; 0.5 for end of scene
 
 PEOPLE:
 {person_db}
@@ -412,7 +567,7 @@ PEOPLE:
 TRANSCRIPT (full precision required for this window):
 {transcript_json}
 
-Return ONLY valid JSON (this is a HIGH-priority segment — complete all fields):
+Return ONLY valid JSON (this is a HIGH-priority segment — complete ALL fields including camera, expressions, physical_actions, edit_hints):
 {_CHUNK_SCHEMA_COMMON.format(
     chunk_id=chunk_id, video_label=video_label,
     strict_start=strict_start, strict_end=strict_end,
@@ -465,6 +620,105 @@ def build_chunk_system_prompt(
     )
 
 
+# ── Color grade prompt — LLM grading plan from color intelligence data ────────
+
+def build_color_grade_prompt(ctx: dict, style_request: str = "cinematic") -> str:
+    """
+    Build a text-only prompt for the LLM to generate a per-scene color grade plan.
+    Input: merged context dict (with color_timeline). Output: JSON grade plan.
+    style_request: natural language style goal e.g. "Netflix documentary", "warm vlog".
+    """
+    color_tl = ctx.get("color_timeline", [])
+    consistency = ctx.get("color_consistency", [])
+    video_id = ctx.get("video_id", "unknown")
+    duration = (ctx.get("video_metadata") or {}).get("duration_s", 0)
+
+    tl_lines = []
+    for i, c in enumerate(color_tl):
+        flags = []
+        exp = c.get("exposure_status", "good")
+        if exp != "good":
+            flags.append(exp)
+        grade = c.get("grade") or {}
+        if grade.get("grade_needed"):
+            flags.append("grade_needed")
+        flag_str = f" [{', '.join(flags)}]" if flags else ""
+        tl_lines.append(
+            f"  S{i+1:02d} [{c.get('start',0):.1f}s-{c.get('end',0):.1f}s] "
+            f"bright={c.get('brightness',0):.2f} "
+            f"temp={c.get('temp_k',5000)}K({c.get('temp_label','')}) "
+            f"sat={c.get('saturation',0):.2f} look={c.get('look','')} "
+            f"palette={c.get('palette',[])}  {flag_str}"
+        )
+
+    consistency_lines = []
+    for flag in consistency:
+        consistency_lines.append(
+            f"  {flag.get('from_start',0):.1f}s→{flag.get('to_start',0):.1f}s: "
+            f"{', '.join(flag.get('flags',[]))}"
+        )
+
+    return f"""RESPOND WITH RAW JSON ONLY. YOUR ENTIRE RESPONSE MUST START WITH {{ AND END WITH }}.
+
+You are a professional colorist. Generate a color grade plan for this video.
+
+Video: {video_id} | Duration: {duration:.1f}s
+Style goal: {style_request}
+
+PER-SCENE COLOR DATA (from computer vision analysis):
+{chr(10).join(tl_lines) if tl_lines else "  (no color data)"}
+
+CONSISTENCY ISSUES DETECTED:
+{chr(10).join(consistency_lines) if consistency_lines else "  (none)"}
+
+Based on the style goal "{style_request}" and the measured data above, generate a grading plan.
+Return ONLY valid JSON:
+
+{{
+  "style_goal": "{style_request}",
+  "overall_look": "<describe the target look>",
+  "global_grade": {{
+    "temperature": <int: K adjustment e.g. -300>,
+    "tint": <int: magenta/green adjustment e.g. +5>,
+    "lift": <int: shadow lift -20 to +20>,
+    "gamma": <int: midtone adjustment>,
+    "gain": <int: highlight adjustment>,
+    "contrast": <int: contrast boost/reduce>,
+    "saturation": <int: saturation adjustment>,
+    "vibrance": <int: vibrance adjustment>
+  }},
+  "per_scene": [
+    {{
+      "scene_id": "S01",
+      "start": <float>,
+      "end": <float>,
+      "issue": "<what's wrong>",
+      "grade": {{
+        "temperature": <int>,
+        "tint": <int>,
+        "lift": <int>,
+        "gamma": <int>,
+        "gain": <int>,
+        "contrast": <int>,
+        "saturation": <int>
+      }},
+      "match_to_scene": "<S_id or null — if this scene should match another>",
+      "ffmpeg_filter": "<ready-to-use ffmpeg eq/colortemperature filter string>"
+    }}
+  ],
+  "consistency_fixes": [
+    {{
+      "from_scene": "S01",
+      "to_scene": "S02",
+      "issue": "<mismatch type>",
+      "fix": "<one-line colorist instruction>"
+    }}
+  ],
+  "lut_suggestion": "<e.g. 'Kodak 2383 D65' or 'none'>",
+  "editor_note": "<2-3 sentences: overall grading strategy>"
+}}"""
+
+
 # ── Synthesis prompt — text-only second pass after chunk merge ────────────────
 
 def build_synthesis_prompt(
@@ -474,16 +728,22 @@ def build_synthesis_prompt(
     timeline_summary: str,
     total_duration: float,
     world_state_timeline: list | None = None,
+    color_timeline: list | None = None,
+    color_consistency: list | None = None,
+    audio_timeline: list | None = None,
 ) -> str:
     world_state_str = ""
     if world_state_timeline:
         world_state_str = "\n\nWORLD STATE ACROSS CHUNKS:\n"
         for ws in world_state_timeline:
+            energy = ws.get('energy', '')
+            if isinstance(energy, dict):
+                energy = f"visual={energy.get('visual','?')} audio={energy.get('audio','?')} conv={energy.get('conversation','?')}"
             world_state_str += (
                 f"  [{ws.get('start', 0):.1f}s-{ws.get('end', 0):.1f}s] "
                 f"stage={ws.get('story_stage', '')} "
                 f"emotion={ws.get('scene_emotion', '')} "
-                f"energy={ws.get('energy', '')} "
+                f"energy={energy} "
                 f"topic={ws.get('current_topic', '')}\n"
             )
         loops = [l for ws in world_state_timeline for l in ws.get("open_loops", [])]
@@ -492,6 +752,38 @@ def build_synthesis_prompt(
             world_state_str += f"  Open loops: {'; '.join(set(loops))}\n"
         if callbacks:
             world_state_str += f"  Callbacks/recurring: {'; '.join(set(callbacks))}\n"
+
+    if color_timeline:
+        color_lines = []
+        for ct in color_timeline[:20]:  # cap at 20 chunks
+            grade = ct.get("grade") or {}
+            needed = grade.get("grade_needed", False)
+            color_lines.append(
+                f"  [{ct.get('start',0):.0f}s-{ct.get('end',0):.0f}s] "
+                f"look={ct.get('look','?')} exposure={ct.get('exposure_status','?')} "
+                f"temp={ct.get('temp_label','?')} "
+                f"grade_needed={'YES' if needed else 'no'}"
+            )
+        # Add consistency flags
+        inconsistencies = [c for c in (color_consistency or []) if c.get("flag") not in (None, "ok", "")]
+        if inconsistencies:
+            color_lines.append(f"  Color consistency issues: {len(inconsistencies)} transitions flagged")
+        color_text = "\n".join(color_lines) if color_lines else "  No color data available."
+    else:
+        color_text = "  No color data available."
+
+    if audio_timeline:
+        audio_lines = []
+        for at in audio_timeline[:20]:  # cap at 20
+            audio_lines.append(
+                f"  [{at.get('start',0):.0f}s-{at.get('end',0):.0f}s] "
+                f"level={at.get('level','?')} speech={at.get('speech_rate','?')} "
+                f"laugh={'YES' if at.get('laugh_detected') else 'no'} "
+                f"silence_before={at.get('silence_before_s',0):.1f}s"
+            )
+        audio_text = "\n".join(audio_lines) if audio_lines else "  No audio data."
+    else:
+        audio_text = "  No audio data."
 
     return f"""RESPOND WITH RAW JSON ONLY. YOUR ENTIRE RESPONSE MUST START WITH {{ AND END WITH }}. NO MARKDOWN. NO EXPLANATION. NO <think> BLOCKS. JUST THE JSON OBJECT.
 
@@ -505,7 +797,28 @@ Known people:
 MERGED TIMELINE (all events, chronological):
 {timeline_summary}{world_state_str}
 
+COLOR INTELLIGENCE (per chunk):
+{color_text}
+
+AUDIO INTELLIGENCE (per chunk):
+{audio_text}
+
 Based on this complete timeline, generate the editorial intelligence layer.
+Use color intelligence to inform editorial decisions (flag overexposed scenes, note color transitions).
+Use audio intelligence to find natural cut points (silences), identify high-energy moments (laughs), and flag speaker pacing.
+
+EDIT SEQUENCE RULES:
+- edit_sequence: ordered list of events that form the BEST standalone clip from this video
+- Include 8-15 events max — this is the final cut, not the full timeline
+- action=cut: drop this event entirely (use for filler, dead air, off-topic)
+- action=keep: include as-is at normal speed
+- action=speed_ramp: include but speed up (1.25x for talking-head padding, slow_mo for peak reaction)
+- action=reaction_cut: cut to the reaction person instead of speaker at this moment
+- action=broll_insert: insert b-roll here (use when speaker references something visual)
+- seq: 1-based output order (can differ from source timeline — reorder for narrative punch)
+- source_start/source_end: timestamps from original video (absolute)
+- reason: why this moment is in the best cut
+
 Return ONLY valid JSON:
 
 {{
@@ -579,8 +892,147 @@ Return ONLY valid JSON:
     "suggested_title": "<YouTube title>",
     "suggested_description": "<YouTube description opening>",
     "editor_notes": "<3-5 specific editing recommendations>"
-  }}
+  }},
+
+  "emotional_graph": [
+    {{"t": <float>, "emotion": "<happy|surprised|laughing|tense|sad|angry|calm|excited>", "intensity": "<low|medium|high>", "trigger": "<event_id>"}}
+  ],
+
+  "narrative_flow": [
+    {{"event_id": "<E_id>", "role": "<hook|setup|conflict|escalation|punchline|resolution|callback|transition>", "links_to": ["<E_id>"], "link_type": "<answers|triggers|calls_back|interrupts>"}}
+  ],
+
+  "edit_sequence": [
+    {{
+      "seq": 1,
+      "event_id": "<E_id>",
+      "action": "<keep|cut|speed_ramp|reaction_cut|broll_insert>",
+      "source_start": <float>,
+      "source_end": <float>,
+      "trim_start": <0.0>,
+      "trim_end": <0.0>,
+      "speed": "<0.5x|0.75x|1x|1.25x|slow_mo>",
+      "caption": "<null or short caption>",
+      "music_change": "<null or mood: upbeat|dramatic|tense|funny|none>",
+      "transition_in": "<cut|dissolve|smash_cut|jump_cut>",
+      "reason": "<5 words: why this event is in the sequence>"
+    }}
+  ]
 }}"""
+
+
+# ── Color analysis (CPU, concurrent with VLM prefill) ────────────────────────
+
+def _enrich_chunks_with_color(
+    chunk_results: list[dict],
+    video_url: str,
+    video_label: str,
+    max_workers: int = 4,
+) -> None:
+    """
+    Run color_analyzer on each successful chunk in a thread pool.
+    Attaches result["color_analysis"] in-place. Runs CPU-only — no GPU.
+    Typically 0.5-1.5s per chunk at 320px; 4 workers finishes 16 chunks in ~4s.
+    Called after map phase so it overlaps zero VLM time.
+    """
+    import concurrent.futures
+
+    ok_chunks = [c for c in chunk_results if c.get("ok")]
+    if not ok_chunks:
+        return
+
+    def _analyze_one(chunk: dict) -> tuple[int, dict]:
+        try:
+            result = _ca.analyze_chunk(
+                video_url,
+                chunk.get("strict_start", chunk.get("window_start", 0)),
+                chunk.get("strict_end",   chunk.get("window_end",   30)),
+                n_frames=2,
+            )
+            return id(chunk), result
+        except Exception as ex:
+            return id(chunk), {"error": str(ex)}
+
+    id_to_chunk = {id(c): c for c in ok_chunks}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futs = {pool.submit(_analyze_one, c): c for c in ok_chunks}
+        for fut in concurrent.futures.as_completed(futs):
+            chunk_id, result = fut.result()
+            chunk = id_to_chunk.get(chunk_id)
+            if chunk is not None:
+                chunk["color_analysis"] = result.get("color_analysis", {})
+                chunk["_color_ms"]      = result.get("_color_ms", 0)
+
+    log(video_label,
+        f"color analysis: {len(ok_chunks)} chunks "
+        f"avg={sum(c.get('_color_ms',0) for c in ok_chunks)//max(len(ok_chunks),1)}ms each")
+
+
+def _collect_transcript_words(transcripts: dict, video_label: str) -> list[dict]:
+    """Return a flat list of word-timing dicts for *video_label*.
+
+    Walks ``transcripts.videos[].segments[].words`` and collects every entry
+    that carries ``start`` and ``end`` timestamps.  Returns ``[]`` when the
+    transcript is absent or contains no word-level data (graceful fallback).
+    """
+    for v in transcripts.get("videos", []):
+        if v.get("video") == video_label:
+            words: list[dict] = []
+            for seg in v.get("segments", []):
+                for w in seg.get("words", []):
+                    if "start" in w and "end" in w:
+                        words.append(w)
+            return words
+    return []
+
+
+def _enrich_chunks_with_audio(
+    chunk_results: list[dict],
+    video_url: str,
+    video_label: str,
+    transcript_words: list | None = None,
+    max_workers: int = 6,
+) -> None:
+    """
+    Run audio_analyzer on each successful chunk in a thread pool.
+    Attaches chunk["audio_analysis"] in-place. CPU-only, no GPU.
+    Runs concurrent with merge phase — adds ~2-4s wall for full video.
+
+    transcript_words: flat list of {"word": str, "start": float, "end": float}
+    dicts collected from all segments. When provided, speech_rate is computed
+    from exact words-per-second instead of the ZCR heuristic (~65% → ~95%).
+    """
+    import concurrent.futures
+
+    ok_chunks = [c for c in chunk_results if c.get("ok")]
+    if not ok_chunks:
+        return
+
+    def _analyze_one(chunk: dict) -> tuple[int, dict]:
+        try:
+            result = _aa.analyze_chunk(
+                video_url,
+                chunk.get("strict_start", chunk.get("window_start", 0)),
+                chunk.get("strict_end",   chunk.get("window_end",   30)),
+                transcript_words=transcript_words,
+            )
+            return id(chunk), result
+        except Exception as ex:
+            return id(chunk), {"error": str(ex)}
+
+    id_to_chunk = {id(c): c for c in ok_chunks}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futs = {pool.submit(_analyze_one, c): c for c in ok_chunks}
+        for fut in concurrent.futures.as_completed(futs):
+            chunk_id, result = fut.result()
+            chunk = id_to_chunk.get(chunk_id)
+            if chunk is not None:
+                chunk["audio_analysis"] = result.get("audio_analysis", {})
+                chunk["_audio_ms"]      = result.get("_audio_ms", 0)
+
+    log(video_label,
+        f"audio analysis: {len(ok_chunks)} chunks "
+        f"avg={sum(c.get('_audio_ms',0) for c in ok_chunks)//max(len(ok_chunks),1)}ms each")
 
 
 # ── Merge chunk results ───────────────────────────────────────────────────────
@@ -628,6 +1080,51 @@ def _merge_people(chunks: list[dict], cast_analysis: dict | None = None) -> list
     return [{"person_id": pid, "display_name": pid} for pid in sorted(seen_ids)]
 
 
+def build_emotion_arcs(
+    timeline: list[dict],
+    window_s: float = 30.0,
+) -> dict:
+    """
+    Aggregate emotion_intensity per speaker in window_s buckets.
+    Returns {person_id: [{t_start, t_end, mean_intensity, peak_intensity, event_count, laugh_count}]}
+    Gives editors a per-speaker emotion curve instead of a single mood_arc string.
+    """
+    from collections import defaultdict
+    buckets: dict[str, dict[int, list]] = defaultdict(lambda: defaultdict(list))
+    laughs:  dict[str, dict[int, int]]  = defaultdict(lambda: defaultdict(int))
+
+    for ev in timeline:
+        speaker   = ev.get("speaker") or "unknown"
+        t         = float(ev.get("start") or 0)
+        intensity = float((ev.get("scores") or {}).get("emotion_intensity") or 0)
+        laugh     = bool((ev.get("audio_energy") or {}).get("laugh_detected", False))
+        bucket    = int(t // window_s)
+        if intensity > 0:
+            buckets[speaker][bucket].append(intensity)
+        if laugh:
+            laughs[speaker][bucket] += 1
+
+    arcs: dict[str, list] = {}
+    for speaker, windows in buckets.items():
+        if not windows:
+            continue
+        max_b = max(windows.keys())
+        arc   = []
+        for b in range(max_b + 1):
+            vals = windows.get(b, [])
+            arc.append({
+                "t_start":        round(b * window_s, 1),
+                "t_end":          round((b + 1) * window_s, 1),
+                "mean_intensity": round(sum(vals) / len(vals), 3) if vals else 0.0,
+                "peak_intensity": round(max(vals), 3) if vals else 0.0,
+                "event_count":    len(vals),
+                "laugh_count":    laughs[speaker].get(b, 0),
+            })
+        arcs[speaker] = arc
+
+    return arcs
+
+
 def merge_chunks(
     chunk_results: list[dict],
     video_label: str,
@@ -646,6 +1143,7 @@ def merge_chunks(
 
     # Collect world_state entries from each successful chunk
     world_states = []
+    color_timeline: list[dict] = []
     for c in chunk_results:
         if c.get("ok") and "world_state" in c:
             ws = c["world_state"]
@@ -655,7 +1153,69 @@ def merge_chunks(
                     "end":   c.get("strict_end",   0),
                     **ws,
                 })
+        if c.get("ok") and c.get("color_analysis"):
+            ca = c["color_analysis"]
+            color_timeline.append({
+                "start":          c.get("strict_start", 0),
+                "end":            c.get("strict_end", 0),
+                "brightness":     ca.get("brightness"),
+                "contrast":       (ca.get("contrast") or {}).get("ratio"),
+                "saturation":     (ca.get("saturation") or {}).get("mean"),
+                "temp_k":         (ca.get("temperature") or {}).get("estimated_kelvin"),
+                "temp_label":     (ca.get("temperature") or {}).get("label"),
+                "look":           ca.get("look"),
+                "palette":        ca.get("palette", []),
+                "exposure_status":(ca.get("exposure") or {}).get("status"),
+                "grade":          ca.get("grade", {}),
+                "ffmpeg_filter":  ca.get("ffmpeg_filter", "null"),
+                "skin_tone":      ca.get("skin_tone", {}),
+            })
     world_state_timeline = sorted(world_states, key=lambda x: x["start"])
+
+    # Compute scene-to-scene color consistency flags
+    color_consistency: list[dict] = []
+    if HAS_COLOR and len(color_timeline) >= 2:
+        color_tl_sorted = sorted(color_timeline, key=lambda x: x["start"])
+        for i in range(1, len(color_tl_sorted)):
+            diff = _ca.compare_chunks(
+                {"color_analysis": {
+                    "brightness":   color_tl_sorted[i-1].get("brightness", 0.5),
+                    "temperature":  {"estimated_kelvin": color_tl_sorted[i-1].get("temp_k", 5000)},
+                    "saturation":   {"mean": color_tl_sorted[i-1].get("saturation", 0.4)},
+                    "look":         color_tl_sorted[i-1].get("look",""),
+                }},
+                {"color_analysis": {
+                    "brightness":   color_tl_sorted[i].get("brightness", 0.5),
+                    "temperature":  {"estimated_kelvin": color_tl_sorted[i].get("temp_k", 5000)},
+                    "saturation":   {"mean": color_tl_sorted[i].get("saturation", 0.4)},
+                    "look":         color_tl_sorted[i].get("look",""),
+                }},
+            )
+            if diff.get("needs_match"):
+                color_consistency.append({
+                    "from_start": color_tl_sorted[i-1]["start"],
+                    "to_start":   color_tl_sorted[i]["start"],
+                    **diff,
+                })
+
+    # Collect audio timeline from chunks
+    audio_timeline: list[dict] = []
+    for c in chunk_results:
+        if c.get("ok") and c.get("audio_analysis"):
+            aa = c["audio_analysis"]
+            audio_timeline.append({
+                "start":          c.get("strict_start", 0),
+                "end":            c.get("strict_end", 0),
+                "peak_db":        aa.get("peak_db"),
+                "rms_mean":       aa.get("rms_mean"),
+                "dynamic_range_db": aa.get("dynamic_range_db"),
+                "speech_rate":    aa.get("speech_rate"),
+                "audio_quality":  aa.get("audio_quality"),
+                "clipping":       aa.get("clipping", False),
+                "energy_curve":   aa.get("energy_curve", []),
+                "silences":       aa.get("silences", []),
+                "laugh_events":   aa.get("laugh_events", []),
+            })
 
     merged = {
         "video_id":             video_label,
@@ -664,6 +1224,10 @@ def merge_chunks(
         "timeline":             all_events,
         "audio_events":         _merge_sorted(chunk_results, "audio_events"),
         "world_state_timeline": world_state_timeline,
+        "color_timeline":       sorted(color_timeline, key=lambda x: x["start"]),
+        "color_consistency":    color_consistency,
+        "audio_timeline":       sorted(audio_timeline, key=lambda x: x["start"]),
+        "emotion_arcs":         {},  # rebuilt after continuity_pass for stable person IDs
         # Synthesis fields filled in by synthesize_merged()
         "video_metadata":       {},
         "scenes":               [],
@@ -674,6 +1238,9 @@ def merge_chunks(
         "thumbnail_candidates": [],
         "ocr_results":          [],
         "editorial_summary":    {},
+        "emotional_graph":      [],
+        "narrative_flow":       [],
+        "edit_sequence":        [],
     }
     return merged
 
@@ -696,18 +1263,33 @@ def synthesize_merged(
     events = merged["timeline"][:600]
     tl_lines = []
     for ev in events:
-        speaker = ev.get("speaker", "")
-        txt     = ev.get("transcript_text", "")
+        speaker  = ev.get("speaker", "")
+        txt      = ev.get("transcript_text", "")
+        cam      = ev.get("camera") or {}
+        vtags    = ",".join(ev.get("visual_tags") or [])[:60]
+        scores   = ev.get("scores") or {}
+        imp_r    = scores.get("importance_reason", "")
+        broll    = "broll" if ev.get("broll_usable") else ""
+        keep     = "" if (ev.get("edit_hints") or {}).get("keep", True) else "DROP"
+        ae       = ev.get("audio_energy") or {}
+        audio_s  = f"audio:{ae.get('level','')} laugh:{ae.get('laugh_detected',False)}" if ae else ""
+        ct       = ev.get("comedy_timing") or {}
+        comedy_s = f"comedy:{ct.get('structure','')} pause:{ct.get('pause_duration_s',0):.1f}s" if ct.get("structure","none") != "none" else ""
+        ei       = scores.get("emotion_intensity", 0)
         tl_lines.append(
             f"  {ev['id']} [{ev.get('start',0):.1f}s-{ev.get('end',0):.1f}s] "
-            f"{ev.get('type','?')} | speaker:{speaker} | "
-            f"clip:{ev.get('clip_worthy',False)} | \"{txt[:80]}\""
+            f"{ev.get('type','?')} | {cam.get('shot_type','')} | speaker:{speaker} | "
+            f"clip:{ev.get('clip_worthy',False)} imp:{scores.get('importance',0)} ei:{ei:.1f} {keep} "
+            f"tags:[{vtags}] {broll} {audio_s} {comedy_s} | \"{txt[:50]}\" | {imp_r}"
         )
     timeline_text = "\n".join(tl_lines)
 
     system = build_synthesis_prompt(
         video_label, video_url, person_db, timeline_text, total_duration,
         world_state_timeline=merged.get("world_state_timeline", []),
+        color_timeline=merged.get("color_timeline"),
+        color_consistency=merged.get("color_consistency"),
+        audio_timeline=merged.get("audio_timeline"),
     )
 
     payload = {
@@ -750,7 +1332,8 @@ def synthesize_merged(
     # Merge synthesis fields into the combined dict
     for key in ("video_metadata", "conversation", "story", "highlights",
                 "clip_candidates", "thumbnail_candidates", "ocr_results",
-                "editorial_summary"):
+                "editorial_summary", "emotional_graph", "narrative_flow",
+                "edit_sequence"):
         if key in synth:
             merged[key] = synth[key]
 
@@ -1506,6 +2089,13 @@ def _finalize_video(
         cr["prev_chunk_id"] = chunk_results[i - 1]["chunk_id"] if i > 0 else None
         cr["next_chunk_id"] = chunk_results[i + 1]["chunk_id"] if i < len(chunk_results) - 1 else None
 
+    # ── COLOR + AUDIO ANALYSIS (CPU, parallel, overlaps with merge+synth latency) ─
+    if HAS_COLOR:
+        _enrich_chunks_with_color(chunk_results, video_url, video_label)
+    if HAS_AUDIO:
+        _enrich_chunks_with_audio(chunk_results, video_url, video_label,
+                                  transcript_words=_collect_transcript_words(transcripts, video_label))
+
     # ── MERGE ─────────────────────────────────────────────────────────────────
     try:
         merged = merge_chunks(chunk_results, video_label, video_url, total_duration,
@@ -1536,6 +2126,9 @@ def _finalize_video(
             log(video_label, f"Continuity pass crashed ({e}) — skipping")
     elif context_mode == "sequential":
         log(video_label, "sequential context mode not yet implemented — using parallel result")
+
+    # Rebuild emotion arcs AFTER continuity pass so person IDs are stable
+    merged["emotion_arcs"] = build_emotion_arcs(merged.get("timeline", []), window_s=30.0)
 
     # ── TOKEN ACCOUNTING ──────────────────────────────────────────────────────
     chunk_prefill = sum(r.get("prefill_tokens", 0) for r in raw_results
@@ -1735,6 +2328,86 @@ def analyze_video(
             result["elapsed"] = elapsed
             result["attempts"] = attempt
 
+            # ── COLOR + AUDIO ENRICHMENT for single-video path ────────────────
+            # The chunked path enriches chunk_results before merge_chunks builds
+            # color_timeline/audio_timeline. The single-video path bypasses that,
+            # so we enrich here using the full-video span as one pseudo-chunk.
+            if HAS_COLOR or HAS_AUDIO:
+                try:
+                    out_path = Path(result["path"])
+                    parsed   = json.loads(out_path.read_text(encoding="utf-8"))
+                    dur_s    = float(
+                        (parsed.get("video_metadata") or {}).get("duration_s") or 0
+                    )
+                    # Build a single pseudo-chunk covering the whole video
+                    pseudo = {
+                        "ok":           True,
+                        "strict_start": 0.0,
+                        "strict_end":   dur_s,
+                    }
+                    if HAS_COLOR:
+                        _enrich_chunks_with_color([pseudo], safe_url, video_label)
+                    if HAS_AUDIO:
+                        _enrich_chunks_with_audio([pseudo], safe_url, video_label,
+                                                  transcript_words=_collect_transcript_words(transcripts, video_label))
+
+                    # Build color_timeline entry (mirrors merge_chunks logic)
+                    color_timeline: list[dict] = []
+                    if pseudo.get("color_analysis"):
+                        ca = pseudo["color_analysis"]
+                        color_timeline.append({
+                            "start":           0.0,
+                            "end":             dur_s,
+                            "brightness":      ca.get("brightness"),
+                            "contrast":        (ca.get("contrast") or {}).get("ratio"),
+                            "saturation":      (ca.get("saturation") or {}).get("mean"),
+                            "temp_k":          (ca.get("temperature") or {}).get("estimated_kelvin"),
+                            "temp_label":      (ca.get("temperature") or {}).get("label"),
+                            "look":            ca.get("look"),
+                            "palette":         ca.get("palette", []),
+                            "exposure_status": (ca.get("exposure") or {}).get("status"),
+                            "grade":           ca.get("grade", {}),
+                            "ffmpeg_filter":   ca.get("ffmpeg_filter", "null"),
+                            "skin_tone":       ca.get("skin_tone", {}),
+                        })
+
+                    # Build audio_timeline entry (mirrors merge_chunks logic)
+                    audio_timeline: list[dict] = []
+                    if pseudo.get("audio_analysis"):
+                        aa = pseudo["audio_analysis"]
+                        audio_timeline.append({
+                            "start":              0.0,
+                            "end":                dur_s,
+                            "peak_db":            aa.get("peak_db"),
+                            "rms_mean":           aa.get("rms_mean"),
+                            "dynamic_range_db":   aa.get("dynamic_range_db"),
+                            "speech_rate":        aa.get("speech_rate"),
+                            "audio_quality":      aa.get("audio_quality"),
+                            "clipping":           aa.get("clipping", False),
+                            "energy_curve":       aa.get("energy_curve", []),
+                            "silences":           aa.get("silences", []),
+                            "laugh_events":       aa.get("laugh_events", []),
+                        })
+
+                    # Inject into parsed JSON and re-write the file
+                    if color_timeline:
+                        parsed["color_timeline"] = color_timeline
+                        parsed.setdefault("color_consistency", [])
+                    if audio_timeline:
+                        parsed["audio_timeline"] = audio_timeline
+                    if color_timeline or audio_timeline:
+                        out_path.write_text(
+                            json.dumps(parsed, indent=2, ensure_ascii=False),
+                            encoding="utf-8",
+                        )
+                        result["size_kb"] = round(out_path.stat().st_size / 1024, 1)
+                        log(video_label,
+                            f"color/audio enriched → color_timeline={len(color_timeline)} "
+                            f"audio_timeline={len(audio_timeline)} entries")
+                except Exception as _enrich_exc:
+                    log(video_label, f"color/audio enrich skipped — {_enrich_exc}")
+            # ── END ENRICHMENT ────────────────────────────────────────────────
+
             # Update shared progress counter
             if progress is not None and progress_lock is not None:
                 with progress_lock:
@@ -1872,6 +2545,10 @@ def _log_thread_safe(label: str, msg: str) -> None:
     log(label, msg)
 
 
+# NOTE: analyze_video_chunked is NOT called anywhere — the live path uses
+# _plan_video_chunks + _dispatch_all_async + _finalize_video directly.
+# Kept as reference only. If you route to this, note it lacks context_mode
+# and continuity_pass support.
 def analyze_video_chunked(
     video_idx: int,
     video_label: str,
@@ -2076,6 +2753,13 @@ def analyze_video_chunked(
         cr["prev_chunk_id"] = chunk_results[i - 1]["chunk_id"] if i > 0 else None
         cr["next_chunk_id"] = chunk_results[i + 1]["chunk_id"] if i < len(chunk_results) - 1 else None
 
+    # ── COLOR + AUDIO ANALYSIS (CPU, parallel, overlaps with merge+synth latency) ─
+    if HAS_COLOR:
+        _enrich_chunks_with_color(chunk_results, video_url, video_label)
+    if HAS_AUDIO:
+        _enrich_chunks_with_audio(chunk_results, video_url, video_label,
+                                  transcript_words=_collect_transcript_words(transcripts, video_label))
+
     # ── MERGE ─────────────────────────────────────────────────────────────────
     try:
         merged = merge_chunks(chunk_results, video_label, video_url, total_duration,
@@ -2095,6 +2779,9 @@ def analyze_video_chunked(
         synth_wall_s = time.time() - t_synth_start
         log(video_label,
             f"Synthesis failed ({e}) — saving merged timeline without editorial")
+
+    # Rebuild emotion arcs with stable post-synthesis person IDs
+    merged["emotion_arcs"] = build_emotion_arcs(merged.get("timeline", []), window_s=30.0)
 
     # ── SAVE ──────────────────────────────────────────────────────────────────
     slug     = video_label.replace(" ", "_")
