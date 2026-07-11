@@ -473,11 +473,11 @@ class PineconeIndexer:
                 if arc:
                     peak_window = max(arc, key=lambda w: w.get("peak_intensity", 0))
                     arc_text = (
-                        f"Emotion arc: peak at {peak_window['t_start']:.0f}s-{peak_window['t_end']:.0f}s "
-                        f"(intensity={peak_window['peak_intensity']:.2f} laughs={peak_window['laugh_count']}). "
+                        f"Emotion arc: peak at {peak_window.get('t_start',0):.0f}s-{peak_window.get('t_end',0):.0f}s "
+                        f"(intensity={peak_window.get('peak_intensity',0):.2f} laughs={peak_window.get('laugh_count',0)}). "
                         f"Windows: " + " ".join(
-                            f"[{w['t_start']:.0f}s mean={w['mean_intensity']:.2f}"
-                            f"{' laugh' if w['laugh_count'] else ''}]"
+                            f"[{w.get('t_start',0):.0f}s mean={w.get('mean_intensity',0):.2f}"
+                            f"{' laugh' if w.get('laugh_count',0) else ''}]"
                             for w in arc
                         )
                     )
@@ -490,18 +490,18 @@ class PineconeIndexer:
                         "person_id":         _safe_str(pid),
                         "person_name":       _safe_str(p.get("display_name", pid)),
                         "role":              _safe_str(p.get("role_in_video"), 200),
-                        "screen_time_s":     float(p.get("screen_time_s") or 0),
-                        "speaking_time_s":   float(p.get("speaking_time_s") or 0),
+                        "screen_time_s":     _safe_float(p.get("screen_time_s"), 0.0),
+                        "speaking_time_s":   _safe_float(p.get("speaking_time_s"), 0.0),
                         "emotion_arc_peaks": json.dumps([
-                            {"t": w["t_start"], "mean": w["mean_intensity"], "peak": w["peak_intensity"]}
+                            {"t": w.get("t_start", 0), "mean": w.get("mean_intensity", 0), "peak": w.get("peak_intensity", 0)}
                             for w in arc if w.get("mean_intensity", 0) > 0
                         ]),
                         "total_laughs":      sum(w.get("laugh_count", 0) for w in arc),
                         "mean_emotion":      round(
-                            sum(w["mean_intensity"] for w in arc) / len(arc), 3
+                            sum(w.get("mean_intensity", 0.0) for w in arc) / len(arc), 3
                         ) if arc else 0.0,
                         "peak_emotion":      round(
-                            max((w["peak_intensity"] for w in arc), default=0.0), 3
+                            max((w.get("peak_intensity", 0.0) for w in arc), default=0.0), 3
                         ),
                     },
                 })
@@ -519,22 +519,22 @@ class PineconeIndexer:
                     "id": f"{video_id}_arc_{pid}_{i:04d}",
                     "text": (
                         f"Video:{video_id} Person:{person_name} "
-                        f"Time:{w['t_start']:.0f}s-{w['t_end']:.0f}s\n"
-                        f"Emotion intensity: mean={w['mean_intensity']:.2f} "
-                        f"peak={w['peak_intensity']:.2f} events={w['event_count']} "
-                        f"laughs={w['laugh_count']}"
+                        f"Time:{w.get('t_start',0):.0f}s-{w.get('t_end',0):.0f}s\n"
+                        f"Emotion intensity: mean={w.get('mean_intensity',0):.2f} "
+                        f"peak={w.get('peak_intensity',0):.2f} events={w.get('event_count',0)} "
+                        f"laughs={w.get('laugh_count',0)}"
                     ),
                     "metadata": {
                         "video_id":       video_id,
                         "entity_type":    "emotion_arc",
                         "person_id":      _safe_str(pid),
                         "person_name":    _safe_str(person_name),
-                        "start":          _f(w["t_start"]),
-                        "end":            _f(w["t_end"]),
-                        "mean_intensity": _f(w["mean_intensity"]),
-                        "peak_intensity": _f(w["peak_intensity"]),
-                        "event_count":    int(w["event_count"]),
-                        "laugh_count":    int(w["laugh_count"]),
+                        "start":          _f(w.get("t_start")),
+                        "end":            _f(w.get("t_end")),
+                        "mean_intensity": _f(w.get("mean_intensity")),
+                        "peak_intensity": _f(w.get("peak_intensity")),
+                        "event_count":    int(w.get("event_count") or 0),
+                        "laugh_count":    int(w.get("laugh_count") or 0),
                     },
                 })
 
@@ -573,7 +573,10 @@ class PineconeIndexer:
 
         # Color timeline (answer "find underexposed scenes", "where is white balance warm")
         for i, ct in enumerate(ctx.get("color_timeline", [])):
-            palette_str = " ".join(ct.get("palette") or [])
+            _raw_palette = ct.get("palette") or []
+            if not isinstance(_raw_palette, list):
+                _raw_palette = []
+            palette_str = " ".join(_raw_palette)
             grade = ct.get("grade") or {}
             ffmpeg_filter = _safe_str(ct.get("ffmpeg_filter", "null"), 500)
             records.append({
@@ -601,7 +604,7 @@ class PineconeIndexer:
                     "saturation":     _f(ct.get("saturation")),
                     "exposure_status": _safe_str(ct.get("exposure_status")),
                     "grade_needed":   bool(grade.get("grade_needed", False)),
-                    "palette":        json.dumps(ct.get("palette") or []),
+                    "palette":        json.dumps(_raw_palette),
                     "ffmpeg_filter":  ffmpeg_filter,
                 },
             })
@@ -621,7 +624,7 @@ class PineconeIndexer:
                 "metadata": {
                     "video_id":      video_id,
                     "entity_type":   "edit_sequence",
-                    "seq":           int(seq_item.get("seq", 0)),
+                    "seq":           int(float(seq_item.get("seq") or 0)),
                     "event_id":      _safe_str(seq_item.get("event_id","")),
                     "action":        _safe_str(seq_item.get("action","keep")),
                     "start":         _f(seq_item.get("source_start")),
@@ -1034,6 +1037,8 @@ class Neo4jGraphBuilder:
 
         for agr in conv.get("agreements", []):
             people = agr.get("between", [])
+            if not isinstance(people, list):
+                people = []
             if len(people) >= 2:
                 self._run("""
                     MATCH (a:Person {id:$a}),(b:Person {id:$b})
@@ -1045,6 +1050,8 @@ class Neo4jGraphBuilder:
 
         for dis in conv.get("disagreements", []):
             people = dis.get("between", [])
+            if not isinstance(people, list):
+                people = []
             if len(people) >= 2:
                 self._run("""
                     MATCH (a:Person {id:$a}),(b:Person {id:$b})
@@ -1177,12 +1184,12 @@ class Neo4jGraphBuilder:
                 "saturation":   _f(ct.get("saturation")),
                 "exposure":     _safe_str(ct.get("exposure_status")),
                 "grade_needed": bool(grade.get("grade_needed", False)),
-                "lift":         int(grade.get("lift", 0)),
-                "gamma":        int(grade.get("gamma", 0)),
-                "gain":         int(grade.get("gain", 0)),
-                "temp_adj":     int(grade.get("temperature", 0)),
-                "sat_adj":      int(grade.get("saturation", 0)),
-                "palette":      json.dumps(ct.get("palette") or []),
+                "lift":         int(float(grade.get("lift") or 0)),
+                "gamma":        int(float(grade.get("gamma") or 0)),
+                "gain":         int(float(grade.get("gain") or 0)),
+                "temp_adj":     int(float(grade.get("temperature") or 0)),
+                "sat_adj":      int(float(grade.get("saturation") or 0)),
+                "palette":      json.dumps(ct.get("palette") if isinstance(ct.get("palette"), list) else []),
                 "ffmpeg_filter": _safe_str(ct.get("ffmpeg_filter", "null"), 500),
             })
             count += 1
