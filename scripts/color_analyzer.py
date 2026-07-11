@@ -244,8 +244,8 @@ def _detect_skin_tone_frame(frame_bgr: np.ndarray) -> dict:
     # Skin hue range in HSV (0-180 scale used by OpenCV): ~0-25
     skin_mask = (
         (h >= 0) & (h <= 25) &
-        (s >= 30) & (s <= 200) &
-        (v >= 60)
+        (s >= 30) & (s <= 170) &
+        (v >= 80) & (v <= 255)
     )
     skin_pct = float(skin_mask.mean())
     if skin_pct < 0.02:

@@ -348,6 +348,9 @@ class PineconeIndexer:
                     "silence_before_s": _f((ev.get("audio_energy") or {}).get("silence_before_s", 0)),
                     "emotion_intensity": _f((ev.get("scores") or {}).get("emotion_intensity", 0)),
                     "emotion_contagion": bool((ev.get("scores") or {}).get("emotion_contagion", False)),
+                    "scene_setting":    _safe_str(ev.get("scene_setting", ""), 300),
+                    "props_visible":    json.dumps(ev.get("props_visible") or []),
+                    "ocr_text":         json.dumps(ev.get("ocr_text") or []),
                 },
             })
 
@@ -805,7 +808,10 @@ class Neo4jGraphBuilder:
                     e.audio_level=$audio_level,
                     e.laugh_detected=$laugh_detected,
                     e.emotion_intensity=$emotion_intensity,
-                    e.emotion_contagion=$emotion_contagion
+                    e.emotion_contagion=$emotion_contagion,
+                    e.scene_setting=$scene_setting,
+                    e.props_visible=$props_visible,
+                    e.ocr_text=$ocr_text
                 WITH e MATCH (v:Video {id:$vid})
                 MERGE (e)-[:PART_OF]->(v)
             """, {
@@ -831,6 +837,9 @@ class Neo4jGraphBuilder:
                 "laugh_detected": bool((ev.get("audio_energy") or {}).get("laugh_detected", False)),
                 "emotion_intensity": _f((ev.get("scores") or {}).get("emotion_intensity", 0)),
                 "emotion_contagion": bool((ev.get("scores") or {}).get("emotion_contagion", False)),
+                "scene_setting": _safe_str(ev.get("scene_setting", ""), 300),
+                "props_visible": json.dumps(ev.get("props_visible") or []),
+                "ocr_text": json.dumps(ev.get("ocr_text") or []),
             })
             count += 1
 

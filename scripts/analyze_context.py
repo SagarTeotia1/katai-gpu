@@ -1376,13 +1376,19 @@ def synthesize_merged(
     video_url   = merged["video_url"]
 
     # Compact timeline text (cap to 600 events to stay within tokens)
-    events = merged["timeline"][:600]
+    _full_tl = merged.get("timeline") or []
+    if len(_full_tl) > 600:
+        log(video_label,
+            f"WARNING: Timeline truncated {len(_full_tl)}→600 events for synthesis "
+            f"(coverage {600/len(_full_tl)*100:.1f}%). "
+            f"Last event at {_full_tl[-1].get('end',0):.1f}s.")
+    events = _full_tl[:600]
     tl_lines = []
     for ev in events:
         speaker  = ev.get("speaker", "")
         txt      = ev.get("transcript_text", "")
         cam      = ev.get("camera") or {}
-        vtags    = ",".join(ev.get("visual_tags") or [])[:60]
+        vtags    = ",".join(ev.get("visual_tags") or [])[:120]
         scores   = ev.get("scores") or {}
         imp_r    = scores.get("importance_reason", "")
         broll    = "broll" if ev.get("broll_usable") else ""
@@ -1478,29 +1484,46 @@ def build_reasoning_pass(
     character models, story structure, belief state, topic graph, comedy
     analysis, object memory, and edit intelligence layers.
     """
-    video_label = merged.get("video_id", "unknown")
-    timeline    = merged.get("timeline", [])
-    known_people = merged.get("known_people", [])
+    video_label     = merged.get("video_id", "unknown")
+    timeline        = merged.get("timeline", [])
+    known_people    = merged.get("known_people", [])
+    color_timeline  = merged.get("color_timeline", [])
 
-    # Build compact event summary for prompt (avoid token explosion)
+    # Build compact event summary for prompt — include visual fields for visual_world layer
     event_summary = []
     for e in timeline:
         if not isinstance(e, dict):
             continue
         event_summary.append({
-            "id":          e.get("id"),
-            "t":           f"{e.get('start', 0):.1f}-{e.get('end', 0):.1f}",
-            "type":        e.get("type"),
-            "speaker":     e.get("speaker"),
-            "moment":      e.get("moment", ""),
-            "transcript":  (e.get("transcript_text", "") or "")[:80],
-            "expressions": [x.get("expression") for x in (e.get("expressions") or []) if isinstance(x, dict)],
-            "reactions":   [x.get("reaction") for x in (e.get("listener_reactions") or []) if isinstance(x, dict)],
-            "laugh":       (e.get("audio_energy") or {}).get("laugh_detected", False),
+            "id":            e.get("id"),
+            "t":             f"{e.get('start', 0):.1f}-{e.get('end', 0):.1f}",
+            "type":          e.get("type"),
+            "speaker":       e.get("speaker"),
+            "moment":        e.get("moment", ""),
+            "transcript":    (e.get("transcript_text", "") or "")[:80],
+            "scene_setting": e.get("scene_setting", ""),
+            "props_visible": (e.get("props_visible") or [])[:4],
+            "ocr_text":      (e.get("ocr_text") or [])[:3],
+            "visual_tags":   (e.get("visual_tags") or [])[:5],
+            "expressions":   [x.get("expression") for x in (e.get("expressions") or []) if isinstance(x, dict)],
+            "reactions":     [x.get("reaction") for x in (e.get("listener_reactions") or []) if isinstance(x, dict)],
+            "laugh":         (e.get("audio_energy") or {}).get("laugh_detected", False),
             "score_importance": (e.get("scores") or {}).get("importance", 0),
         })
 
     people_list = [f"{p.get('person_id')} = {p.get('display_name')}" for p in known_people]
+
+    # Compact color timeline context for visual_world layer
+    _color_ctx = ""
+    if color_timeline:
+        _color_lines = []
+        for ct in color_timeline[:20]:
+            _color_lines.append(
+                f"  {ct.get('start',0):.0f}s-{ct.get('end',0):.0f}s: "
+                f"look={ct.get('look','?')} palette={ct.get('palette',[])} "
+                f"temp={ct.get('temp_label','?')} mood={ct.get('mood','?')}"
+            )
+        _color_ctx = "\n\nCOLOR / VISUAL LOOK DATA:\n" + "\n".join(_color_lines)
 
     system = f"""You are an expert video editor and narrative analyst building an Editor Memory Database.
 Given a timeline of events from a video, produce a structured JSON analysis that captures:
@@ -1512,7 +1535,7 @@ Given a timeline of events from a video, produce a structured JSON analysis that
 - The TOPICS and how they connect
 
 Video has these people: {", ".join(people_list)}
-Total events: {len(event_summary)}
+Total events: {len(event_summary)}{_color_ctx}
 
 Respond with ONLY valid JSON. No markdown. No explanation.
 JSON schema:
@@ -1707,6 +1730,22 @@ OUTPUT ONLY VALID JSON — no markdown, no explanation:
                     ev["visible_people"] = [remapping.get(pid, pid) for pid in ev.get("visible_people", [])]
                 if ev.get("speaker") in remapping:
                     ev["speaker"] = remapping[ev["speaker"]]
+                # Remap nested person IDs
+                for item in (ev.get("listener_reactions") or []):
+                    if isinstance(item, dict) and item.get("person_id") in remapping:
+                        item["person_id"] = remapping[item["person_id"]]
+                for item in (ev.get("expressions") or []):
+                    if isinstance(item, dict) and item.get("person_id") in remapping:
+                        item["person_id"] = remapping[item["person_id"]]
+                for item in (ev.get("physical_actions") or []):
+                    if isinstance(item, dict) and item.get("person_id") in remapping:
+                        item["person_id"] = remapping[item["person_id"]]
+                for item in (ev.get("frame_people") or []):
+                    if isinstance(item, dict) and item.get("person_id") in remapping:
+                        item["person_id"] = remapping[item["person_id"]]
+                cam = ev.get("camera")
+                if isinstance(cam, dict) and cam.get("focus_person") in remapping:
+                    cam["focus_person"] = remapping[cam["focus_person"]]
             log(video_label,
                 f"Continuity done: {len(result['known_people'])} unique people, "
                 f"{len(remapping)} ID remappings applied")
@@ -1744,7 +1783,7 @@ def _make_scene(existing: list, events: list[dict]) -> dict:
         "start":            events[0].get("start", 0),
         "end":              events[-1].get("end", 0),
         "title":            f"Scene {idx}",
-        "description":      "; ".join(e.get("description","")[:60] for e in events[:3]),
+        "description":      "; ".join(e.get("moment","")[:60] for e in events[:3]),
         "people_present":   list({p for e in events for p in e.get("visible_people",[])}),
         "dominant_emotion": events[len(events)//2].get("emotion", ""),
         "narrative_purpose": "",
