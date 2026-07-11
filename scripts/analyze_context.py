@@ -197,7 +197,8 @@ def build_transcript_block(transcripts: dict, video_label: str,
                            start_s: float = 0.0, end_s: float = 1e9) -> str:
     """Extract transcript segments — readable timestamped lines, not raw JSON.
 
-    Format: [start→end] "text"
+    Format (with speaker diarization): [start→end] **P001**: "text"
+    Format (without diarization):      [start→end] "text"
     Easier for the model to quote exact lines and map timestamps to events.
     """
     for v in transcripts.get("videos", []):
@@ -209,8 +210,11 @@ def build_transcript_block(transcripts: dict, video_label: str,
             for s in segs:
                 if s["start"] >= start_s - 2 and s["end"] <= end_s + 2:
                     text = s["text"].strip()
-                    if text:
-                        lines.append(f'[{s["start"]:.1f}s→{s["end"]:.1f}s] "{text}"')
+                    if not text:
+                        continue
+                    spk = s.get("speaker_id")
+                    prefix = f"**{spk}**: " if spk else ""
+                    lines.append(f'[{s["start"]:.1f}s→{s["end"]:.1f}s] {prefix}"{text}"')
             return "\n".join(lines) if lines else "(no speech in this window)"
     return "(no transcript)"
 
@@ -3493,6 +3497,47 @@ def main() -> None:
         transcripts: dict = {"videos": []}
     else:
         transcripts: dict = json.loads(tr_path.read_text(encoding="utf-8"))
+
+    # ── Speaker diarization — audio d-vector embeddings + K-means ────────────
+    # Runs after both transcripts and cast_analysis are loaded so n_speakers is known.
+    # Graceful: if speaker_diarizer is not installed or fails, pipeline continues
+    # unlabeled and build_transcript_block falls back to the plain [time] "text" format.
+    try:
+        import speaker_diarizer as _sd  # type: ignore
+
+        # Build a label→url lookup from cast JSON
+        _url_by_label: dict[str, str] = {v["label"]: v["url"] for v in cast.get("videos", [])}
+
+        for _tv in transcripts.get("videos", []):
+            _vid_label = _tv.get("video", "")
+            _segs      = _tv.get("segments", [])
+            if not _segs:
+                continue
+            _vid_url = _url_by_label.get(_vid_label)
+            if not _vid_url:
+                continue
+            _n_spk = max(1, len(cast_analysis.get("persons", [])))
+            print(
+                f"  [{_vid_label}] Speaker diarization: "
+                f"{_n_spk} speaker(s), {len(_segs)} segments...",
+                flush=True,
+            )
+            _labeled = _sd.diarize(_vid_url, _segs, _n_spk)
+            _tv["segments"] = _labeled
+            _n_done = sum(1 for s in _labeled if s.get("speaker_id"))
+            print(
+                f"  [{_vid_label}] Diarization done: "
+                f"{_n_done}/{len(_labeled)} segments labeled",
+                flush=True,
+            )
+
+    except ImportError:
+        pass  # speaker_diarizer not installed — continue without speaker labels
+    except Exception as _sd_exc:
+        print(
+            f"  [WARN] Speaker diarization failed: {_sd_exc} — continuing unlabeled",
+            flush=True,
+        )
 
     videos  = cast["videos"]
     n       = len(videos)
