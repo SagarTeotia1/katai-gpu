@@ -115,13 +115,11 @@ class VideoService:
             "max_tokens": settings.video_max_tokens,
             "temperature": 0.3,
             "stream": stream,
-            "extra_body": {
-                "top_k": 20,
-                "chat_template_kwargs": {"enable_thinking": False},
-                "mm_processor_kwargs": {
-                    "fps": settings.video_fps,
-                    "do_sample_frames": True,
-                },
+            "top_k": 20,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "mm_processor_kwargs": {
+                "fps": settings.video_fps,
+                "do_sample_frames": True,
             },
         }
 
@@ -199,11 +197,9 @@ class VideoService:
                 "temperature": 0.0 if attempt > 0 else 0.1,
                 "stream": False,
                 "response_format": {"type": "json_object"},
-                "extra_body": {
-                    "top_k": 1 if attempt > 0 else 20,
-                    "chat_template_kwargs": {"enable_thinking": False},
-                    "mm_processor_kwargs": {"fps": settings.video_fps, "do_sample_frames": True},
-                },
+                "top_k": 1 if attempt > 0 else 20,
+                "chat_template_kwargs": {"enable_thinking": False},
+                "mm_processor_kwargs": {"fps": settings.video_fps, "do_sample_frames": True},
             }
             raw = ""
             try:
@@ -250,13 +246,12 @@ class VideoService:
             "temperature": 0.1,
             "stream": False,
             "response_format": {"type": "json_object"},
-            "extra_body": {
-                "top_k": 20,
-                "chat_template_kwargs": {"enable_thinking": False},
-                "mm_processor_kwargs": {
-                    "fps": settings.video_fps,
-                    "do_sample_frames": True,
-                },
+            "top_k": 20,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "mm_processor_kwargs": {
+                "fps": settings.video_fps,
+                "do_sample_frames": True,
+            },
             },
         }
         raw = ""

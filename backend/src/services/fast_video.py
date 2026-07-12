@@ -78,9 +78,7 @@ class FastVideoService:
             }],
             "max_tokens": 200,
             "temperature": 0.1,
-            "extra_body": {
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         try:
             r = await self._client.post(settings.llm_chat_url, json=payload)
@@ -126,10 +124,8 @@ class FastVideoService:
             "temperature": 0.1,
             "stream": False,
             "response_format": {"type": "json_object"},
-            "extra_body": {
-                "top_k": 20,
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
+            "top_k": 20,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         try:
             r = await self._client.post(settings.llm_chat_url, json=payload)

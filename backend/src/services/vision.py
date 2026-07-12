@@ -18,25 +18,36 @@ class VisionService:
     """Downloads images and runs them through vLLM's vision model."""
 
     def __init__(self) -> None:
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=600.0, write=30.0, pool=5.0),
+        # Separate clients so R2 image downloads never starve vLLM POST slots.
+        # pool=5.0 on a shared client caused PoolTimeout: 6 concurrent R2 GETs
+        # held all connections; vLLM POSTs timed out before acquiring a slot.
+        self._image_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=30.0),
+            limits=httpx.Limits(max_connections=32, max_keepalive_connections=8),
+        )
+        self._llm_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=600.0, write=60.0, pool=30.0),
+            limits=httpx.Limits(max_connections=32, max_keepalive_connections=8),
         )
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        await self._image_client.aclose()
+        await self._llm_client.aclose()
 
     async def _fetch_image(self, image_url: str) -> tuple[str, str]:
         """Download image, return (base64_string, mime_type)."""
         try:
-            r = await self._client.get(image_url, follow_redirects=True)
+            r = await self._image_client.get(image_url, follow_redirects=True)
             r.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise VisionServiceError(f"Failed to fetch image ({exc.response.status_code}): {image_url}") from exc
+        except httpx.PoolTimeout as exc:
+            raise VisionServiceError(f"Image download pool timeout: {image_url}") from exc
         except httpx.RequestError as exc:
             raise VisionServiceError(f"Cannot reach image URL: {image_url}") from exc
         mime = r.headers.get("content-type", "image/jpeg").split(";")[0].strip()
         if not mime.startswith("image/"):
-            mime = "image/jpeg"
+            raise VisionServiceError(f"URL did not return an image (content-type: {mime}): {image_url}")
         return base64.b64encode(r.content).decode("utf-8"), mime
 
     def _build_payload(self, image_b64: str, mime: str, prompt: str, *, stream: bool) -> dict:
@@ -81,12 +92,14 @@ class VisionService:
         payload = self._build_payload(image_b64, mime, prompt, stream=False)
 
         try:
-            r = await self._client.post(settings.llm_chat_url, json=payload)
+            r = await self._llm_client.post(settings.llm_chat_url, json=payload)
             r.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise VisionServiceError(f"vLLM vision error {exc.response.status_code}") from exc
+        except httpx.PoolTimeout as exc:
+            raise VisionServiceError("vLLM pool timeout — too many concurrent requests") from exc
         except httpx.RequestError as exc:
-            raise VisionServiceError("vLLM unreachable") from exc
+            raise VisionServiceError(f"vLLM unreachable: {exc}") from exc
 
         data = r.json()
         try:
@@ -104,7 +117,7 @@ class VisionService:
         payload = self._build_payload(image_b64, mime, prompt, stream=True)
 
         try:
-            async with self._client.stream("POST", settings.llm_chat_url, json=payload) as response:
+            async with self._llm_client.stream("POST", settings.llm_chat_url, json=payload) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     line = line.strip()
@@ -123,4 +136,4 @@ class VisionService:
         except httpx.HTTPStatusError as exc:
             raise VisionServiceError(f"vLLM stream error {exc.response.status_code}") from exc
         except httpx.RequestError as exc:
-            raise VisionServiceError("vLLM unreachable during stream") from exc
+            raise VisionServiceError(f"vLLM unreachable during stream: {exc}") from exc
