@@ -252,7 +252,6 @@ class VideoService:
                 "fps": settings.video_fps,
                 "do_sample_frames": True,
             },
-            },
         }
         raw = ""
         try:
