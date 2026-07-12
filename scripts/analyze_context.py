@@ -1638,7 +1638,7 @@ Return ONLY valid JSON:
     "closing_beat": "<exact timestamp and transition instruction>",
     "editor_todo": ["<1. specific numbered task>"]
   }}
-}}}"""
+}}"""
 
 
 # ── Color analysis (CPU, concurrent with VLM prefill) ────────────────────────
