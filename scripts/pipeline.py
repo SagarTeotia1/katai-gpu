@@ -594,8 +594,9 @@ def main() -> None:
     # ─────────────────────────────────────────────────────────────────────────
     context_files: list[str] = []
 
+    ctx_step_num = 3 if (seq_mode and run_cast and run_trans) else 2
     if args.skip_context:
-        section(2, TOTAL_STEPS, "Semantic Event Analysis", "SKIP")
+        section(ctx_step_num, TOTAL_STEPS, "Semantic Event Analysis", "SKIP")
         found = sorted(Path("output").glob("context_*.json"), key=lambda p: p.stat().st_mtime)
         context_files = [str(f) for f in found]
         print(f"  Using {len(context_files)} existing context files:", flush=True)
@@ -603,7 +604,7 @@ def main() -> None:
             print(f"    {dim('→')} {f}", flush=True)
         summary["steps"]["context_analysis"] = {"status": "skipped", "output_files": context_files}
     else:
-        section(2, TOTAL_STEPS, "Semantic Event Analysis", "RUNNING")
+        section(ctx_step_num, TOTAL_STEPS, "Semantic Event Analysis", "RUNNING")
 
         # Planner-specific info block
         if planner == "semantic":
