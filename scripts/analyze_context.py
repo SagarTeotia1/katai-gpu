@@ -20,6 +20,7 @@ Usage:
 """
 import argparse
 import asyncio
+import collections
 import json
 import os
 import re
@@ -3065,6 +3066,8 @@ def _plan_video_chunks(
     n_chunks: int,
     model_id: str,
     planner: str = "semantic",
+    checkpoint_dir: "Path | None" = None,
+    resume: bool = False,
 ) -> dict:
     """Returns plan dict or dict with 'error' key if planning fails.
 
@@ -3171,17 +3174,48 @@ def _plan_video_chunks(
     def label_fn(c: Chunk) -> str:
         return f"{video_label}/chunk{c.chunk_id}"
 
+    # ── Checkpoint resume — load pre-done results, skip their chunks ─────────────
+    ck_video_dir: Path | None = None
+    ck_results_preloaded: list[dict] = []
+    if checkpoint_dir is not None and resume:
+        ck_video_dir = checkpoint_dir / video_label.replace(" ", "_").replace("/", "_")
+        if ck_video_dir.exists():
+            done_windows: set[tuple[float, float]] = set()
+            for ck_f in sorted(ck_video_dir.glob("chunk_*.json")):
+                try:
+                    cr = json.loads(ck_f.read_text(encoding="utf-8"))
+                    if cr.get("ok"):
+                        ss = round(float(cr.get("strict_start", 0)), 1)
+                        se = round(float(cr.get("strict_end", 0)), 1)
+                        done_windows.add((ss, se))
+                        ck_results_preloaded.append(cr)
+                except Exception:
+                    pass
+            if ck_results_preloaded:
+                chunks_before = len(chunks)
+                chunks = [c for c in chunks
+                          if (round(c.strict_start, 1), round(c.strict_end, 1)) not in done_windows]
+                n_planned = len(chunks)
+                log(video_label,
+                    f"Checkpoint resume: {len(ck_results_preloaded)} done "
+                    f"({chunks_before - n_planned} skipped) → {n_planned} remaining")
+
     return {
-        "chunks":         chunks,
-        "build_payload":  build_payload,
-        "label_fn":       label_fn,
-        "n_planned":      n_planned,
-        "person_db":      person_db,
-        "safe_url":       safe_url,
-        "video_url":      video_url,
-        "total_duration": total_duration,
-        "cast_analysis":  cast_analysis,
-        "t0":             t0,
+        "chunks":               chunks,
+        "build_payload":        build_payload,
+        "label_fn":             label_fn,
+        "n_planned":            n_planned,
+        "person_db":            person_db,
+        "safe_url":             safe_url,
+        "video_url":            video_url,
+        "total_duration":       total_duration,
+        "cast_analysis":        cast_analysis,
+        "t0":                   t0,
+        "ck_results_preloaded": ck_results_preloaded,
+        "checkpoint_dir":       str(ck_video_dir) if ck_video_dir else (
+                                    str(checkpoint_dir / video_label.replace(" ", "_").replace("/", "_"))
+                                    if checkpoint_dir else None
+                                ),
     }
 
 
@@ -3199,19 +3233,43 @@ async def _dispatch_all_async(
     Returns {label: (raw_results_list, dispatcher)} for each video.
     """
     shared_sem = asyncio.Semaphore(MAX_INFLIGHT)
-    _planned_chunks = sum(p["n_planned"] for p in video_plans.values())
+    # Use actual chunk counts (may be reduced by resume filtering)
+    _planned_chunks = sum(len(p["chunks"]) for p in video_plans.values())
     t0_dispatch   = time.time()
+
+    # Per-video checkpoint dirs — created from plan["checkpoint_dir"] if set.
+    def _make_save_ck(ck_dir_str: "str | None"):
+        if not ck_dir_str:
+            return None
+        ck_d = Path(ck_dir_str)
+        ck_d.mkdir(parents=True, exist_ok=True)
+        def _save(result: dict) -> None:
+            if not result.get("ok"):
+                return
+            try:
+                cid = result.get("chunk_id", 0)
+                ss  = int(result.get("strict_start", 0))
+                se  = int(result.get("strict_end", 0))
+                (ck_d / f"chunk_{cid}_{ss}_{se}.json").write_text(
+                    json.dumps(result, ensure_ascii=False), encoding="utf-8"
+                )
+            except Exception:
+                pass
+        return _save
 
     # Per-video progress counters (updated inside log_fn which runs in threads)
     _prog_lock = threading.Lock()
     _prog: dict = {
-        lbl: {"done": 0, "failed": 0, "total": plan["n_planned"]}
+        lbl: {"done": 0, "failed": 0, "total": len(plan["chunks"])}
         for lbl, plan in video_plans.items()
     }
     _total_done     = [0]   # mutable via list
     _total_seen     = [_planned_chunks]  # grows when adaptive splits add chunks
     _tokens_prefill = [0]
     _tokens_decode  = [0]
+    # Rolling ETA — ring buffer of (monotonic_time, done_count) samples
+    _rate_window: collections.deque = collections.deque(maxlen=60)
+    _rate_window.append((time.monotonic(), 0))
 
     def _log_with_progress(label: str, msg: str) -> None:
         _log_thread_safe(label, msg)
@@ -3249,10 +3307,20 @@ async def _dispatch_all_async(
             snap  = {lbl: dict(v) for lbl, v in _prog.items()}
             tok_in  = _tokens_prefill[0]
             tok_out = _tokens_decode[0]
+            # Rolling ETA sample
+            _rate_window.append((time.monotonic(), done))
 
         elapsed = time.time() - t0_dispatch
-        rate    = done / max(elapsed, 1)
-        eta     = (total - done) / max(rate, 0.001)
+        # Rolling ETA: use last N-sample window to compute current throughput rate
+        with _prog_lock:
+            rw = list(_rate_window)
+        if len(rw) >= 2:
+            w_t0, w_d0 = rw[0]
+            w_t1, w_d1 = rw[-1]
+            window_rate = (w_d1 - w_d0) / max(time.monotonic() - w_t0, 1.0)
+            eta = (total - done) / max(window_rate, 0.001)
+        else:
+            eta = (total - done) / max(done / max(elapsed, 1), 0.001)
         bar_w   = 24
         filled  = int(bar_w * done / max(total, 1))
         bar_str = "█" * filled + "░" * (bar_w - filled)
@@ -3294,6 +3362,7 @@ async def _dispatch_all_async(
         )
         dispatchers[label] = disp
         label_order.append(label)
+        _ck_cb = _make_save_ck(plan.get("checkpoint_dir"))
         coros.append(disp.run_adaptive(
             plan["chunks"], plan["build_payload"],
             label_fn=plan["label_fn"], log_fn=_log_with_progress,
@@ -3301,6 +3370,7 @@ async def _dispatch_all_async(
             fps=MM_FPS,        # must match vLLM --mm-processor-kwargs fps
             min_frames=3,      # each half must have >= 3 frames → min 3s at fps=1
             max_splits=16,     # cap at initial chunk count to prevent runaway explosion
+            on_result=_ck_cb,
         ))
 
     log("dispatch", f"Firing {_planned_chunks} planned chunks across {len(video_plans)} videos "
@@ -3344,20 +3414,41 @@ def _finalize_video(
         return {"ok": False, "error": str(raw_results),
                 "elapsed": round(time.time() - t0, 1), "attempts": 1}
 
+    # Prepend pre-loaded checkpoint results from previous (interrupted) runs
+    ck_pre = plan.get("ck_results_preloaded") or []
+    if ck_pre:
+        raw_results = list(ck_pre) + list(raw_results)
+        log(video_label, f"Resume: injected {len(ck_pre)} checkpoint results + {len(raw_results)-len(ck_pre)} new")
+
     # ── PARSE + STUB ──────────────────────────────────────────────────────────
+    # run_adaptive returns results in COMPLETION ORDER, not plan order, and may
+    # include adaptive-split chunks not in the original plan. Match by chunk_id;
+    # fall back to result's own window metadata for adaptive splits.
+    chunk_by_id: dict[int, "Chunk"] = {c.chunk_id: c for c in chunks}
     chunk_results: list[dict] = []
     ok_chunks = 0
-    for chunk, res in _zip_longest(chunks, raw_results, fillvalue=None):
-        if chunk is None or res is None:
-            log(video_label, f"WARNING: chunk/result mismatch at position — skipping orphan entry")
+    for res in raw_results:
+        if res is None:
             continue
-        lbl = label_fn(chunk)
+        cid   = res.get("chunk_id", -1)
+        chunk = chunk_by_id.get(cid)
+        # Use result's own window (adaptive splits have the correct window in res)
+        res_start = res.get("strict_start", chunk.strict_start if chunk else 0.0)
+        res_end   = res.get("strict_end",   chunk.strict_end   if chunk else 0.0)
+        lbl = f"{video_label}/chunk{cid}"
         if not res["ok"] or res["response"] is None:
-            slice_ = build_transcript_block(
-                transcripts, video_label,
-                start_s=chunk.strict_start, end_s=chunk.strict_end,
-            )
-            stub = stub_failed_chunk(chunk, slice_)
+            if chunk:
+                stub = stub_failed_chunk(chunk, build_transcript_block(
+                    transcripts, video_label, start_s=res_start, end_s=res_end,
+                ))
+            else:
+                from chunk_dispatch import Chunk as _Chunk
+                _tmp = _Chunk(chunk_id=cid, scene_id=0, part_idx=0,
+                              strict_start=res_start, strict_end=res_end,
+                              pad_start=res_start, pad_end=res_end)
+                stub = stub_failed_chunk(_tmp, build_transcript_block(
+                    transcripts, video_label, start_s=res_start, end_s=res_end,
+                ))
             stub["error"] = res.get("error") or "unknown"
             chunk_results.append(stub)
             log(lbl, f"stubbed (error: {stub['error']})")
@@ -3367,11 +3458,18 @@ def _finalize_video(
         try:
             parsed = _extract_chunk_json(res["response"], lbl)
         except (ValueError, KeyError) as e:
-            slice_ = build_transcript_block(
-                transcripts, video_label,
-                start_s=chunk.strict_start, end_s=chunk.strict_end,
-            )
-            stub = stub_failed_chunk(chunk, slice_)
+            if chunk:
+                stub = stub_failed_chunk(chunk, build_transcript_block(
+                    transcripts, video_label, start_s=res_start, end_s=res_end,
+                ))
+            else:
+                from chunk_dispatch import Chunk as _Chunk
+                _tmp = _Chunk(chunk_id=cid, scene_id=0, part_idx=0,
+                              strict_start=res_start, strict_end=res_end,
+                              pad_start=res_start, pad_end=res_end)
+                stub = stub_failed_chunk(_tmp, build_transcript_block(
+                    transcripts, video_label, start_s=res_start, end_s=res_end,
+                ))
             stub["error"] = f"parse: {e}"
             chunk_results.append(stub)
             log(lbl, f"parse failure → stubbed ({e})")
@@ -3379,11 +3477,11 @@ def _finalize_video(
                 global_progress["chunks_failed"] += 1
             continue
         parsed["ok"]           = True
-        parsed["chunk_id"]     = chunk.chunk_id
-        parsed["scene_id"]     = chunk.scene_id
-        parsed["part_idx"]     = chunk.part_idx
-        parsed["strict_start"] = chunk.strict_start
-        parsed["strict_end"]   = chunk.strict_end
+        parsed["chunk_id"]     = cid
+        parsed["scene_id"]     = chunk.scene_id  if chunk else 0
+        parsed["part_idx"]     = chunk.part_idx  if chunk else 0
+        parsed["strict_start"] = res_start
+        parsed["strict_end"]   = res_end
         parsed["wall_s"]       = round(res["wall_s"], 2)
         chunk_results.append(parsed)
         ok_chunks += 1
@@ -4231,7 +4329,12 @@ def main() -> None:
     parser.add_argument("--cast", default="cast.json")
     parser.add_argument("--cast-analysis", default=None)
     parser.add_argument("--transcripts",   default=None)
-    parser.add_argument("--output",   default="output")
+    parser.add_argument("--output",         default="output")
+    parser.add_argument("--checkpoint-dir", default=None,
+                        help="Directory to save per-chunk results for crash resume. "
+                             "Default: output/checkpoints. Pass 'none' to disable.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from existing checkpoints in --checkpoint-dir.")
     parser.add_argument("--vllm",     default=VLLM_URL)
     parser.add_argument("--backend",  default="http://localhost:8080")
     parser.add_argument("--model",    default=MODEL_ID)
@@ -4267,6 +4370,13 @@ def main() -> None:
     backend_url = args.backend
     # --scene-align is deprecated; let it override --planner for compat
     planner = "scene" if args.scene_align else args.planner
+    # Checkpoint dir: default output/checkpoints, disable with 'none'
+    _ck_arg = getattr(args, "checkpoint_dir", None)
+    _do_resume = getattr(args, "resume", False)
+    if _ck_arg and _ck_arg.lower() == "none":
+        checkpoint_dir: Path | None = None
+    else:
+        checkpoint_dir = Path(_ck_arg) if _ck_arg else Path(args.output) / "checkpoints"
 
     # ── Load inputs ──────────────────────────────────────────────────────────
     cast_path = Path(args.cast)
@@ -4429,6 +4539,8 @@ def main() -> None:
                     label, v["url"], cast_analysis, transcripts,
                     durations.get(label, 600.0), chunk_alloc.get(label, n_chunks),
                     model_id, planner,
+                    checkpoint_dir=checkpoint_dir,
+                    resume=_do_resume,
                 )
                 if "error" in plan:
                     results[label] = {"ok": False, "error": plan["error"],

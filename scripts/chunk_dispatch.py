@@ -599,6 +599,7 @@ class ChunkDispatcher:
         fps: float = 1.0,
         min_frames: int = 3,
         max_splits: int = 48,
+        on_result: "Callable[[dict], None] | None" = None,
     ) -> list[dict[str, Any]]:
         """Like ``run()`` but uses WorkStealingQueue for adaptive tail splitting.
 
@@ -697,6 +698,11 @@ class ChunkDispatcher:
                         continue  # halves re-queued; skip result append + queue.done
                     async with results_lock:
                         results.append(result)
+                    if on_result is not None:
+                        try:
+                            on_result(result)
+                        except Exception:
+                            pass
                     n_splits = await queue.done(chunk, current_inflight=self._inflight)
                     if n_splits:
                         _log(label,
@@ -789,7 +795,7 @@ class ChunkDispatcher:
                 if attempt >= self.retries:
                     break
                 delay = self.backoff[min(attempt, len(self.backoff) - 1)]
-                log_fn(label, f"attempt {attempt + 1} retriable ({exc}); sleeping {delay:.1f}s")
+                log_fn(label, f"attempt {attempt + 1} retriable ({type(exc).__name__}: {exc!r}); sleeping {delay:.1f}s")
                 await asyncio.sleep(delay)
             except RuntimeError:
                 # Non-retriable HTTP status — surface immediately.
