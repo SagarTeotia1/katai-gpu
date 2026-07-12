@@ -229,7 +229,10 @@ pipeline: ## ONE CMD — cast→transcript→diarize→context→index — usage
 	@python3 scripts/pipeline.py $(CAST) \
 		--backend http://localhost:$(BACKEND_PORT) \
 		--vllm http://localhost:$(VLLM_PORT)/v1/chat/completions \
-		--whisper http://localhost:$(WHISPER_PORT) \
+		--local-whisper \
+		--whisper-model $(WHISPER_MODEL) \
+		--whisper-device $(WHISPER_DEVICE) \
+		--whisper-compute-type $(WHISPER_COMPUTE) \
 		--chunks $(CHUNKS) \
 		--workers $(WORKERS) \
 		--whisper-workers $(WHISPER_WORKERS) \
