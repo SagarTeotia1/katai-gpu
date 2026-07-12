@@ -3154,22 +3154,42 @@ def _finalize_video(
     _crossvalidate_speakers(merged.get("timeline", []), transcripts, video_label)
     _link_callbacks(merged.get("timeline", []), video_label)
 
-    # ── SYNTH ─────────────────────────────────────────────────────────────────
+    # ── SYNTH + REASONING in parallel ────────────────────────────────────────
+    # reasoning reads only timeline/known_people/color_timeline (all from map phase)
+    # → independent of synthesis output → fire both simultaneously
     t_synth = time.time()
     synth_wall_s = 0.0
-    try:
-        merged = synthesize_merged(merged, person_db, total_duration, vllm_url, model_id)
-        synth_wall_s = time.time() - t_synth
-    except Exception as e:
-        synth_wall_s = time.time() - t_synth
-        log(video_label,
-            f"Synthesis failed ({e}) — saving merged timeline without editorial")
+    _synth_result:  list[dict]  = [merged]
+    _reason_result: list[dict]  = [merged]
 
-    # ── REASONING PASS ───────────────────────────────────────────────────────
-    try:
-        merged = build_reasoning_pass(merged, vllm_url, model_id)
-    except Exception as e:
-        log(video_label, f"Reasoning pass failed ({e}) — saving without reasoning layers")
+    def _run_synth() -> None:
+        try:
+            _synth_result[0] = synthesize_merged(merged, person_db, total_duration, vllm_url, model_id)
+        except Exception as e:
+            log(video_label, f"Synthesis failed ({e}) — saving merged timeline without editorial")
+
+    def _run_reasoning() -> None:
+        try:
+            _reason_result[0] = build_reasoning_pass(merged, vllm_url, model_id)
+        except Exception as e:
+            log(video_label, f"Reasoning pass failed ({e}) — saving without reasoning layers")
+
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    with _TPE(max_workers=2) as _pool:
+        _fs = _pool.submit(_run_synth)
+        _fr = _pool.submit(_run_reasoning)
+        _fs.result()
+        _fr.result()
+
+    synth_wall_s = time.time() - t_synth
+    # Merge: start from synth output (has editorial fields), overlay reasoning layers
+    merged = _synth_result[0]
+    for _rk, _rv in _reason_result[0].items():
+        if _rk not in merged or _rk.startswith("viewer_") or _rk.startswith("relationship") \
+                or _rk in ("character_model", "story_graph", "belief_state_timeline",
+                            "topic_graph", "comedy_analysis", "object_memory",
+                            "visual_world", "edit_intelligence"):
+            merged[_rk] = _rv
 
     # ── CONTINUITY PASS (optional) ────────────────────────────────────────────
     if context_mode == "continuity":
@@ -3847,21 +3867,39 @@ def analyze_video_chunked(
                 "elapsed": round(time.time() - t0, 1), "attempts": 1}
 
     # ── SYNTH ─────────────────────────────────────────────────────────────────
+    # ── SYNTH + REASONING in parallel ────────────────────────────────────────
     t_synth_start = time.time()
-    synth_wall_s = 0.0
-    try:
-        merged = synthesize_merged(merged, person_db, total_duration, vllm_url, model_id)
-        synth_wall_s = time.time() - t_synth_start
-    except Exception as e:
-        synth_wall_s = time.time() - t_synth_start
-        log(video_label,
-            f"Synthesis failed ({e}) — saving merged timeline without editorial")
+    synth_wall_s  = 0.0
+    _synth_result2:  list[dict] = [merged]
+    _reason_result2: list[dict] = [merged]
 
-    # ── REASONING PASS ───────────────────────────────────────────────────────
-    try:
-        merged = build_reasoning_pass(merged, vllm_url, model_id)
-    except Exception as e:
-        log(video_label, f"Reasoning pass failed ({e}) — saving without reasoning layers")
+    def _run_synth2() -> None:
+        try:
+            _synth_result2[0] = synthesize_merged(merged, person_db, total_duration, vllm_url, model_id)
+        except Exception as e:
+            log(video_label, f"Synthesis failed ({e}) — saving merged timeline without editorial")
+
+    def _run_reasoning2() -> None:
+        try:
+            _reason_result2[0] = build_reasoning_pass(merged, vllm_url, model_id)
+        except Exception as e:
+            log(video_label, f"Reasoning pass failed ({e}) — saving without reasoning layers")
+
+    from concurrent.futures import ThreadPoolExecutor as _TPE2
+    with _TPE2(max_workers=2) as _pool2:
+        _fs2 = _pool2.submit(_run_synth2)
+        _fr2 = _pool2.submit(_run_reasoning2)
+        _fs2.result()
+        _fr2.result()
+
+    synth_wall_s = time.time() - t_synth_start
+    merged = _synth_result2[0]
+    for _rk2, _rv2 in _reason_result2[0].items():
+        if _rk2 not in merged or _rk2.startswith("viewer_") or _rk2.startswith("relationship") \
+                or _rk2 in ("character_model", "story_graph", "belief_state_timeline",
+                             "topic_graph", "comedy_analysis", "object_memory",
+                             "visual_world", "edit_intelligence"):
+            merged[_rk2] = _rv2
 
     # Rebuild emotion arcs with stable post-synthesis person IDs
     merged["emotion_arcs"] = build_emotion_arcs(merged.get("timeline", []), window_s=30.0)
