@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """
 Whisper transcription script — reads cast JSON or video URL list,
-calls the whisper service, saves structured transcript JSON.
+calls the whisper service (Docker) OR runs faster-whisper locally on GPU.
 
 Output per video:
   { video, source, url, language, duration_s, transcript, segments: [{id, start, end, text, words}] }
 
 Usage:
-  python3 scripts/transcribe.py --cast cast.json
+  python3 scripts/transcribe.py --cast cast.json                         # Docker whisper service
+  python3 scripts/transcribe.py --cast cast.json --local                 # GPU local (faster-whisper)
+  python3 scripts/transcribe.py --cast cast.json --local --model large-v3
   python3 scripts/transcribe.py --videos "https://..." "https://..."
-  python3 scripts/transcribe.py --cast cast.json --output output/transcripts.json
   make transcribe CAST=cast.json
+  make transcribe-gpu CAST=cast.json
 """
 import argparse
 import json
+import os
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -78,6 +83,88 @@ def call_whisper(video_url: str, whisper_base: str, language: str | None = None)
     return json.loads(resp.read())
 
 
+def _download_audio(url: str, tmp_dir: str) -> str:
+    """Download/extract audio from URL to WAV via ffmpeg. Returns path to WAV file."""
+    out_path = os.path.join(tmp_dir, "audio.wav")
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", url,
+        "-vn", "-ar", "16000", "-ac", "1", "-f", "wav",
+        out_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, timeout=600)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {result.stderr.decode()[:300]}")
+    return out_path
+
+
+def transcribe_local(label: str, source: str, url: str,
+                     model_size: str = "large-v3",
+                     device: str = "cuda",
+                     compute_type: str = "float16",
+                     language: str | None = None) -> dict:
+    """Transcribe using faster-whisper directly on GPU (no Docker service needed)."""
+    t0 = time.time()
+    print(f"  [{label}] Local GPU whisper — downloading audio...", flush=True)
+    try:
+        from faster_whisper import WhisperModel  # type: ignore
+    except ImportError:
+        raise RuntimeError("faster-whisper not installed. Run: pip install faster-whisper")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        audio_path = _download_audio(url, tmp_dir)
+        print(f"  [{label}] Audio ready — loading model {model_size} on {device}...", flush=True)
+
+        model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        segments_iter, info = model.transcribe(
+            audio_path,
+            language=language,
+            beam_size=5,
+            word_timestamps=True,
+            vad_filter=True,
+        )
+
+        segments_list = []
+        transcript_parts = []
+        for i, seg in enumerate(segments_iter):
+            words = []
+            if seg.words:
+                words = [{"word": w.word, "start": round(w.start, 3), "end": round(w.end, 3), "probability": round(w.probability, 3)} for w in seg.words]
+            segments_list.append({
+                "id": i,
+                "start": round(seg.start, 3),
+                "end": round(seg.end, 3),
+                "text": seg.text.strip(),
+                "words": words,
+            })
+            transcript_parts.append(seg.text.strip())
+
+        elapsed = time.time() - t0
+        duration_s = round(info.duration, 2)
+        lang = info.language
+        lang_prob = round(info.language_probability, 3)
+        transcript = " ".join(transcript_parts)
+
+        print(
+            f"  [{label}] Done — {len(segments_list)} segments | lang={lang} "
+            f"| {duration_s}s audio | {elapsed:.1f}s wall",
+            flush=True,
+        )
+        return {
+            "video": label,
+            "source": source,
+            "url": url,
+            "ok": True,
+            "error": None,
+            "transcription_time_s": round(elapsed, 1),
+            "language": lang,
+            "language_probability": lang_prob,
+            "duration_s": duration_s,
+            "transcript": transcript,
+            "segments": segments_list,
+        }
+
+
 def transcribe_video(label: str, source: str, url: str, whisper_base: str, language: str | None) -> dict:
     t0 = time.time()
     print(f"  [{label}] Transcribing: {url}", flush=True)
@@ -139,6 +226,18 @@ def main() -> None:
                              "vLLM idle during this stage.")
     parser.add_argument("--backend", default=f"http://localhost:{BACKEND_PORT}",
                         help="Backend URL (used for ffprobe duration lookup when --workers=0).")
+    parser.add_argument("--local", action="store_true",
+                        help="Run faster-whisper locally on GPU instead of Docker service. "
+                             "Requires: pip install faster-whisper")
+    parser.add_argument("--model", default="large-v3",
+                        help="Whisper model size for --local mode (default: large-v3). "
+                             "Options: tiny, base, small, medium, large-v2, large-v3")
+    parser.add_argument("--compute-type", default="float16",
+                        dest="compute_type",
+                        help="Compute type for --local mode (default: float16). "
+                             "Options: float16, int8_float16, int8")
+    parser.add_argument("--device", default="cuda",
+                        help="Device for --local mode (default: cuda). Options: cuda, cpu")
     args = parser.parse_args()
 
     # Build video list
@@ -154,47 +253,67 @@ def main() -> None:
     out_path = Path(args.output) if args.output else Path("output") / f"transcripts_{ts}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    mode_str = f"local GPU ({args.device}, {args.model}, {args.compute_type})" if args.local else args.whisper
     print(f"\n{'='*60}")
     print(f"  Whisper Transcription Pipeline")
-    print(f"  Service:  {args.whisper}")
+    print(f"  Mode:     {mode_str}")
     print(f"  Videos:   {len(videos)}")
     print(f"  Language: {args.language or 'auto-detect'}")
     print(f"  Output:   {out_path}")
     print(f"{'='*60}\n")
 
-    # Service health check
-    print("  Checking whisper service...", flush=True)
-    if not check_service(args.whisper):
-        print(f"\n  ERROR: Whisper service not ready at {args.whisper}")
-        print("  Start it: docker compose up -d whisper")
-        print("  Wait for model load (first run ~2 min, then cached)")
-        sys.exit(1)
-    print("  Service ready.\n", flush=True)
-
     t_wall = time.time()
     results = []
 
-    # Parallel — vLLM idle during transcribe stage, safe to stack whisper workers.
-    if args.workers and args.workers > 0:
-        workers = max(1, min(args.workers, len(videos)))
-        print(f"  Parallel workers: {workers} (manual)\n", flush=True)
+    if args.local:
+        # Local GPU mode — sequential (one model instance shared, GPU already saturated by vLLM if running)
+        print(f"  Local GPU mode — loading faster-whisper {args.model} on {args.device}...", flush=True)
+        for v in videos:
+            try:
+                r = transcribe_local(
+                    v["label"], v["source"], v["url"],
+                    model_size=args.model,
+                    device=args.device,
+                    compute_type=args.compute_type,
+                    language=args.language,
+                )
+            except Exception as e:
+                print(f"  [{v['label']}] FAILED — {e}", flush=True)
+                r = {"video": v["label"], "source": v["source"], "url": v["url"],
+                     "ok": False, "error": str(e), "language": None,
+                     "duration_s": None, "transcript": None, "segments": []}
+            results.append(r)
     else:
-        print("  Probing durations (ffprobe via backend) for dynamic worker count...", flush=True)
-        durations = [probe_duration(args.backend, v["url"]) for v in videos]
-        for v, d in zip(videos, durations):
-            print(f"    [{v['label']}] {d:.1f}s" if d else f"    [{v['label']}] unknown", flush=True)
-        workers = dynamic_worker_count(durations, len(videos))
-        known = [d for d in durations if d]
-        max_d = max(known) if known else 0
-        print(f"  Parallel workers: {workers} (auto — max duration {max_d:.0f}s)\n", flush=True)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(transcribe_video, v["label"], v["source"], v["url"],
-                        args.whisper, args.language): v["label"]
-            for v in videos
-        }
-        for fut in as_completed(futures):
-            results.append(fut.result())
+        # Docker whisper service mode
+        print("  Checking whisper service...", flush=True)
+        if not check_service(args.whisper):
+            print(f"\n  ERROR: Whisper service not ready at {args.whisper}")
+            print("  Start it: docker compose up -d whisper")
+            print("  Wait for model load (first run ~2 min, then cached)")
+            sys.exit(1)
+        print("  Service ready.\n", flush=True)
+
+        # Parallel — vLLM idle during transcribe stage, safe to stack whisper workers.
+        if args.workers and args.workers > 0:
+            workers = max(1, min(args.workers, len(videos)))
+            print(f"  Parallel workers: {workers} (manual)\n", flush=True)
+        else:
+            print("  Probing durations (ffprobe via backend) for dynamic worker count...", flush=True)
+            durations = [probe_duration(args.backend, v["url"]) for v in videos]
+            for v, d in zip(videos, durations):
+                print(f"    [{v['label']}] {d:.1f}s" if d else f"    [{v['label']}] unknown", flush=True)
+            workers = dynamic_worker_count(durations, len(videos))
+            known = [d for d in durations if d]
+            max_d = max(known) if known else 0
+            print(f"  Parallel workers: {workers} (auto — max duration {max_d:.0f}s)\n", flush=True)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(transcribe_video, v["label"], v["source"], v["url"],
+                            args.whisper, args.language): v["label"]
+                for v in videos
+            }
+            for fut in as_completed(futures):
+                results.append(fut.result())
     # Stable label order for output
     order = {v["label"]: i for i, v in enumerate(videos)}
     results.sort(key=lambda r: order.get(r.get("video", ""), 1_000_000))

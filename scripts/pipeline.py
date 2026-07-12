@@ -331,6 +331,19 @@ def main() -> None:
     parser.add_argument("--no-index",    action="store_true", help="Skip Pinecone + Neo4j indexing")
     parser.add_argument("--no-pinecone", action="store_true", help="Index to Neo4j only")
     parser.add_argument("--no-neo4j",    action="store_true", help="Index to Pinecone only")
+    parser.add_argument("--sequential", action="store_true",
+                        help="Run stages in strict order: Whisper → Cast → Context (no parallelism). "
+                             "Use with --local-whisper to transcribe on GPU before vLLM loads.")
+    parser.add_argument("--local-whisper", action="store_true",
+                        help="Use faster-whisper on GPU host instead of Docker whisper service. "
+                             "Requires: pip install faster-whisper. Best used with --sequential.")
+    parser.add_argument("--whisper-model", default="large-v3",
+                        help="Model size for --local-whisper (default: large-v3).")
+    parser.add_argument("--whisper-device", default="cuda",
+                        help="Device for --local-whisper (default: cuda).")
+    parser.add_argument("--whisper-compute-type", default="float16",
+                        dest="whisper_compute_type",
+                        help="Compute type for --local-whisper (default: float16).")
     args = parser.parse_args()
 
     cast_path = Path(args.cast)
@@ -501,12 +514,18 @@ def main() -> None:
 
     cast_cmd  = [PYTHON, SCRIPTS / "cast_analysis.py", cast_path, "--backend", args.backend]
     trans_cmd = [PYTHON, SCRIPTS / "transcribe.py", "--cast", cast_path,
-                 "--whisper", args.whisper, "--backend", args.backend,
+                 "--backend", args.backend,
                  "--workers", str(args.whisper_workers)]
+    if args.local_whisper:
+        trans_cmd += ["--local", "--model", args.whisper_model,
+                      "--device", args.whisper_device,
+                      "--compute-type", args.whisper_compute_type]
+    else:
+        trans_cmd += ["--whisper", args.whisper]
 
     t0_both = time.time()
 
-    if run_cast and run_trans:
+    if run_cast and run_trans and not args.sequential:
         section(1, TOTAL_STEPS, "Cast Analysis + Whisper Transcription", "RUNNING")
         print(f"  {cyan('[parallel]')} Cast on GPU, Whisper on CPU — wall = max(cast, whisper)\n", flush=True)
         (cast_ok, cast_m, _), (trans_ok, trans_m, _) = run_step_parallel(
@@ -515,6 +534,19 @@ def main() -> None:
         )
         _record_cast(cast_ok,   cast_m,  t0_both)
         _record_trans(trans_ok, trans_m, t0_both)
+    elif run_cast and run_trans and args.sequential:
+        # Sequential: Whisper first (GPU), then Cast
+        whisper_mode = "local GPU" if args.local_whisper else "Docker service"
+        section(1, TOTAL_STEPS, f"Whisper Transcription [{whisper_mode}]", "RUNNING")
+        t0 = time.time()
+        ok, metrics, _ = run_step(trans_cmd, parse_transcribe)
+        _record_trans(ok, metrics, t0)
+        write_summary(summary, summary_path)
+
+        section(2, TOTAL_STEPS, "Cast Appearance Analysis", "RUNNING")
+        t0 = time.time()
+        ok, metrics, _ = run_step(cast_cmd, parse_cast)
+        _record_cast(ok, metrics, t0)
     else:
         if not run_cast:
             cast_analysis_file = _resolve_skip(args.skip_cast, "output/cast_analysis_*.json")

@@ -1,9 +1,10 @@
 .PHONY: up down logs build shell-backend shell-vllm restart clean test chat analyze parallel help \
-        pipeline pipeline-context pipeline-reindex pipeline-status \
-        transcribe transcribe-urls analyze-context index-context index-pinecone index-neo4j \
+        pipeline pipeline-seq pipeline-context pipeline-reindex pipeline-status \
+        transcribe transcribe-gpu transcribe-urls analyze-context index-context index-pinecone index-neo4j \
         color-grade export-lut grade-apply emotion-arcs \
         query retrieve edit edit2 direct \
-        install logs-vllm logs-backend logs-frontend \
+        install install-diarization install-whisper-gpu \
+        logs-vllm logs-backend logs-frontend \
         video video-chunk video-fast video-semantic video-bench vision-bench \
         cast-analysis whisper-up whisper-logs whisper-health \
         neo4j-up neo4j-logs list-models status health-backend health-vllm gpu-info \
@@ -33,11 +34,15 @@ help: ## Show this help message
 
 ##@ Setup
 
-install: ## Install all host-side script dependencies (pinecone, neo4j, resemblyzer, sklearn, opencv...)
+install: ## Install all host-side script dependencies (pinecone, neo4j, resemblyzer, sklearn, opencv, faster-whisper...)
 	pip install -r scripts/requirements.txt
+	pip install faster-whisper
 
 install-diarization: ## Install speaker diarization deps only (resemblyzer + soundfile + sklearn)
 	pip install resemblyzer soundfile scikit-learn
+
+install-whisper-gpu: ## Install faster-whisper for local GPU transcription (no Docker needed)
+	pip install faster-whisper
 
 ##@ Docker
 
@@ -187,11 +192,22 @@ whisper-health: ## Check whisper service health
 	@curl -s http://localhost:$(WHISPER_PORT)/health | python3 -m json.tool
 
 WHISPER_WORKERS ?= 0
-transcribe: ## Transcribe videos from cast JSON — usage: make transcribe CAST=cast.json [WHISPER_WORKERS=0=auto]
+WHISPER_MODEL   ?= large-v3
+WHISPER_DEVICE  ?= cuda
+WHISPER_COMPUTE ?= float16
+
+transcribe: ## Transcribe videos via Docker whisper service — usage: make transcribe CAST=cast.json [WHISPER_WORKERS=0=auto]
 	@python3 scripts/transcribe.py --cast $(CAST) \
 		--whisper http://localhost:$(WHISPER_PORT) \
 		--backend http://localhost:$(BACKEND_PORT) \
 		--workers $(WHISPER_WORKERS)
+
+transcribe-gpu: ## Transcribe on host GPU (faster-whisper, no Docker) — usage: make transcribe-gpu CAST=cast.json [WHISPER_MODEL=large-v3]
+	@python3 scripts/transcribe.py --cast $(CAST) \
+		--local \
+		--model $(WHISPER_MODEL) \
+		--device $(WHISPER_DEVICE) \
+		--compute-type $(WHISPER_COMPUTE)
 
 transcribe-urls: ## Transcribe raw video URLs — usage: make transcribe-urls VIDS="url1 url2"
 	@python3 scripts/transcribe.py --videos $(VIDS) --whisper http://localhost:$(WHISPER_PORT)
@@ -216,6 +232,19 @@ pipeline: ## ONE CMD — cast→transcript→diarize→context→index — usage
 		--chunks $(CHUNKS) \
 		--workers $(WORKERS) \
 		--whisper-workers $(WHISPER_WORKERS) \
+		--planner $(PLANNER)
+
+pipeline-seq: ## Sequential GPU pipeline: Whisper(GPU)→Cast→Context — usage: make pipeline-seq CAST=cast.json [WHISPER_MODEL=large-v3]
+	@python3 scripts/pipeline.py $(CAST) \
+		--sequential \
+		--local-whisper \
+		--whisper-model $(WHISPER_MODEL) \
+		--whisper-device $(WHISPER_DEVICE) \
+		--whisper-compute-type $(WHISPER_COMPUTE) \
+		--backend http://localhost:$(BACKEND_PORT) \
+		--vllm http://localhost:$(VLLM_PORT)/v1/chat/completions \
+		--chunks $(CHUNKS) \
+		--workers $(WORKERS) \
 		--planner $(PLANNER)
 
 pipeline-context: ## Skip cast+transcribe, run context+index only — usage: make pipeline-context CAST=cast.json
