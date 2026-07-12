@@ -34,9 +34,10 @@ help: ## Show this help message
 
 ##@ Setup
 
-install: ## Install all host-side script dependencies (pinecone, neo4j, resemblyzer, sklearn, opencv, faster-whisper, setuptools...)
+install: ## Install all host-side script dependencies (pinecone, neo4j, resemblyzer, sklearn, opencv, faster-whisper, setuptools, ffmpeg...)
 	pip install -r scripts/requirements.txt
 	pip install faster-whisper setuptools
+	conda install -c conda-forge ffmpeg -y 2>/dev/null || apt-get install -y ffmpeg 2>/dev/null || echo "WARNING: ffmpeg not installed — install manually: conda install -c conda-forge ffmpeg"
 
 install-diarization: ## Install speaker diarization deps only (resemblyzer + soundfile + sklearn)
 	pip install resemblyzer soundfile scikit-learn
