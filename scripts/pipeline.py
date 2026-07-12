@@ -430,11 +430,17 @@ def main() -> None:
         "fixed":  dim(f"fixed   — {args.chunks} equal-width chunks per video (legacy)"),
     }.get(planner, planner)
     print(f"  Planner    : {planner_desc}", flush=True)
-    print(f"  Mode       : {args.context_mode}", flush=True)
+    seq_mode = getattr(args, "sequential", False)
+    local_w  = getattr(args, "local_whisper", False)
+    mode_str = args.context_mode
+    if seq_mode:
+        whisper_src = f"local GPU ({args.whisper_model})" if local_w else "Docker service"
+        mode_str = f"sequential  [Whisper={whisper_src} → Cast → Context]"
+    print(f"  Mode       : {mode_str}", flush=True)
     print(f"{'─'*W}", flush=True)
 
     # Step list
-    both_parallel = (args.skip_cast is None) and (args.skip_transcribe is None) and not getattr(args, "sequential", False)
+    both_parallel = (args.skip_cast is None) and (args.skip_transcribe is None) and not seq_mode
     steps_info = [
         (1, "Cast + Whisper [parallel]" if both_parallel else "Cast Appearance Analysis",
             args.skip_cast is not None and args.skip_transcribe is not None,
@@ -443,9 +449,18 @@ def main() -> None:
         (3, "Index → Pinecone + Neo4j", args.no_index,   est_index),
     ]
     if not both_parallel:
-        # Renumber existing steps to make room for separate Whisper row
+        # Renumber steps; Whisper goes first when sequential
         steps_info = [(n if n < 2 else n+1, *rest) for n, *rest in steps_info]
-        steps_info.insert(1, (2, "Whisper Transcription", args.skip_transcribe is not None, est_trans))
+        whisper_label = f"Whisper Transcription [local GPU]" if (seq_mode and local_w) else "Whisper Transcription"
+        steps_info.insert(0 if seq_mode else 1,
+                          (1 if seq_mode else 2,
+                           whisper_label,
+                           args.skip_transcribe is not None,
+                           est_trans))
+        if seq_mode:
+            # renumber: whisper=1, cast=2, context=3, index=4
+            steps_info = sorted(steps_info, key=lambda x: x[0])
+            steps_info = [(i+1, name, skip, est) for i, (_, name, skip, est) in enumerate(steps_info)]
 
     for num, name, skipped, est in steps_info:
         tag  = dim("  [SKIP]") if skipped else f"  ~{fmt_time(est)}"
