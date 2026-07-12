@@ -408,6 +408,8 @@ def main() -> None:
     write_summary(summary, summary_path)
 
     # ── Header ────────────────────────────────────────────────────────────────
+    seq_mode = getattr(args, "sequential", False)
+
     _base_steps = 4 if seq_mode else 3
     TOTAL_STEPS = _base_steps + 1 if args.chunk_bench else _base_steps
 
@@ -431,7 +433,6 @@ def main() -> None:
         "fixed":  dim(f"fixed   — {args.chunks} equal-width chunks per video (legacy)"),
     }.get(planner, planner)
     print(f"  Planner    : {planner_desc}", flush=True)
-    seq_mode = getattr(args, "sequential", False)
     local_w  = getattr(args, "local_whisper", False)
     mode_str = args.context_mode
     if seq_mode:
