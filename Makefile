@@ -225,8 +225,9 @@ analyze-context: ## Full semantic video context — usage: make analyze-context 
 		--chunks $(CHUNKS) \
 		--planner $(PLANNER)
 
-pipeline: ## ONE CMD — cast→transcript→diarize→context→index — usage: make pipeline CAST=cast.json [CHUNKS=8] [WORKERS=24] [PLANNER=semantic]
+pipeline: ## ONE CMD — Whisper→Cast→Context→Index (sequential GPU) — usage: make pipeline CAST=cast.json [CHUNKS=8] [WORKERS=24] [PLANNER=semantic]
 	@python3 scripts/pipeline.py $(CAST) \
+		--sequential \
 		--backend http://localhost:$(BACKEND_PORT) \
 		--vllm http://localhost:$(VLLM_PORT)/v1/chat/completions \
 		--local-whisper \
