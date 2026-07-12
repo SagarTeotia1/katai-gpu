@@ -1583,11 +1583,23 @@ Return ONLY valid JSON:
 
 def _build_synth_group_c(prefix: str, person_db_raw: str) -> str:
     """Group C — intelligence: cause_effect_graph, character_states, brian_brief."""
+    import re as _re
+    person_ids = _re.findall(r"PERSON (P\d{3})", person_db_raw)
+    if not person_ids:
+        person_ids = ["P001"]
+    best_shots_schema = "\n".join(
+        f'      "{pid}": {{\n'
+        f'        "best_close_up": {{"timestamp_s": 0.0, "event_id": "<E_id>", "why": "<exact expression and why it works visually>"}},\n'
+        f'        "best_reaction": {{"timestamp_s": 0.0, "event_id": "<E_id>", "why": "<why this is their most usable reaction shot>"}},\n'
+        f'        "best_delivery": {{"timestamp_s": 0.0, "event_id": "<E_id>", "why": "<their most powerful delivery moment>"}}\n'
+        f'      }}'
+        for pid in person_ids
+    )
     return prefix + f"""
 Generate ONLY these fields for the editorial intelligence layer.
 
 BRIAN_BRIEF RULES (most important):
-- best_shots: For EACH person, find best close-up (most expressive), best reaction, best delivery. Be specific enough to scrub directly to the moment.
+- best_shots: For EACH of the {len(person_ids)} known persons ({', '.join(person_ids)}), find best close-up (most expressive), best reaction, best delivery. Be specific enough to scrub directly to the moment.
 - scene_color_grades: For EACH scene S001-S00N, actionable colorist notes + ffmpeg_quick_fix filter string.
 - audio_notes: Specific dead air timestamps to cut, loud peaks to duck, trailing speech to trim.
 - opening_hook / closing_beat: Exact timestamps and specific instructions.
@@ -1611,11 +1623,7 @@ Return ONLY valid JSON:
 
   "brian_brief": {{
     "best_shots": {{
-      "P001": {{
-        "best_close_up": {{"timestamp_s": 0.0, "event_id": "<E_id>", "why": "<exact expression and why it works visually>"}},
-        "best_reaction": {{"timestamp_s": 0.0, "event_id": "<E_id>", "why": "<why this is their most usable reaction shot>"}},
-        "best_delivery": {{"timestamp_s": 0.0, "event_id": "<E_id>", "why": "<their most powerful delivery moment>"}}
-      }}
+{best_shots_schema}
     }},
     "scene_color_grades": [
       {{
@@ -1630,7 +1638,7 @@ Return ONLY valid JSON:
     "closing_beat": "<exact timestamp and transition instruction>",
     "editor_todo": ["<1. specific numbered task>"]
   }}
-}}"""
+}}}"""
 
 
 # ── Color analysis (CPU, concurrent with VLM prefill) ────────────────────────
@@ -2259,9 +2267,9 @@ def synthesize_merged(
     if _at:
         audio_lines = [
             f"  [{a.get('start',0):.0f}s-{a.get('end',0):.0f}s] "
-            f"level={a.get('level','?')} speech={a.get('speech_rate','?')} "
-            f"laugh={'YES' if a.get('laugh_detected') else 'no'} "
-            f"silence_before={a.get('silence_before_s',0):.1f}s"
+            f"peak={a.get('peak_db','?')} rms={a.get('rms_mean','?')} "
+            f"speech={a.get('speech_rate','?')} quality={a.get('audio_quality','?')} "
+            f"laughs={len(a.get('laugh_events',[]))} silences={len(a.get('silences',[]))}"
             for a in _at[:20]
         ]
         audio_text = "\n".join(audio_lines)
@@ -3439,7 +3447,7 @@ def _finalize_video(
 
     def _run_reasoning() -> None:
         try:
-            _reason_result[0] = build_reasoning_pass(merged, vllm_url, model_id)
+            _reason_result[0] = build_reasoning_pass(dict(merged), vllm_url, model_id)
         except Exception as e:
             log(video_label, f"Reasoning pass failed ({e}) — saving without reasoning layers")
 
@@ -4150,7 +4158,7 @@ def analyze_video_chunked(
 
     def _run_reasoning2() -> None:
         try:
-            _reason_result2[0] = build_reasoning_pass(merged, vllm_url, model_id)
+            _reason_result2[0] = build_reasoning_pass(dict(merged), vllm_url, model_id)
         except Exception as e:
             log(video_label, f"Reasoning pass failed ({e}) — saving without reasoning layers")
 
