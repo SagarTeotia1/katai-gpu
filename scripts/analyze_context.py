@@ -1419,6 +1419,220 @@ Return ONLY valid JSON:
 }}"""
 
 
+# ── Synthesis split-prompt builders ─────────────────────────────────────────
+# Fire 3 parallel sub-calls instead of 1 monolithic call per video.
+# All groups share the same context prefix; each generates a focused subset of fields.
+# 2 videos × 3 groups + 2 reasoning = 8 GPU reqs simultaneously → ~4x utilization.
+
+def _build_synth_prefix(
+    video_label: str,
+    video_url: str,
+    person_db: str,
+    timeline_summary: str,
+    total_duration: float,
+    world_state_str: str,
+    color_text: str,
+    audio_text: str,
+) -> str:
+    return f"""RESPOND WITH RAW JSON ONLY. YOUR ENTIRE RESPONSE MUST START WITH {{ AND END WITH }}. NO MARKDOWN. NO EXPLANATION. NO <think> BLOCKS. JUST THE JSON OBJECT.
+
+You are a senior video editor analyzing a complete merged timeline from parallel chunk analysis.
+
+Video ID: {video_label}
+Total duration: {total_duration:.1f}s
+Known people:
+{person_db}
+
+MERGED TIMELINE (all events, chronological):
+{timeline_summary}{world_state_str}
+
+COLOR INTELLIGENCE (per chunk):
+{color_text}
+
+AUDIO INTELLIGENCE (per chunk):
+{audio_text}
+"""
+
+
+def _build_synth_group_a(prefix: str, total_duration: float) -> str:
+    """Group A — structure: video_metadata, conversation, story, scenes, narrative_flow, emotional_graph."""
+    return prefix + f"""
+Generate ONLY these fields for the editorial intelligence layer.
+
+SCENES RULES: divide into 3-8 meaningful narrative scenes (not arbitrary chunks). Title must be descriptive — NEVER "Scene 1". Description: 2-3 full sentences, no semicolons.
+EMOTIONAL_GRAPH: sample every significant event. intensity is 0.0-1.0 float.
+
+Return ONLY valid JSON:
+
+{{
+  "video_metadata": {{
+    "duration_s": {total_duration},
+    "setting": "<location description>",
+    "format": "<podcast|interview|vlog|comedy|debate>",
+    "language": "<language>",
+    "overall_context": "<2-3 sentences: what this video is, who, what discussed>"
+  }},
+
+  "conversation": {{
+    "turns": [{{"turn_id": "T001", "speaker": "P001", "start": 0.0, "end": 0.0, "text": "<words>"}}],
+    "interruptions": [{{"at_s": 0.0, "interrupted": "P001", "by": "P002", "context": "<what was cut off>"}}],
+    "callbacks": [{{"at_s": 0.0, "references_event": "<event_id>", "description": "<what was called back>"}}],
+    "question_answer_pairs": [{{"question_event": "<E_id>", "answer_event": "<E_id>", "asker": "P001", "answerer": "P002", "topic": "<>"}}],
+    "agreements": [{{"at_s": 0.0, "between": ["P001","P002"], "about": "<>"}}],
+    "disagreements": [{{"at_s": 0.0, "between": ["P001","P002"], "about": "<>", "intensity": "<mild|heated>"}}],
+    "jokes": [{{"event_id": "<>", "setup_event": "<>", "punchline": "<>", "landed": true}}]
+  }},
+
+  "story": {{
+    "hook": {{"event_id": "<>", "description": "<first 10s attention grab>"}},
+    "setup": {{"start": 0.0, "end": 0.0, "description": "<>"}},
+    "conflict": {{"start": 0.0, "end": 0.0, "description": "<>", "present": false}},
+    "escalation": {{"start": 0.0, "end": 0.0, "description": "<>", "present": false}},
+    "resolution": {{"start": 0.0, "end": 0.0, "description": "<>", "present": false}},
+    "ending": {{"event_id": "<>", "description": "<how video ends and feeling it leaves>"}}
+  }},
+
+  "scenes": [
+    {{
+      "scene_id": "S001",
+      "start": 0.0,
+      "end": 0.0,
+      "title": "<descriptive scene title — NOT 'Scene 1'>",
+      "description": "<2-3 sentence narrative description. NO semicolons.>",
+      "dominant_emotion": "<happy|tense|curious|excited|sad|angry|calm|shocked>",
+      "narrative_purpose": "<what this scene does for the overall story>",
+      "event_ids": ["<E_id>"]
+    }}
+  ],
+
+  "narrative_flow": [
+    {{"event_id": "<E_id>", "role": "<hook|setup|conflict|escalation|punchline|resolution|callback|transition>", "links_to": ["<E_id>"], "link_type": "<answers|triggers|calls_back|interrupts>"}}
+  ],
+
+  "emotional_graph": [
+    {{"t": 0.0, "dominant_emotion": "<happy|surprised|laughing|tense|sad|angry|calm|excited|curious|shocked>", "intensity": 0.0, "speaker": "<person_id>"}}
+  ]
+}}"""
+
+
+def _build_synth_group_b(prefix: str) -> str:
+    """Group B — picks: highlights, clip_candidates, thumbnail_candidates, ocr_results, editorial_summary, edit_sequence."""
+    return prefix + """
+Generate ONLY these fields for the editorial intelligence layer.
+
+EDIT SEQUENCE: ordered list of 8-15 events forming the BEST 60-second standalone highlight cut. Can reorder for narrative punch.
+HIGHLIGHTS: best standalone moments. CLIP_CANDIDATES: complete self-contained clips for social platforms.
+
+Return ONLY valid JSON:
+
+{
+  "highlights": [
+    {"id": "H001", "start": 0.0, "end": 0.0, "title": "<catchy>",
+      "reason": "<why highlight>", "type": "<funny|emotional|informative|shocking>",
+      "event_ids": ["<E_id>"], "score": 0}
+  ],
+
+  "clip_candidates": [
+    {"id": "C001", "start": 0.0, "end": 0.0, "duration_s": 0.0,
+      "title": "<>", "hook": "<opening line>", "why_complete": "<standalone reason>",
+      "platform": "<YouTube Shorts|Instagram Reels|TikTok|full clip>",
+      "depends_on_events": ["<E_id>"],
+      "scores": {"clip": 0, "viral": 0, "hook": 0}}
+  ],
+
+  "thumbnail_candidates": [
+    {"timestamp_s": 0.0, "event_id": "<>", "description": "<exact frame>",
+      "why_good_thumbnail": "<reason>", "primary_person": "<P_id>",
+      "expression": "<surprised|laughing|serious|intense>", "score": 0}
+  ],
+
+  "ocr_results": [
+    {"timestamp_s": 0.0, "text": "<on-screen text>",
+      "location": "<top-left|center|lower-third>", "type": "<title-card|lower-third|logo>"}
+  ],
+
+  "editorial_summary": {
+    "overall_summary": "<4-6 sentences: complete summary>",
+    "main_topics": ["<topic1>"],
+    "emotional_arc": "<e.g. starts slow → builds → big laugh at 72s → calm ending>",
+    "key_moments": [{"timestamp_s": 0.0, "description": "<what happens and why>"}],
+    "best_clip": {"start": 0.0, "end": 0.0, "reason": "<why best standalone>"},
+    "viral_potential": "<low|medium|high|very high>",
+    "suggested_title": "<YouTube title>",
+    "suggested_description": "<YouTube description opening>",
+    "editor_notes": "<3-5 specific editing recommendations>"
+  },
+
+  "edit_sequence": [
+    {
+      "order": 1, "event_id": "<E_id>", "start": 0.0, "end": 0.0,
+      "instruction": "<specific visual instruction>",
+      "caption": "<short on-screen text or null>",
+      "transition": "<cut|dissolve|smash_cut|jump_cut>",
+      "seq": 1, "action": "<keep|cut|speed_ramp|reaction_cut|broll_insert>",
+      "source_start": 0.0, "source_end": 0.0,
+      "trim_start": 0.0, "trim_end": 0.0,
+      "speed": "<0.5x|0.75x|1x|1.25x|slow_mo>",
+      "music_change": null,
+      "transition_in": "<cut|dissolve|smash_cut|jump_cut>",
+      "reason": "<5 words: why this event is in the sequence>"
+    }
+  ]
+}"""
+
+
+def _build_synth_group_c(prefix: str, person_db_raw: str) -> str:
+    """Group C — intelligence: cause_effect_graph, character_states, brian_brief."""
+    return prefix + f"""
+Generate ONLY these fields for the editorial intelligence layer.
+
+BRIAN_BRIEF RULES (most important):
+- best_shots: For EACH person, find best close-up (most expressive), best reaction, best delivery. Be specific enough to scrub directly to the moment.
+- scene_color_grades: For EACH scene S001-S00N, actionable colorist notes + ffmpeg_quick_fix filter string.
+- audio_notes: Specific dead air timestamps to cut, loud peaks to duck, trailing speech to trim.
+- opening_hook / closing_beat: Exact timestamps and specific instructions.
+- editor_todo: Numbered list of 5-10 most important editing actions.
+
+CAUSE_EFFECT_GRAPH: Map every causal link between events (triggers_pause, triggers_reaction, setup_for, resolves, callbacks).
+CHARACTER_STATES: Per-person state at each significant event_id.
+
+Return ONLY valid JSON:
+
+{{
+  "cause_effect_graph": [
+    {{"from_event": "<E_id>", "to_events": ["<E_id>"], "relationship": "<triggers_pause|triggers_reaction|setup_for|resolves|callbacks>"}}
+  ],
+
+  "character_states": {{
+    "<event_id>": {{
+      "<person_id>": {{"confidence": 0.0, "dominance": 0.0, "energy": 0.0, "attention_target": "<person_id or null>"}}
+    }}
+  }},
+
+  "brian_brief": {{
+    "best_shots": {{
+      "P001": {{
+        "best_close_up": {{"timestamp_s": 0.0, "event_id": "<E_id>", "why": "<exact expression and why it works visually>"}},
+        "best_reaction": {{"timestamp_s": 0.0, "event_id": "<E_id>", "why": "<why this is their most usable reaction shot>"}},
+        "best_delivery": {{"timestamp_s": 0.0, "event_id": "<E_id>", "why": "<their most powerful delivery moment>"}}
+      }}
+    }},
+    "scene_color_grades": [
+      {{
+        "scene_id": "S001",
+        "color_issues": "<what is technically wrong>",
+        "grade_instruction": "<actionable colorist instruction>",
+        "ffmpeg_quick_fix": "<ready-to-paste ffmpeg filter>"
+      }}
+    ],
+    "audio_notes": "<specific pacing issues with timestamps>",
+    "opening_hook": "<exact timestamp and instruction for opening frame>",
+    "closing_beat": "<exact timestamp and transition instruction>",
+    "editor_todo": ["<1. specific numbered task>"]
+  }}
+}}"""
+
+
 # ── Color analysis (CPU, concurrent with VLM prefill) ────────────────────────
 
 def _enrich_chunks_with_color(
@@ -1947,21 +2161,8 @@ def merge_chunks(
     return merged
 
 
-def synthesize_merged(
-    merged: dict,
-    person_db: str,
-    total_duration: float,
-    vllm_url: str,
-    model_id: str,
-) -> dict:
-    """
-    Second LLM pass — text only (no video), fast ~30-60s.
-    Takes merged timeline, generates conversation/story/highlights/clips/editorial.
-    """
-    video_label = merged["video_id"]
-    video_url   = merged["video_url"]
-
-    # Compact timeline text (cap to 600 events to stay within tokens)
+def _build_timeline_text(merged: dict, video_label: str) -> str:
+    """Compact timeline for synthesis prompts — shared by all 3 groups."""
     _full_tl = merged.get("timeline") or []
     if len(_full_tl) > 600:
         log(video_label,
@@ -1970,9 +2171,8 @@ def synthesize_merged(
             f"Last event at {_full_tl[-1].get('end',0):.1f}s.")
         mid_start = len(_full_tl) // 2 - 150
         _full_tl = _full_tl[:150] + _full_tl[max(0, mid_start):mid_start + 300] + _full_tl[-150:]
-    events = _full_tl
     tl_lines = []
-    for ev in events:
+    for ev in _full_tl:
         speaker  = ev.get("speaker", "")
         txt      = ev.get("transcript_text", "")
         cam      = ev.get("camera") or {}
@@ -1995,75 +2195,144 @@ def synthesize_merged(
             f"tags:[{vtags}] {broll} {audio_s} {comedy_s} | \"{txt[:50]}\" | {imp_r}"
         )
         tl_lines.append(line)
-        # Append rich visual prose when available (HIGH-tier chunks only)
         vd = ev.get("visual_description", "")
         dn = ev.get("delivery_notes", "")
         if vd:
             tl_lines.append(f"    visual: {vd[:200]}")
         if dn:
             tl_lines.append(f"    delivery: {dn[:120]}")
-    timeline_text = "\n".join(tl_lines)
+    return "\n".join(tl_lines)
 
-    system = build_synthesis_prompt(
-        video_label, video_url, person_db, timeline_text, total_duration,
-        world_state_timeline=merged.get("world_state_timeline", []),
-        color_timeline=merged.get("color_timeline"),
-        color_consistency=merged.get("color_consistency"),
-        audio_timeline=merged.get("audio_timeline"),
+
+def synthesize_merged(
+    merged: dict,
+    person_db: str,
+    total_duration: float,
+    vllm_url: str,
+    model_id: str,
+) -> dict:
+    """
+    Second LLM pass — fires 3 parallel sub-calls (groups A/B/C) instead of 1 monolithic call.
+    2 videos × 3 groups = 6 GPU reqs simultaneously → ~3x synthesis throughput on 96GB GPU.
+    Each group outputs ~3-5K tokens vs 8-16K for monolithic → faster per-request decode.
+    """
+    from concurrent.futures import ThreadPoolExecutor as _TPE_S
+
+    video_label = merged["video_id"]
+    timeline_text = _build_timeline_text(merged, video_label)
+
+    # Build shared context prefix (timeline, color, audio, persons)
+    _wst = merged.get("world_state_timeline", [])
+    world_state_str = ""
+    if _wst:
+        world_state_str = "\n\nWORLD STATE ACROSS CHUNKS:\n"
+        for ws in _wst:
+            energy = ws.get('energy', '')
+            if isinstance(energy, dict):
+                energy = f"visual={energy.get('visual','?')} audio={energy.get('audio','?')} conv={energy.get('conversation','?')}"
+            world_state_str += (
+                f"  [{ws.get('start',0):.1f}s-{ws.get('end',0):.1f}s] "
+                f"stage={ws.get('story_stage','')} emotion={ws.get('scene_emotion','')} "
+                f"energy={energy} topic={ws.get('current_topic','')}\n"
+            )
+
+    _ct = merged.get("color_timeline")
+    _cc = merged.get("color_consistency")
+    _at = merged.get("audio_timeline")
+
+    if _ct:
+        color_lines = []
+        for ct in _ct[:20]:
+            grade = ct.get("grade") or {}
+            color_lines.append(
+                f"  [{ct.get('start',0):.0f}s-{ct.get('end',0):.0f}s] "
+                f"look={ct.get('look','?')} exposure={ct.get('exposure_status','?')} "
+                f"temp={ct.get('temp_label','?')} grade_needed={'YES' if grade.get('grade_needed') else 'no'}"
+            )
+        inconsistencies = [c for c in (_cc or []) if c.get("flag") not in (None, "ok", "")]
+        if inconsistencies:
+            color_lines.append(f"  Color consistency issues: {len(inconsistencies)} transitions flagged")
+        color_text = "\n".join(color_lines)
+    else:
+        color_text = "  No color data available."
+
+    if _at:
+        audio_lines = [
+            f"  [{a.get('start',0):.0f}s-{a.get('end',0):.0f}s] "
+            f"level={a.get('level','?')} speech={a.get('speech_rate','?')} "
+            f"laugh={'YES' if a.get('laugh_detected') else 'no'} "
+            f"silence_before={a.get('silence_before_s',0):.1f}s"
+            for a in _at[:20]
+        ]
+        audio_text = "\n".join(audio_lines)
+    else:
+        audio_text = "  No audio data."
+
+    prefix = _build_synth_prefix(
+        video_label, merged.get("video_url", ""), person_db,
+        timeline_text, total_duration, world_state_str, color_text, audio_text,
     )
 
-    payload = {
-        "model": model_id,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content":
-             "/no_think\n\nGenerate the complete editorial intelligence layer for this video."},
-        ],
-        "max_tokens": 16384,  # raised from 12288: brian_brief + scene_color_grades add ~3K tokens
-        "temperature": 0.0,
-        "response_format": {"type": "json_object"},
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
+    def _call_group(group_prompt: str, group_name: str, max_tokens: int) -> dict:
+        payload = {
+            "model": model_id,
+            "messages": [
+                {"role": "system", "content": group_prompt},
+                {"role": "user", "content": f"/no_think\n\nGenerate the {group_name} fields for this video."},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        try:
+            raw_resp = post_vllm(payload, vllm_url, timeout=600)
+            usage = raw_resp.get("usage", {})
+            msg   = raw_resp["choices"][0]["message"]
+            raw   = msg.get("content") or ""
+            if not raw.strip():
+                log(video_label, f"Synthesis group {group_name} empty — finish={raw_resp['choices'][0].get('finish_reason')}")
+                return {"_tokens_in": usage.get("prompt_tokens", 0), "_tokens_out": 0}
+            parsed = parse_robust(raw, f"{video_label}_synth_{group_name}")
+            parsed["_tokens_in"]  = usage.get("prompt_tokens", 0)
+            parsed["_tokens_out"] = usage.get("completion_tokens", 0)
+            return parsed
+        except Exception as e:
+            log(video_label, f"Synthesis group {group_name} failed: {e}")
+            return {"_tokens_in": 0, "_tokens_out": 0}
 
-    log(video_label, "Synthesis pass — text-only LLM call for conversation/story/editorial...")
-    raw_resp = post_vllm(payload, vllm_url, timeout=600)
-    usage = raw_resp.get("usage", {})
-    merged["_synth_tokens_in"]  = usage.get("prompt_tokens", 0)
-    merged["_synth_tokens_out"] = usage.get("completion_tokens", 0)
+    log(video_label, "Synthesis pass — 3 parallel sub-calls (A:structure B:editorial C:intelligence)...")
 
-    msg = raw_resp["choices"][0]["message"]
-    raw = msg.get("content") or ""
-    if not raw.strip():
-        finish = raw_resp["choices"][0].get("finish_reason", "unknown")
-        log(video_label, f"Synthesis returned EMPTY content (finish_reason={finish}) — model used all tokens thinking; /no_think not applied to text-only calls")
-        return merged
+    prompt_a = _build_synth_group_a(prefix, total_duration)
+    prompt_b = _build_synth_group_b(prefix)
+    prompt_c = _build_synth_group_c(prefix, person_db)
 
-    # Show first 200 chars for debugging
-    preview = raw[:200].replace("\n", " ")
-    log(video_label, f"Synthesis raw preview: {preview!r}")
+    with _TPE_S(max_workers=3) as _pool:
+        _fa = _pool.submit(_call_group, prompt_a, "A-structure",   6144)
+        _fb = _pool.submit(_call_group, prompt_b, "B-editorial",   8192)
+        _fc = _pool.submit(_call_group, prompt_c, "C-intelligence", 6144)
+        res_a = _fa.result()
+        res_b = _fb.result()
+        res_c = _fc.result()
 
-    try:
-        synth = parse_robust(raw, f"{video_label}_synthesis")
-    except Exception as e:
-        log(video_label, f"Synthesis parse FAILED: {e}")
-        log(video_label, f"Synthesis raw (first 500): {raw[:500]!r}")
-        log(video_label, f"Synthesis raw (last 200): {raw[-200:]!r}")
-        return merged
+    # Accumulate token counts
+    merged["_synth_tokens_in"]  = res_a.get("_tokens_in",  0) + res_b.get("_tokens_in",  0) + res_c.get("_tokens_in",  0)
+    merged["_synth_tokens_out"] = res_a.get("_tokens_out", 0) + res_b.get("_tokens_out", 0) + res_c.get("_tokens_out", 0)
 
-    # Merge synthesis fields into the combined dict
-    for key in ("video_metadata", "conversation", "story", "highlights",
-                "clip_candidates", "thumbnail_candidates", "ocr_results",
-                "editorial_summary", "emotional_graph", "narrative_flow",
-                "edit_sequence", "cause_effect_graph", "character_states",
-                "scenes"):
-        if key in synth:
-            merged[key] = synth[key]
+    # Merge all fields from A, B, C into merged dict
+    _all_synth_keys = (
+        "video_metadata", "conversation", "story", "scenes", "narrative_flow", "emotional_graph",
+        "highlights", "clip_candidates", "thumbnail_candidates", "ocr_results", "editorial_summary", "edit_sequence",
+        "cause_effect_graph", "character_states", "brian_brief",
+    )
+    for res in (res_a, res_b, res_c):
+        for key in _all_synth_keys:
+            if key in res:
+                merged[key] = res[key]
 
-    # Build scenes from event clusters if synthesis didn't provide them
+    # Fallback: build scenes from timeline if model missed them
     if not merged.get("scenes"):
         merged["scenes"] = _scenes_from_timeline(merged["timeline"])
-
-    # Post-process: fix scenes with empty or semicolon-only descriptions
     _fix_scene_descriptions(merged)
 
     return merged

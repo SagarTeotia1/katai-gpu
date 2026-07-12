@@ -34,9 +34,9 @@ help: ## Show this help message
 
 ##@ Setup
 
-install: ## Install all host-side script dependencies (pinecone, neo4j, resemblyzer, sklearn, opencv, faster-whisper...)
+install: ## Install all host-side script dependencies (pinecone, neo4j, resemblyzer, sklearn, opencv, faster-whisper, setuptools...)
 	pip install -r scripts/requirements.txt
-	pip install faster-whisper
+	pip install faster-whisper setuptools
 
 install-diarization: ## Install speaker diarization deps only (resemblyzer + soundfile + sklearn)
 	pip install resemblyzer soundfile scikit-learn
