@@ -76,9 +76,12 @@ def analyze_image(image_url: str, backend: str) -> str:
                 data=payload,
                 headers={"Content-Type": "application/json"},
             )
-            resp = urllib.request.urlopen(req, timeout=360)
+            resp = urllib.request.urlopen(req, timeout=180)
             data = json.loads(resp.read())
-            return data["description"]
+            description = data.get("description") or ""
+            if not description:
+                raise ValueError(f"Empty description in response: {str(data)[:200]}")
+            return description
         except urllib.error.HTTPError as e:
             last_err = e
             if e.code not in RETRIABLE_HTTP or attempt == 2:

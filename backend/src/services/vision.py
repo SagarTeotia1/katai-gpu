@@ -72,9 +72,7 @@ class VisionService:
             "max_tokens": settings.vision_max_tokens,
             "temperature": 0.3,
             "stream": stream,
-            "extra_body": {
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
+            "chat_template_kwargs": {"enable_thinking": False},
         }
 
     async def analyze(self, image_url: str, prompt: str) -> str:
@@ -93,7 +91,7 @@ class VisionService:
         data = r.json()
         try:
             msg = data["choices"][0]["message"]
-            content = msg.get("content") or msg.get("reasoning_content") or ""
+            content = msg.get("content") if msg.get("content") is not None else msg.get("reasoning_content")
             if not content:
                 raise VisionServiceError(f"vLLM returned empty content: {data}")
             return str(content)

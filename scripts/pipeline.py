@@ -408,7 +408,8 @@ def main() -> None:
     write_summary(summary, summary_path)
 
     # ── Header ────────────────────────────────────────────────────────────────
-    TOTAL_STEPS = 3 if not args.chunk_bench else 4
+    _base_steps = 4 if seq_mode else 3
+    TOTAL_STEPS = _base_steps + 1 if args.chunk_bench else _base_steps
 
     print(f"\n{'═'*W}", flush=True)
     print(bold("  KATAI-GPU PIPELINE".center(W)), flush=True)
@@ -562,6 +563,7 @@ def main() -> None:
         t0 = time.time()
         ok, metrics, _ = run_step(cast_cmd, parse_cast)
         _record_cast(ok, metrics, t0)
+        write_summary(summary, summary_path)
     else:
         if not run_cast:
             cast_analysis_file = _resolve_skip(args.skip_cast, "output/cast_analysis_*.json")
@@ -702,18 +704,19 @@ def main() -> None:
     write_summary(summary, summary_path)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # STEP 3 — Index → Pinecone + Neo4j
+    # STEP (last) — Index → Pinecone + Neo4j
     # ─────────────────────────────────────────────────────────────────────────
+    index_step_num = TOTAL_STEPS
 
     if args.no_index:
-        section(3, TOTAL_STEPS, "Index → Pinecone + Neo4j", "SKIP")
+        section(index_step_num, TOTAL_STEPS, "Index → Pinecone + Neo4j", "SKIP")
         summary["steps"]["indexing"] = {"status": "skipped", "reason": "--no-index flag"}
     elif not context_files:
-        section(3, TOTAL_STEPS, "Index → Pinecone + Neo4j", "SKIP")
+        section(index_step_num, TOTAL_STEPS, "Index → Pinecone + Neo4j", "SKIP")
         print(yellow("  No context files to index — skipping."), flush=True)
         summary["steps"]["indexing"] = {"status": "skipped", "reason": "no context files"}
     else:
-        section(3, TOTAL_STEPS, "Index → Pinecone + Neo4j", "RUNNING")
+        section(index_step_num, TOTAL_STEPS, "Index → Pinecone + Neo4j", "RUNNING")
         cmd = [PYTHON, SCRIPTS / "index_context.py"] + context_files
         if args.no_pinecone:
             cmd.append("--no-pinecone")

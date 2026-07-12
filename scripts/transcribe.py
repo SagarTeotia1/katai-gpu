@@ -185,7 +185,9 @@ def transcribe_local_all(videos: list[dict],
         raise RuntimeError("faster-whisper not installed. Run: pip install faster-whisper")
 
     n = len(videos)
-    print(f"  Loading {n} faster-whisper {model_size} instance(s) on {device}...", flush=True)
+    # Cap at 4: large-v3 ~3 GB VRAM each; 4 instances = ~12 GB, safe alongside vLLM's 51 GB
+    workers = min(n, 4)
+    print(f"  Loading {workers} faster-whisper {model_size} instance(s) on {device}...", flush=True)
 
     def _worker(v: dict) -> dict:
         try:
@@ -197,7 +199,7 @@ def transcribe_local_all(videos: list[dict],
                     "ok": False, "error": str(e), "language": None,
                     "duration_s": None, "transcript": None, "segments": []}
 
-    with ThreadPoolExecutor(max_workers=n) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_worker, v): v["label"] for v in videos}
         results = [f.result() for f in as_completed(futures)]
 
@@ -355,7 +357,7 @@ def main() -> None:
 
     output = {
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "whisper_model": "large-v3",
+        "whisper_model": args.model if args.local else "service",
         "total_videos": len(videos),
         "total_time_s": round(wall, 1),
         "videos": results,
