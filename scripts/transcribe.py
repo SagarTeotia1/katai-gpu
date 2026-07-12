@@ -123,71 +123,87 @@ def _download_audio(url: str, tmp_dir: str) -> str:
     return out_path
 
 
-def transcribe_local(label: str, source: str, url: str,
-                     model_size: str = "large-v3",
-                     device: str = "cuda",
-                     compute_type: str = "float16",
-                     language: str | None = None) -> dict:
-    """Transcribe using faster-whisper directly on GPU (no Docker service needed)."""
+def _transcribe_with_model(model: "object", label: str, source: str, url: str,
+                           language: str | None = None) -> dict:
+    """Run transcription for one video using a pre-loaded WhisperModel instance."""
     t0 = time.time()
-    print(f"  [{label}] Local GPU whisper — downloading audio...", flush=True)
-    try:
-        from faster_whisper import WhisperModel  # type: ignore
-    except ImportError:
-        raise RuntimeError("faster-whisper not installed. Run: pip install faster-whisper")
-
+    print(f"  [{label}] Downloading audio...", flush=True)
     with tempfile.TemporaryDirectory() as tmp_dir:
         audio_path = _download_audio(url, tmp_dir)
-        print(f"  [{label}] Audio ready — loading model {model_size} on {device}...", flush=True)
-
-        model = WhisperModel(model_size, device=device, compute_type=compute_type)
-        segments_iter, info = model.transcribe(
+        print(f"  [{label}] Transcribing...", flush=True)
+        segments_iter, info = model.transcribe(  # type: ignore[attr-defined]
             audio_path,
             language=language,
             beam_size=5,
             word_timestamps=True,
             vad_filter=True,
         )
-
         segments_list = []
         transcript_parts = []
         for i, seg in enumerate(segments_iter):
             words = []
             if seg.words:
-                words = [{"word": w.word, "start": round(w.start, 3), "end": round(w.end, 3), "probability": round(w.probability, 3)} for w in seg.words]
+                words = [{"word": w.word, "start": round(w.start, 3), "end": round(w.end, 3),
+                          "probability": round(w.probability, 3)} for w in seg.words]
             segments_list.append({
-                "id": i,
-                "start": round(seg.start, 3),
-                "end": round(seg.end, 3),
-                "text": seg.text.strip(),
-                "words": words,
+                "id": i, "start": round(seg.start, 3), "end": round(seg.end, 3),
+                "text": seg.text.strip(), "words": words,
             })
             transcript_parts.append(seg.text.strip())
 
-        elapsed = time.time() - t0
-        duration_s = round(info.duration, 2)
-        lang = info.language
-        lang_prob = round(info.language_probability, 3)
-        transcript = " ".join(transcript_parts)
+    elapsed = time.time() - t0
+    duration_s = round(info.duration, 2)
+    lang = info.language
+    lang_prob = round(info.language_probability, 3)
+    print(f"  [{label}] Done — {len(segments_list)} segments | lang={lang} "
+          f"| {duration_s}s audio | {elapsed:.1f}s wall", flush=True)
+    return {
+        "video": label, "source": source, "url": url,
+        "ok": True, "error": None,
+        "transcription_time_s": round(elapsed, 1),
+        "language": lang, "language_probability": lang_prob,
+        "duration_s": duration_s,
+        "transcript": " ".join(transcript_parts),
+        "segments": segments_list,
+    }
 
-        print(
-            f"  [{label}] Done — {len(segments_list)} segments | lang={lang} "
-            f"| {duration_s}s audio | {elapsed:.1f}s wall",
-            flush=True,
-        )
-        return {
-            "video": label,
-            "source": source,
-            "url": url,
-            "ok": True,
-            "error": None,
-            "transcription_time_s": round(elapsed, 1),
-            "language": lang,
-            "language_probability": lang_prob,
-            "duration_s": duration_s,
-            "transcript": transcript,
-            "segments": segments_list,
-        }
+
+def transcribe_local_all(videos: list[dict],
+                         model_size: str = "large-v3",
+                         device: str = "cuda",
+                         compute_type: str = "float16",
+                         language: str | None = None) -> list[dict]:
+    """Load WhisperModel ONCE, transcribe all videos in parallel threads.
+
+    CTranslate2 model is NOT thread-safe for concurrent .transcribe() calls on
+    the same instance, so each thread gets its own model instance. Whisper
+    large-v3 is ~3 GB VRAM — multiple instances are fine on 96 GB GPU.
+    """
+    try:
+        from faster_whisper import WhisperModel  # type: ignore
+    except ImportError:
+        raise RuntimeError("faster-whisper not installed. Run: pip install faster-whisper")
+
+    n = len(videos)
+    print(f"  Loading {n} faster-whisper {model_size} instance(s) on {device}...", flush=True)
+
+    def _worker(v: dict) -> dict:
+        try:
+            model = WhisperModel(model_size, device=device, compute_type=compute_type)
+            return _transcribe_with_model(model, v["label"], v["source"], v["url"], language)
+        except Exception as e:
+            print(f"  [{v['label']}] FAILED — {e}", flush=True)
+            return {"video": v["label"], "source": v["source"], "url": v["url"],
+                    "ok": False, "error": str(e), "language": None,
+                    "duration_s": None, "transcript": None, "segments": []}
+
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        futures = {pool.submit(_worker, v): v["label"] for v in videos}
+        results = [f.result() for f in as_completed(futures)]
+
+    order = {v["label"]: i for i, v in enumerate(videos)}
+    results.sort(key=lambda r: order.get(r.get("video", ""), 999))
+    return results
 
 
 def transcribe_video(label: str, source: str, url: str, whisper_base: str, language: str | None) -> dict:
@@ -291,23 +307,14 @@ def main() -> None:
     results = []
 
     if args.local:
-        # Local GPU mode — sequential (one model instance shared, GPU already saturated by vLLM if running)
-        print(f"  Local GPU mode — loading faster-whisper {args.model} on {args.device}...", flush=True)
-        for v in videos:
-            try:
-                r = transcribe_local(
-                    v["label"], v["source"], v["url"],
-                    model_size=args.model,
-                    device=args.device,
-                    compute_type=args.compute_type,
-                    language=args.language,
-                )
-            except Exception as e:
-                print(f"  [{v['label']}] FAILED — {e}", flush=True)
-                r = {"video": v["label"], "source": v["source"], "url": v["url"],
-                     "ok": False, "error": str(e), "language": None,
-                     "duration_s": None, "transcript": None, "segments": []}
-            results.append(r)
+        # Local GPU mode — parallel per-video, one WhisperModel instance per thread
+        results = transcribe_local_all(
+            videos,
+            model_size=args.model,
+            device=args.device,
+            compute_type=args.compute_type,
+            language=args.language,
+        )
     else:
         # Docker whisper service mode
         print("  Checking whisper service...", flush=True)
