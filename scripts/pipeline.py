@@ -434,7 +434,7 @@ def main() -> None:
     print(f"{'─'*W}", flush=True)
 
     # Step list
-    both_parallel = (args.skip_cast is None) and (args.skip_transcribe is None)
+    both_parallel = (args.skip_cast is None) and (args.skip_transcribe is None) and not getattr(args, "sequential", False)
     steps_info = [
         (1, "Cast + Whisper [parallel]" if both_parallel else "Cast Appearance Analysis",
             args.skip_cast is not None and args.skip_transcribe is not None,

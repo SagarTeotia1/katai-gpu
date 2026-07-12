@@ -83,11 +83,36 @@ def call_whisper(video_url: str, whisper_base: str, language: str | None = None)
     return json.loads(resp.read())
 
 
+def _find_ffmpeg() -> str:
+    """Locate ffmpeg binary — checks PATH then common conda/system locations."""
+    import shutil
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    candidates = [
+        "/usr/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        os.path.join(os.path.dirname(sys.executable), "ffmpeg"),   # conda env bin
+        os.path.expanduser("~/miniconda3/bin/ffmpeg"),
+        os.path.expanduser("~/anaconda3/bin/ffmpeg"),
+        "/opt/conda/bin/ffmpeg",
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    raise RuntimeError(
+        "ffmpeg not found. Install it:\n"
+        "  conda install -c conda-forge ffmpeg\n"
+        "  OR: sudo apt install ffmpeg"
+    )
+
+
 def _download_audio(url: str, tmp_dir: str) -> str:
     """Download/extract audio from URL to WAV via ffmpeg. Returns path to WAV file."""
+    ffmpeg = _find_ffmpeg()
     out_path = os.path.join(tmp_dir, "audio.wav")
     cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
+        ffmpeg, "-y", "-loglevel", "error",
         "-i", url,
         "-vn", "-ar", "16000", "-ac", "1", "-f", "wav",
         out_path,
