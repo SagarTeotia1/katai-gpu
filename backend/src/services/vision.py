@@ -72,6 +72,9 @@ class VisionService:
             "max_tokens": settings.vision_max_tokens,
             "temperature": 0.3,
             "stream": stream,
+            "extra_body": {
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
         }
 
     async def analyze(self, image_url: str, prompt: str) -> str:
@@ -89,7 +92,11 @@ class VisionService:
 
         data = r.json()
         try:
-            return str(data["choices"][0]["message"]["content"])
+            msg = data["choices"][0]["message"]
+            content = msg.get("content") or msg.get("reasoning_content") or ""
+            if not content:
+                raise VisionServiceError(f"vLLM returned empty content: {data}")
+            return str(content)
         except (KeyError, IndexError) as exc:
             raise VisionServiceError(f"Unexpected response shape: {data}") from exc
 
