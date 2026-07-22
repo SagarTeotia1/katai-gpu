@@ -1,4 +1,4 @@
-# katai-gpu — Qwen3.6-27B Local GPU Inference Stack
+# katai-gpu — Qwen3-VL-30B-FP8 Local GPU Inference Stack
 
 vLLM-powered multimodal inference stack with parallel video analysis pipeline.
 One-command startup. True concurrent batching. Chat + image + video analysis.
@@ -26,11 +26,11 @@ One-command startup. True concurrent batching. Chat + image + video analysis.
 ┌─────────────────────────────────────────────────────────────┐
 │              vLLM Server  :8000                             │
 │   • Continuous batching (PagedAttention)                    │
-│   • BF16 full precision                                     │
+│   • FP8 weights (dtype auto) + FP8 KV cache                │
 │   • Flash Attention 2                                       │
 │   • --reasoning-parser qwen3 (strips <think> blocks)        │
-│   • Model: Qwen/Qwen3.6-27B  (~51 GB VRAM)                 │
-│   • GPU: RTX Pro 6000 96GB (45 GB headroom for KV cache)   │
+│   • Model: Qwen/Qwen3-VL-30B-Instruct-FP8  (~30 GB VRAM)  │
+│   • GPU: RTX Pro 6000 96GB (66 GB headroom for KV cache)   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -48,20 +48,20 @@ One-command startup. True concurrent batching. Chat + image + video analysis.
 | Spec | Value |
 |------|-------|
 | GPU | NVIDIA RTX Pro 6000 (96 GB VRAM) |
-| VRAM used by model | ~51 GB (BF16) |
-| VRAM headroom | ~45 GB for KV cache |
+| VRAM used by model | ~30 GB (FP8 weights) |
+| VRAM headroom | ~66 GB for KV cache |
 | CUDA | 12.1+ |
 | RAM | 64 GB+ recommended |
-| Disk (model cache) | ~60 GB free |
+| Disk (model cache) | ~35 GB free |
 
 ### Other GPU configs
 
 | GPU | VRAM | Recommended model |
 |-----|------|-------------------|
-| RTX Pro 6000 | 96 GB | `Qwen/Qwen3.6-27B` BF16 ← default |
-| A100 80GB | 80 GB | `Qwen/Qwen3.6-27B` BF16 |
-| A100 40GB | 40 GB | Use `--quantization awq` |
-| RTX 4090 | 24 GB | `Qwen/Qwen3-8B` BF16 |
+| RTX Pro 6000 | 96 GB | `Qwen/Qwen3-VL-30B-Instruct-FP8` ← default |
+| A100 80GB | 80 GB | `Qwen/Qwen3-VL-30B-Instruct-FP8` |
+| A100 40GB | 40 GB | `Qwen/Qwen3-VL-7B-Instruct` BF16 |
+| RTX 4090 | 24 GB | `Qwen/Qwen2.5-VL-7B-Instruct` BF16 |
 
 ---
 
@@ -69,7 +69,7 @@ One-command startup. True concurrent batching. Chat + image + video analysis.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MODEL_ID` | `Qwen/Qwen3.6-27B` | HuggingFace model ID |
+| `MODEL_ID` | `Qwen/Qwen3-VL-30B-Instruct-FP8` | HuggingFace model ID |
 | `HF_TOKEN` | *(optional)* | HF token — not needed if model already cached |
 | `VLLM_PORT` | `8000` | vLLM API port |
 | `BACKEND_PORT` | `8080` | FastAPI backend port |
@@ -189,14 +189,15 @@ ffprobe → duration
 - `make video-chunk VID="url" N=4` — recommended
 - `make video-chunk VID="url" N=8` — faster for long videos
 
-### Concurrency Numbers (RTX Pro 6000 96GB)
+### Concurrency Numbers (RTX Pro 6000 96GB, Qwen3-VL-30B-FP8)
 | Metric | Value |
 |--------|-------|
-| KV cache | ~476K tokens total |
-| Typical chunk usage | ~12K tokens at 12.3% per chunk |
-| Safe parallel chunks | 4-6 (N=4 recommended, N=8 max) |
-| Generation throughput | ~90 tok/s total across all chunks |
-| Time per chunk (8192 tokens) | ~360s wall time for N=4 |
+| KV cache | ~900K tokens total (FP8 model frees ~66GB vs ~45GB BF16) |
+| Typical chunk usage | ~18K tokens at 2% per chunk (1.5fps × higher res) |
+| Max parallel seqs | 32 (was 16 on BF16 model) |
+| Safe parallel chunks | 8-16 (scene-aligned planner auto-sizes) |
+| Generation throughput | ~150+ tok/s total (FP8 compute faster) |
+| Time per chunk (12288 tokens) | ~240s wall time for 8 parallel chunks |
 
 ---
 

@@ -24,7 +24,7 @@ BACKEND_PORT       ?= 8080
 FRONTEND_PORT      ?= 3000
 WHISPER_PORT       ?= 9000
 MODEL              ?= $(MODEL_ID)
-MODEL              ?= Qwen/Qwen3.6-27B
+MODEL              ?= Qwen/Qwen3-VL-30B-Instruct-FP8
 N                  ?= 4
 
 ##@ General
@@ -54,7 +54,7 @@ up: ## Build images and start all services
 	fi
 	$(COMPOSE) up --build -d
 	@echo ""
-	@echo "  Services starting — first run downloads model from HuggingFace (~54 GB)"
+	@echo "  Services starting — first run downloads model from HuggingFace (~35 GB FP8)"
 	@echo "    vLLM API    → http://localhost:$(VLLM_PORT)"
 	@echo "    Backend     → http://localhost:$(BACKEND_PORT)"
 	@echo "    Frontend    → http://localhost:$(FRONTEND_PORT)"

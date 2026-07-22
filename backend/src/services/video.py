@@ -119,6 +119,7 @@ class VideoService:
             "chat_template_kwargs": {"enable_thinking": False},
             "mm_processor_kwargs": {
                 "fps": settings.video_fps,
+                "max_pixels": settings.video_max_pixels,
                 "do_sample_frames": True,
             },
         }
@@ -199,7 +200,11 @@ class VideoService:
                 "response_format": {"type": "json_object"},
                 "top_k": 1 if attempt > 0 else 20,
                 "chat_template_kwargs": {"enable_thinking": False},
-                "mm_processor_kwargs": {"fps": settings.video_fps, "do_sample_frames": True},
+                "mm_processor_kwargs": {
+                    "fps": settings.video_fps,
+                    "max_pixels": settings.video_max_pixels,
+                    "do_sample_frames": True,
+                },
             }
             raw = ""
             try:
@@ -250,6 +255,7 @@ class VideoService:
             "chat_template_kwargs": {"enable_thinking": False},
             "mm_processor_kwargs": {
                 "fps": settings.video_fps,
+                "max_pixels": settings.video_max_pixels,
                 "do_sample_frames": True,
             },
         }
