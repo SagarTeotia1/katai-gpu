@@ -69,7 +69,7 @@ except ImportError:
     HAS_AUDIO = False
 
 VLLM_URL    = "http://localhost:8000/v1/chat/completions"
-MODEL_ID    = "Qwen/Qwen3.6-27B"
+MODEL_ID    = os.environ.get("MODEL_ID", "Qwen/Qwen3-VL-30B-A3B-Instruct")
 MAX_TOKENS  = 32768
 MAX_RETRIES    = 3               # per-chunk retry attempts (single-video path only)
 RETRY_DELAYS   = [5, 15]         # seconds before attempt 2, 3
