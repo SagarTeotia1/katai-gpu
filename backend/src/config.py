@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     llm_base_url: str = "http://vllm:8000"
 
     # Model (HuggingFace model ID)
-    model_id: str = "Qwen/Qwen3.6-27B"
+    model_id: str = "Qwen/Qwen3-VL-30B-Instruct-FP8"
 
     @property
     def vision_model_id(self) -> str:
@@ -28,10 +28,12 @@ class Settings(BaseSettings):
 
     # Video — full semantic analysis
     video_max_tokens: int = 16384
-    # Chunk analysis — shorter per-chunk budget; json-repair handles truncation
-    video_chunk_max_tokens: int = 8192
-    # 1 fps = 1 frame/s; fewer prompt tokens → faster prefill + generation start
-    video_fps: float = 1.0
+    # Chunk analysis — increased from 8192; FP8 KV headroom supports longer outputs
+    video_chunk_max_tokens: int = 12288
+    # 1.5 fps: 50% more temporal coverage; Qwen3-VL handles dense frame sequences well
+    video_fps: float = 1.5
+    # 1204224 = ~1097×1097 per frame; Qwen3-VL default, richer spatial grounding
+    video_max_pixels: int = 1204224
 
     # Server
     host: str = "0.0.0.0"

@@ -428,9 +428,9 @@ def main() -> None:
     parser.add_argument("--min-s", type=float, default=8.0)
     parser.add_argument("--max-s", type=float, default=20.0)
     parser.add_argument("--overlap-s", type=float, default=2.0)
-    parser.add_argument("--fps", type=float, default=1.0,
+    parser.add_argument("--fps", type=float, default=1.5,
                         help="Must match vLLM --mm-processor-kwargs fps")
-    parser.add_argument("--max-pixels", type=int, default=602112,
+    parser.add_argument("--max-pixels", type=int, default=1204224,
                         help="Must match vLLM --mm-processor-kwargs max_pixels")
     args = parser.parse_args()
 
