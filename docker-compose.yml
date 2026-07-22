@@ -23,14 +23,14 @@ services:
     ports:
       - "${VLLM_PORT:-8000}:8000"
     command: >
-      --model ${MODEL_ID:-Qwen/Qwen3-VL-30B-A3B-Instruct-FP8}
+      --model ${MODEL_ID:-Qwen/Qwen3-VL-30B-A3B-Instruct}
       --port 8000
       --tensor-parallel-size 1
       --max-model-len ${MAX_MODEL_LEN:-131072}
-      --dtype auto
+      --dtype bfloat16
       --gpu-memory-utilization ${GPU_MEM_UTIL:-0.90}
-      --max-num-seqs 32
-      --max-num-batched-tokens 65536
+      --max-num-seqs 16
+      --max-num-batched-tokens 32768
       --enable-chunked-prefill
       --kv-cache-dtype fp8
       --limit-mm-per-prompt '{"video":1}'
@@ -66,7 +66,7 @@ services:
     container_name: katai-backend
     environment:
       - LLM_BASE_URL=http://vllm:8000
-      - MODEL_ID=${MODEL_ID:-Qwen/Qwen3-VL-30B-A3B-Instruct-FP8}
+      - MODEL_ID=${MODEL_ID:-Qwen/Qwen3-VL-30B-A3B-Instruct}
       - MAX_TOKENS=${MAX_TOKENS:-4096}
       - TEMPERATURE=${TEMPERATURE:-0.7}
       - HOST=0.0.0.0

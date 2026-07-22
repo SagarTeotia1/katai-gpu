@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     llm_base_url: str = "http://vllm:8000"
 
     # Model (HuggingFace model ID)
-    model_id: str = "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
+    model_id: str = "Qwen/Qwen3-VL-30B-A3B-Instruct"
 
     @property
     def vision_model_id(self) -> str:

@@ -24,7 +24,7 @@ BACKEND_PORT       ?= 8080
 FRONTEND_PORT      ?= 3000
 WHISPER_PORT       ?= 9000
 MODEL              ?= $(MODEL_ID)
-MODEL              ?= Qwen/Qwen3-VL-30B-A3B-Instruct-FP8
+MODEL              ?= Qwen/Qwen3-VL-30B-A3B-Instruct
 N                  ?= 4
 
 ##@ General

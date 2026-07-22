@@ -29,7 +29,7 @@ One-command startup. True concurrent batching. Chat + image + video analysis.
 │   • FP8 weights (dtype auto) + FP8 KV cache                │
 │   • Flash Attention 2                                       │
 │   • --reasoning-parser qwen3 (strips <think> blocks)        │
-│   • Model: Qwen/Qwen3-VL-30B-A3B-Instruct-FP8  (~30 GB VRAM)  │
+│   • Model: Qwen/Qwen3-VL-30B-A3B-Instruct  (~30 GB VRAM)  │
 │   • GPU: RTX Pro 6000 96GB (66 GB headroom for KV cache)   │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -58,8 +58,8 @@ One-command startup. True concurrent batching. Chat + image + video analysis.
 
 | GPU | VRAM | Recommended model |
 |-----|------|-------------------|
-| RTX Pro 6000 | 96 GB | `Qwen/Qwen3-VL-30B-A3B-Instruct-FP8` ← default |
-| A100 80GB | 80 GB | `Qwen/Qwen3-VL-30B-A3B-Instruct-FP8` |
+| RTX Pro 6000 | 96 GB | `Qwen/Qwen3-VL-30B-A3B-Instruct` ← default |
+| A100 80GB | 80 GB | `Qwen/Qwen3-VL-30B-A3B-Instruct` |
 | A100 40GB | 40 GB | `Qwen/Qwen3-VL-7B-Instruct` BF16 |
 | RTX 4090 | 24 GB | `Qwen/Qwen2.5-VL-7B-Instruct` BF16 |
 
@@ -69,7 +69,7 @@ One-command startup. True concurrent batching. Chat + image + video analysis.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MODEL_ID` | `Qwen/Qwen3-VL-30B-A3B-Instruct-FP8` | HuggingFace model ID |
+| `MODEL_ID` | `Qwen/Qwen3-VL-30B-A3B-Instruct` | HuggingFace model ID |
 | `HF_TOKEN` | *(optional)* | HF token — not needed if model already cached |
 | `VLLM_PORT` | `8000` | vLLM API port |
 | `BACKEND_PORT` | `8080` | FastAPI backend port |
